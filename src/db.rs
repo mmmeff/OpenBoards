@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::{BoardError, BoardResult};
 
@@ -288,6 +288,44 @@ const MIGRATIONS: &[Migration] = &[
                 ON events (board_id, message_id);
         "#,
     },
+    Migration {
+        version: 9,
+        name: "009_schedules",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS schedules (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                re TEXT,
+                text TEXT NOT NULL,
+                labels_json TEXT NOT NULL,
+                attachments_json TEXT NOT NULL,
+                schema_id TEXT,
+                no_sync INTEGER NOT NULL DEFAULT 0,
+                creator_actor TEXT NOT NULL,
+                creator_principal TEXT NOT NULL,
+                creator_profile TEXT,
+                creator_avatar TEXT,
+                every_secs INTEGER,
+                max_times INTEGER,
+                until_at TEXT,
+                next_run_at TEXT NOT NULL,
+                runs_completed INTEGER NOT NULL DEFAULT 0,
+                last_run_at TEXT,
+                last_message_id TEXT,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedules_due
+                ON schedules (status, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_schedules_board_thread
+                ON schedules (board_id, re, status, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_schedules_board_channel
+                ON schedules (board_id, channel, status, next_run_at);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.
@@ -382,14 +420,16 @@ fn run_migrations(conn: &mut Connection) -> BoardResult<()> {
         "#,
     )?;
 
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM _migrations",
-        [],
-        |row| row.get(0),
-    )?;
-
     for migration in MIGRATIONS {
-        if migration.version <= current {
+        let applied: bool = conn
+            .query_row(
+                "SELECT 1 FROM _migrations WHERE version = ?1",
+                rusqlite::params![migration.version],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if applied {
             continue;
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -413,8 +453,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("openboards.db");
         let db = Database::open(&db_path).unwrap();
+        let expected_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
 
-        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(db.schema_version().unwrap(), expected_version);
 
         db.with_conn(|conn| {
             let journal_mode: String =
@@ -429,13 +470,14 @@ mod tests {
 
         // Reopening is idempotent
         let db2 = Database::open(&db_path).unwrap();
-        assert_eq!(db2.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(db2.schema_version().unwrap(), expected_version);
     }
 
     #[test]
     fn initializes_in_memory_db_with_foreign_keys() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let expected_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
+        assert_eq!(db.schema_version().unwrap(), expected_version);
         db.with_conn(|conn| {
             let foreign_keys: i64 =
                 conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;

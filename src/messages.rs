@@ -15,6 +15,7 @@ use crate::grants;
 use crate::id::new_message_id;
 use crate::labels;
 use crate::mentions::{self, MentionResolution};
+use crate::schedules;
 use crate::schemas;
 use crate::validate::{validate_channel_path, validate_text_length};
 
@@ -1261,11 +1262,18 @@ pub fn get_thread(
         }
 
         let cursor = current_board_cursor_tx(conn, board_id)?;
+        let pending_schedules = schedules::list_pending_thread_schedules_tx(conn, board_id, &root_id)?
+            .into_iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .map_err(|e| BoardError::internal(format!("failed to serialize schedule: {e}")))
+            })
+            .collect::<BoardResult<Vec<Value>>>()?;
         Ok(ThreadView {
             message: root_view,
             replies,
             cursor,
-            schedules: Vec::new(),
+            schedules: pending_schedules,
         })
     })
 }

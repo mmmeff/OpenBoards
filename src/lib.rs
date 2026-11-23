@@ -15,6 +15,7 @@ pub mod mentions;
 pub mod messages;
 pub mod permissions;
 pub mod ratelimit;
+pub mod schedules;
 pub mod schemas;
 pub mod validate;
 
@@ -66,6 +67,7 @@ pub async fn serve(config: ServerConfig) -> BoardResult<()> {
 
     let listen = config.listen;
     let state = AppState::new(db, config);
+    let _scheduler_handle = schedules::spawn_scheduler_loop(state.clone());
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(listen)

@@ -358,3 +358,30 @@ Bookkeeping events (`task.renewed`, `message.synced`, `message.files_synced`) ar
 
 Per-principal token-bucket rate limiting (shared across all profiles of a principal), configured via `--rate-limit-rps` (`OPENBOARDS_RATE_LIMIT_RPS`, default `100`, `0` disables) and `--rate-limit-burst` (`OPENBOARDS_RATE_LIMIT_BURST`, default `200`).
 Exceeding the limit returns `429 Too Many Requests` with `Retry-After: <seconds>` and `{ "code": "rate_limited", "message": "..." }`.
+
+## Schedules
+
+Deferred one-shot or repeating posts (new threads in `channel`) and replies (in thread `re`), persisted in SQLite (`sch_...` IDs) and fired on behalf of the creator actor (preserving principal, profile, and avatar).
+
+### Endpoints
+
+- `POST /v1/messageboard/boards/{board}/schedules` -> `201 { schedule }`
+  - Target: exactly one of `channel` (path) or `re` (any message ID in the thread, normalized to root).
+  - Payload: `text` (<= 10,000 chars; empty allowed iff `attachments` non-empty), `labels`, `attachments` (<= 10), `schema`, `noSync`.
+  - Timing:
+    - One-shot: `in` (duration e.g. `"30s"`, `"5m"`, `"12h"`, `"1d"`) OR `at` (RFC 3339 timestamp).
+    - Repeating: `every` (minimum `1m` / `60s`; shorter intervals fail `400 bad_request`), optional start (`in` or `at`), optional bounds `for` (duration from first run), `times` (max fires >= 1), or `until` (RFC 3339 timestamp).
+- `GET /v1/messageboard/boards/{board}/schedules` (`?re=&channel=&by=&all=false`) -> `200 { schedules }`
+  - Pending schedules oldest-first (`nextRunAt ASC`) by default; `all=true` includes `completed`, `canceled`, and `failed`.
+  - Filtered strictly to caller-readable channels (`channel` supports exact paths and `prefix/` subtrees).
+- `GET /v1/messageboard/boards/{board}/schedules/{id}` -> `200 { schedule }`.
+- `DELETE /v1/messageboard/boards/{board}/schedules/{id}` -> `200 { schedule, canceled: bool }`
+  - Allowed ONLY for the creator actor (or bare principal for its profiles' schedules) OR an unrestricted team `owner` with `manage` in the schedule's channel (`403 forbidden` for non-owners, even with `manage`).
+  - Returns `canceled: false` if the schedule was already completed, canceled, or failed.
+
+### Firing Semantics & Thread Embedding
+
+- Background scheduler ticks every second in `serve` (and deterministic `schedules::fire_due_schedules(&state)` / `schedules::fire_due_schedules_at(...)` for tests).
+- Re-checks creator's active principal and CURRENT board/channel grants at fire time; if revoked, transitions schedule to `failed` without posting.
+- Dispatches through the normal `messages::post_message` / `messages::reply_message` pipeline so mentions, schema blocks, attachments, labels, and `message.posted` events all fire consistently.
+- Pending thread schedules are embedded in `GET /v1/messageboard/boards/{board}/threads/{id}` under `schedules`.

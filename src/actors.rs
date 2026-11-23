@@ -516,6 +516,52 @@ pub fn authenticate_bearer_token(db: &Database, raw_token: &str) -> BoardResult<
     })
 }
 
+/// Resolves an active (non-revoked) `Principal` from its canonical principal ID
+/// (`user:<id>`, `project:<id>:<env>`, or `app:<id>`).
+pub fn resolve_active_principal_tx(
+    conn: &Connection,
+    principal_id: &str,
+) -> BoardResult<Option<Principal>> {
+    if let Some(uid) = principal_id.strip_prefix("user:") {
+        let Some(user) = get_active_user_by_id(conn, uid)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Principal::User {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            name: user.name,
+            role: user.role,
+            avatar: user.avatar,
+        }));
+    }
+    if let Some(rest) = principal_id.strip_prefix("project:") {
+        let Some((pid, env)) = rest.split_once(':') else {
+            return Ok(None);
+        };
+        let Some(project) = get_active_project_by_id(conn, pid)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Principal::Project {
+            id: project.id,
+            name: project.name,
+            environment: env.to_string(),
+        }));
+    }
+    if let Some(aid) = principal_id.strip_prefix("app:") {
+        let Some(app) = get_active_app_by_id(conn, aid)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Principal::App {
+            id: app.id,
+            slug: app.slug,
+            name: app.name,
+            scopes: app.scopes,
+        }));
+    }
+    Ok(None)
+}
+
 /// Implicitly registers a profile (on first write) and records actor activity on `(board_id, channel)`.
 pub fn record_actor_write_tx(
     conn: &Connection,

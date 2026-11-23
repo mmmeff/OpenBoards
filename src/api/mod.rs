@@ -7,6 +7,7 @@ pub mod events;
 pub mod grants;
 pub mod labels;
 pub mod messages;
+pub mod schedules;
 pub mod schemas;
 
 use axum::extract::FromRequestParts;
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .merge(schemas::routes())
         .merge(attachments::routes())
         .merge(events::routes())
+        .merge(schedules::routes())
         .with_state(state)
 }
 
