@@ -548,3 +548,279 @@ async fn mentions_visibility_isolation_and_by_and_thread_pagination() {
     assert_eq!(page2["threads"][0]["message"]["id"], m1_id);
     assert!(page2["older"].is_null());
 }
+
+#[tokio::test]
+async fn labels_cas_filters_inheritance_and_structured_schemas() {
+    let h = TestHarness::new();
+    let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+    let (_eve_id, eve_tok) = h.create_user_with_token("eve", "eve@acme.com", "viewer").await;
+
+    // Built-in schemas git-commit@1 and vercel-deployment@1 are pre-seeded
+    let (st, body) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/schemas",
+            Some(&eve_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let schema_ids: Vec<&str> = body["schemas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert!(schema_ids.contains(&"git-commit@1"));
+    assert!(schema_ids.contains(&"vercel-deployment@1"));
+
+    // Viewer lacks manage at * -> cannot register schema
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/schemas",
+            Some(&eve_tok),
+            &[],
+            Some(json!({
+                "name": "sandbox",
+                "version": 1,
+                "schema": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Member with manage at * registers sandbox@1 -> 201 created: true
+    let sandbox_def = json!({
+        "name": "sandbox",
+        "version": 1,
+        "description": "What a sandbox did.",
+        "schema": {
+            "type": "object",
+            "required": ["id", "action"],
+            "properties": {
+                "id": { "type": "string" },
+                "action": { "enum": ["started", "stopped"] }
+            }
+        }
+    });
+    let (st, body) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/schemas",
+            Some(&alice_tok),
+            &[],
+            Some(sandbox_def.clone()),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(body["created"], true);
+    assert_eq!(body["schema"]["id"], "sandbox@1");
+
+    // Identical re-registration -> 200 created: false
+    let (st, body) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/schemas",
+            Some(&alice_tok),
+            &[],
+            Some(sandbox_def),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["created"], false);
+
+    // Differing definition -> 409 schema_immutable
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/schemas",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "name": "sandbox",
+                "version": 1,
+                "schema": { "type": "object" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "schema_immutable");
+
+    // Reserved board.* label rejected on post with 400 reserved_label
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "www/prod",
+                "text": "bad label",
+                "labels": { "board.task": "ready" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], "reserved_label");
+
+    // Invalid structured block -> 400 invalid_block; unknown schema -> 400 schema_not_found
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "www/prod",
+                "text": "```board-block sandbox@1\n{\"id\":\"sbx-1\",\"action\":\"exploded\"}\n```"
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], "invalid_block");
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "www/prod",
+                "schema": "missing@1",
+                "text": "{\"a\":1}"
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], "schema_not_found");
+
+    // Post root with embedded fenced block + initial label `status=open`
+    let (st, root) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "www/prod",
+                "text": "Launch report:\n\n```board-block sandbox@1\n{\"id\":\"sbx-123\",\"action\":\"started\"}\n```",
+                "labels": { "status": "open" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let root_id = root["id"].as_str().unwrap().to_string();
+    assert_eq!(root["labels"]["status"], "open");
+    assert_eq!(root["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(root["blocks"][0]["schema"], "sandbox");
+    assert_eq!(root["blocks"][0]["version"], 1);
+    assert_eq!(root["blocks"][0]["data"]["id"], "sbx-123");
+
+    // Post reply with explicit `schema` for built-in git-commit@1 and label `kind=bug`
+    let (st, reply) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/replies"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "schema": "git-commit@1",
+                "text": "{\"sha\":\"a1b2c3d\",\"message\":\"fix timeout\"}",
+                "labels": { "kind": "bug" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let reply_id = reply["id"].as_str().unwrap().to_string();
+    assert_eq!(reply["blocks"][0]["schema"], "git-commit");
+
+    // Atomic CAS label update: `if: { owner: null }` succeeds, then fails with 409 label_conflict
+    // WITHOUT leaking the actual label value ("secret-owner")!
+    let (st, body) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/labels"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "set": { "owner": "secret-owner" },
+                "if": { "owner": null, "status": "open" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["labels"]["owner"], "secret-owner");
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/labels"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "set": { "owner": "other" },
+                "if": { "owner": null }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "label_conflict");
+    let err_msg = err["message"].as_str().unwrap();
+    assert!(err_msg.contains("owner"));
+    assert!(!err_msg.contains("secret-owner"), "must never leak actual value");
+
+    // Viewer cannot set labels (403 forbidden)
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/labels"),
+            Some(&eve_tok),
+            &[],
+            Some(json!({ "set": { "status": "closed" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Filter engine: subtree `www/`, conjunction + alternation + presence + root inheritance + text
+    // Reply has `kind=bug`, root has `status=open` -> reply matches BOTH `status=open|draft` AND `kind=bug`!
+    let (st, page) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/messages?channel=www/&label=status=open|draft&label=kind=bug&label=owner&text=timeout",
+            Some(&eve_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["id"], reply_id);
+
+    // Deleting root strips its labels so label filter no longer finds the root
+    let (st, _) = h
+        .req(
+            Method::DELETE,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, page) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/messages?label=status=open",
+            Some(&eve_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(page["messages"].as_array().unwrap().is_empty());
+}

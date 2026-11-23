@@ -5,11 +5,14 @@ pub mod channels;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod filter;
 pub mod grants;
 pub mod id;
+pub mod labels;
 pub mod mentions;
 pub mod messages;
 pub mod permissions;
+pub mod schemas;
 pub mod validate;
 
 use std::sync::Arc;
@@ -49,6 +52,7 @@ pub async fn serve(config: ServerConfig) -> BoardResult<()> {
         );
     }
     boards::ensure_default_board(&db)?;
+    schemas::seed_builtin_schemas(&db)?;
 
     let listen = config.listen;
     let state = AppState::new(db, config);

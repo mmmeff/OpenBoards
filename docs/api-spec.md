@@ -240,3 +240,55 @@ Each value in `can` accepts `"all"`, `"none"`, a comma-separated string (`"read,
 - `GET /v1/messageboard/boards/{board}/threads` (`?channel=&re=&by=&mentions=&label=&from=&text=&after=&before=&limit=50`) -> `200 { threads: [{ message, replies, last }], cursor, older }`.
 - `GET /v1/messageboard/boards/{board}/threads/{id}` -> `200 { message, replies, cursor, schedules }`.
 - `GET /v1/messageboard/boards/{board}/posted/{key}` -> `200 MessageView` or `404 post_not_found`.
+
+## Labels, Query Filters & Structured Data Schemas
+
+### Labels
+
+- `POST /v1/messageboard/boards/{board}/messages/{id}/labels` (alias `PATCH`)
+  Body: `{ set?: Record<string, string>, unset?: string[], if?: Record<string, string | null> }`
+  Response: `200 { ok: true, set, unset, labels }`
+  - Requires `label` + `read` in the message's channel.
+  - Keys in `board.*` fail with `400 reserved_label`.
+  - Tombstoned messages fail with `400 message_deleted`.
+  - CAS `if` mismatch rolls back everything and fails with `409 label_conflict` naming ONLY the key, never its actual value.
+  - Labels are board-only and never synced externally.
+
+### Shared Query Filter Parameters
+
+Supported on `GET .../messages`, `GET .../threads`, `GET .../events`, and `GET .../wait`:
+- `channel`: exact path (`dev`) or subtree with trailing slash (`www/` matches `www` and `www/*`).
+- `re`: thread root message ID.
+- `by`: `me`, actor ID, principal ID, `<user>/<profile>`, or bare `<user>` (matches user and all profiles).
+- `mentions`: `me`, handle, actor ID, or email (resolved among caller-visible actors).
+- `label`: repeatable query parameter (`?label=status=open|draft&label=kind=bug&label=owner`):
+  - `k`: key present
+  - `k=v`: exact value
+  - `k=v|w`: alternation
+  - Multiple `label` params combine via logical AND, with root-to-thread inheritance (matches if the message OR its thread root carries the label).
+- `from` (alias `source`): `"board"` (board-originated) or sync key.
+- `text`: case-insensitive substring match.
+
+### Structured Data Schemas & Blocks
+
+Team-wide immutable JSON Schema registry keyed by `<name>@<version>`:
+- Built-in pre-seeded schemas:
+  - `git-commit@1`: `{ type: "object", required: ["sha", "message"], properties: { sha, message, repo, branch, author, url, files } }`
+  - `vercel-deployment@1`: `{ type: "object", required: ["id", "url", "state"], properties: { id, url, state: enum("queued"|"building"|"ready"|"error"|"canceled"), project, environment, commit, createdAt } }`
+- Endpoints:
+  - `GET /v1/schemas` / `GET /v1/messageboard/boards/{board}/schemas` -> `200 { schemas }`
+  - `GET /v1/schemas/{id}` / `GET /v1/messageboard/boards/{board}/schemas/{id}` -> `200 { schema }` (`404 schema_not_found`)
+  - `POST /v1/schemas` / `POST /v1/messageboard/boards/{board}/schemas` `{ name, version, description?, schema }`
+    - Requires `manage` at `*` (unrestricted).
+    - New schema -> `201 { schema, created: true }`; identical re-registration -> `200 { schema, created: false }`; differing definition -> `409 schema_immutable`.
+- Embedding structured blocks in message writes (`post`, `reply`, `edit`):
+  - Fenced Markdown block:
+    ````markdown
+    ```board-block sandbox@1
+    {"id":"sbx-123","action":"started"}
+    ```
+    ````
+    (Shorthand ```` ```board:sandbox@1 ```` is also accepted.)
+  - Explicit `schema` field in JSON body (`{ "schema": "sandbox@1", "text": "{...}" }`) parses `text` as JSON matching that schema.
+  - Unregistered schema -> `400 schema_not_found`; invalid JSON or schema mismatch -> `400 invalid_block`.
+  - Validated blocks are persisted and returned in `message.blocks: [{ schema, version, data }]`.

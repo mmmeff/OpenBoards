@@ -8,28 +8,73 @@ use serde_json::{json, Value};
 use crate::actors::CallerContext;
 use crate::api::boards::EnsureQuery;
 use crate::boards;
-use crate::error::BoardResult;
+use crate::error::{BoardError, BoardResult};
+use crate::filter::{LabelPredicate, QueryFilter};
 use crate::messages::{
-    self, BasicMessageQuery, DeleteMessageInput, EditMessageInput, PostMessageInput, ReactInput,
+    self, DeleteMessageInput, EditMessageInput, MessageListQuery, PostMessageInput, ReactInput,
     ReplyMessageInput,
 };
 use crate::AppState;
 
 #[derive(Debug, Default, Deserialize)]
-struct ListQueryParams {
-    ensure: Option<bool>,
-    channel: Option<String>,
-    re: Option<String>,
-    by: Option<String>,
-    after: Option<String>,
-    before: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Default, Deserialize)]
 struct DeleteQueryParams {
     ensure: Option<bool>,
     revision: Option<i64>,
+}
+
+/// Parses repeated query pairs (`?label=a=1&label=b=2|3&channel=dev/&...`) into `ensure` + `MessageListQuery`.
+pub fn parse_list_query_pairs(
+    pairs: Vec<(String, String)>,
+) -> BoardResult<(Option<bool>, MessageListQuery)> {
+    let mut ensure = None;
+    let mut filter = QueryFilter::default();
+    let mut after = None;
+    let mut before = None;
+    let mut limit = None;
+
+    for (k, v) in pairs {
+        match k.as_str() {
+            "ensure" => {
+                ensure = Some(parse_bool_param("ensure", &v)?);
+            }
+            "channel" => filter.channel = Some(v),
+            "re" => filter.re = Some(v),
+            "by" => filter.by = Some(v),
+            "mentions" => filter.mentions = Some(v),
+            "label" => filter.labels.push(LabelPredicate::parse(&v)?),
+            "from" | "source" => filter.from = Some(v),
+            "text" => filter.text = Some(v),
+            "after" => after = Some(v),
+            "before" => before = Some(v),
+            "limit" => {
+                let parsed: usize = v
+                    .parse()
+                    .map_err(|_| BoardError::bad_request(format!("invalid limit '{v}'")))?;
+                limit = Some(parsed);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        ensure,
+        MessageListQuery {
+            filter,
+            after,
+            before,
+            limit,
+        },
+    ))
+}
+
+pub fn parse_bool_param(name: &str, v: &str) -> BoardResult<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(BoardError::bad_request(format!(
+            "invalid boolean value '{other}' for '{name}'"
+        ))),
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -181,22 +226,11 @@ async fn list_messages(
     State(state): State<AppState>,
     caller: CallerContext,
     Path(board): Path<String>,
-    Query(params): Query<ListQueryParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, params.ensure, &caller)?;
-    let page = messages::list_messages(
-        &state.db,
-        &resolved.id,
-        &caller,
-        BasicMessageQuery {
-            channel: params.channel,
-            re: params.re,
-            by: params.by,
-            after: params.after,
-            before: params.before,
-            limit: params.limit,
-        },
-    )?;
+    let (ensure, query) = parse_list_query_pairs(pairs)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
+    let page = messages::list_messages(&state.db, &resolved.id, &caller, query)?;
     Ok(Json(json!(page)))
 }
 
@@ -204,22 +238,11 @@ async fn list_threads(
     State(state): State<AppState>,
     caller: CallerContext,
     Path(board): Path<String>,
-    Query(params): Query<ListQueryParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, params.ensure, &caller)?;
-    let page = messages::list_threads(
-        &state.db,
-        &resolved.id,
-        &caller,
-        BasicMessageQuery {
-            channel: params.channel,
-            re: params.re,
-            by: params.by,
-            after: params.after,
-            before: params.before,
-            limit: params.limit,
-        },
-    )?;
+    let (ensure, query) = parse_list_query_pairs(pairs)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
+    let page = messages::list_threads(&state.db, &resolved.id, &caller, query)?;
     Ok(Json(json!(page)))
 }
 

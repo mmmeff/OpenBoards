@@ -194,6 +194,44 @@ const MIGRATIONS: &[Migration] = &[
             );
         "#,
     },
+    Migration {
+        version: 5,
+        name: "005_labels_and_schemas",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS message_labels (
+                board_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (message_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_labels_board_kv
+                ON message_labels (board_id, key, value);
+
+            CREATE TABLE IF NOT EXISTS schemas (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                description TEXT,
+                schema_json TEXT NOT NULL,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (name, version)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_blocks (
+                board_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                schema_name TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                data_json TEXT NOT NULL,
+                PRIMARY KEY (message_id, idx)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_blocks_board
+                ON message_blocks (board_id, message_id);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

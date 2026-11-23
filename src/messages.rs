@@ -8,9 +8,12 @@ use serde_json::Value;
 use crate::actors::{self, CallerContext};
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult, ErrorCode};
+use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
 use crate::grants;
 use crate::id::new_message_id;
+use crate::labels;
 use crate::mentions::{self, MentionResolution};
+use crate::schemas;
 use crate::validate::{validate_channel_path, validate_text_length};
 
 pub const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -110,6 +113,7 @@ pub struct PostMessageInput {
     pub attachments: Vec<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    pub schema: Option<String>,
     #[serde(default, alias = "noSync")]
     pub no_sync: bool,
 }
@@ -124,6 +128,7 @@ pub struct ReplyMessageInput {
     pub attachments: Vec<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    pub schema: Option<String>,
     #[serde(default, alias = "noSync")]
     pub no_sync: bool,
 }
@@ -132,6 +137,7 @@ pub struct ReplyMessageInput {
 pub struct EditMessageInput {
     pub text: String,
     pub revision: Option<i64>,
+    pub schema: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -147,10 +153,8 @@ pub struct ReactInput {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct BasicMessageQuery {
-    pub channel: Option<String>,
-    pub re: Option<String>,
-    pub by: Option<String>,
+pub struct MessageListQuery {
+    pub filter: QueryFilter,
     pub after: Option<String>,
     pub before: Option<String>,
     pub limit: Option<usize>,
@@ -301,10 +305,14 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
 
     let deleted = row.deleted_at.is_some();
 
-    let reactions = if deleted {
-        BTreeMap::new()
+    let (labels, reactions, blocks) = if deleted {
+        (BTreeMap::new(), BTreeMap::new(), Vec::new())
     } else {
-        load_reactions_tx(conn, &row.id)?
+        (
+            labels::load_message_labels_tx(conn, &row.id)?,
+            load_reactions_tx(conn, &row.id)?,
+            schemas::load_message_blocks_tx(conn, &row.id)?,
+        )
     };
 
     Ok(MessageView {
@@ -323,14 +331,70 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
             profile: row.by_profile.clone(),
             handle,
         },
-        labels: BTreeMap::new(),
+        labels,
         reactions,
         attachments: Vec::new(),
-        blocks: Vec::new(),
+        blocks,
         from: row.from_source.clone(),
         no_sync: row.no_sync,
         revision: row.revision,
         created_at: row.created_at.clone(),
+        deleted,
+    })
+}
+
+pub fn load_mention_ids_tx(conn: &Connection, message_id: &str) -> BoardResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT actor_id FROM message_mentions WHERE message_id = ?1 ORDER BY actor_id ASC",
+    )?;
+    let rows = stmt.query_map(params![message_id], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Builds an immutable `MessageSnapshot` (including root thread labels and mentions) for filtering
+/// and event-log before/after evaluation.
+pub fn build_message_snapshot_tx(
+    conn: &Connection,
+    row: &StoredMessageRow,
+) -> BoardResult<MessageSnapshot> {
+    let handle = actors::resolve_actor_view(conn, &row.by_actor)?
+        .map(|a| a.handle)
+        .unwrap_or_else(|| row.by_actor.clone());
+    let deleted = row.deleted_at.is_some();
+    let msg_labels = if deleted {
+        BTreeMap::new()
+    } else {
+        labels::load_message_labels_tx(conn, &row.id)?
+    };
+    let root_labels = match &row.re {
+        Some(root_id) => Some(labels::load_message_labels_tx(conn, root_id)?),
+        None => None,
+    };
+    let mention_ids = if deleted {
+        Vec::new()
+    } else {
+        load_mention_ids_tx(conn, &row.id)?
+    };
+    Ok(MessageSnapshot {
+        id: row.id.clone(),
+        channel: row.channel.clone(),
+        re: row.re.clone(),
+        text: if deleted {
+            String::new()
+        } else {
+            row.text.clone()
+        },
+        by_actor: row.by_actor.clone(),
+        by_principal: row.by_principal.clone(),
+        by_handle: handle,
+        labels: msg_labels,
+        root_labels,
+        mention_ids,
+        from: row.from_source.clone(),
         deleted,
     })
 }
@@ -464,6 +528,9 @@ pub fn post_message(
             "message text cannot be empty unless attachments are provided",
         ));
     }
+    if !input.labels.is_empty() {
+        labels::validate_user_labels(&input.labels)?;
+    }
 
     db.with_tx(|tx| {
         let board_grants = grants::load_grants_tx(tx, board_id)?;
@@ -491,6 +558,12 @@ pub fn post_message(
                 input.channel
             )));
         }
+        if !input.labels.is_empty() && !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "setting labels in '{}' requires 'label' permission",
+                input.channel
+            )));
+        }
 
         let actor_id = caller.actor_id();
         if let Some(idem_key) = &input.id {
@@ -510,6 +583,9 @@ pub fn post_message(
                 });
             }
         }
+
+        let parsed_blocks =
+            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
 
         let now = Utc::now().to_rfc3339();
         if !channel_exists {
@@ -550,6 +626,12 @@ pub fn post_message(
         )?;
 
         store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+        if !input.labels.is_empty() {
+            labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
+        }
+        if !parsed_blocks.is_empty() {
+            schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
+        }
 
         if let Some(idem_key) = &input.id {
             store_idempotency_tx(
@@ -594,6 +676,9 @@ pub fn reply_message(
             "message text cannot be empty unless attachments are provided",
         ));
     }
+    if !input.labels.is_empty() {
+        labels::validate_user_labels(&input.labels)?;
+    }
 
     db.with_tx(|tx| {
         let target = load_stored_message_tx(tx, board_id, target_message_id)?.ok_or_else(|| {
@@ -614,6 +699,12 @@ pub fn reply_message(
         if !perms.can_reply() {
             return Err(BoardError::forbidden(format!(
                 "replying in '{}' requires 'read' and 'post' permissions",
+                target.channel
+            )));
+        }
+        if !input.labels.is_empty() && !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "setting labels in '{}' requires 'label' permission",
                 target.channel
             )));
         }
@@ -663,6 +754,9 @@ pub fn reply_message(
             }
         }
 
+        let parsed_blocks =
+            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
+
         let now = Utc::now().to_rfc3339();
         actors::record_actor_write_tx(tx, board_id, &target.channel, caller)?;
 
@@ -697,6 +791,12 @@ pub fn reply_message(
         )?;
 
         store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+        if !input.labels.is_empty() {
+            labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
+        }
+        if !parsed_blocks.is_empty() {
+            schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
+        }
 
         if let Some(idem_key) = &input.id {
             store_idempotency_tx(
@@ -782,6 +882,8 @@ pub fn edit_message(
             ));
         }
 
+        let parsed_blocks =
+            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
         let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
         let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
         let now = Utc::now().to_rfc3339();
@@ -793,6 +895,7 @@ pub fn edit_message(
             params![resolved_mentions.text, next_rev, now, board_id, message_id],
         )?;
         store_mentions_tx(tx, board_id, message_id, &resolved_mentions.actor_ids)?;
+        schemas::store_message_blocks_tx(tx, board_id, message_id, &parsed_blocks)?;
 
         let updated = load_stored_message_tx(tx, board_id, message_id)?.unwrap();
         let view = hydrate_message_view_tx(tx, &updated)?;
@@ -868,6 +971,8 @@ pub fn delete_message(
             "DELETE FROM message_mentions WHERE message_id = ?1",
             params![message_id],
         )?;
+        labels::delete_message_labels_tx(tx, message_id)?;
+        schemas::delete_message_blocks_tx(tx, message_id)?;
 
         Ok(true)
     })
@@ -1067,61 +1172,24 @@ fn validate_limit(limit: Option<usize>) -> BoardResult<usize> {
     Ok(n)
 }
 
-fn matches_by_filter(
-    by_filter: &str,
-    caller: &CallerContext,
-    msg: &MessageView,
-) -> bool {
-    if by_filter.eq_ignore_ascii_case("me") {
-        if caller.profile.is_some() {
-            return msg.by.actor == caller.actor_id();
-        }
-        return msg.by.principal == caller.principal_id();
-    }
-    if by_filter.contains(':') {
-        // Actor or principal ID
-        if by_filter.contains('+') {
-            return msg.by.actor == by_filter;
-        }
-        return msg.by.principal == by_filter;
-    }
-    if by_filter.contains('/') {
-        // Specific profile handle `<user>/<profile>`
-        return msg.by.handle.eq_ignore_ascii_case(by_filter);
-    }
-    // Bare user/project/app handle matches that principal AND all its profiles
-    let base_handle = msg
-        .by
-        .handle
-        .split_once('/')
-        .map(|(base, _)| base)
-        .unwrap_or(msg.by.handle.as_str());
-    base_handle.eq_ignore_ascii_case(by_filter)
-}
-
-fn matches_channel_filter(channel_filter: &str, channel: &str) -> bool {
-    if let Some(prefix) = channel_filter.strip_suffix('/') {
-        channel == prefix || channel.starts_with(channel_filter)
-    } else {
-        channel == channel_filter
-    }
-}
-
 pub fn list_messages(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
-    query: BasicMessageQuery,
+    query: MessageListQuery,
 ) -> BoardResult<MessagesPage> {
     if query.after.is_some() && query.before.is_some() {
         return Err(BoardError::bad_request(
             "cannot combine 'after' and 'before'",
         ));
     }
+    query.filter.validate()?;
     let limit = validate_limit(query.limit)?;
 
     db.with_conn(|conn| {
         let board_grants = grants::load_grants_tx(conn, board_id)?;
+        let visible_actors = visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?;
+        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
         let after_seq = match &query.after {
             Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
             None => None,
@@ -1157,23 +1225,11 @@ pub fn list_messages(
             {
                 continue;
             }
-            if let Some(ch_f) = &query.channel {
-                if !matches_channel_filter(ch_f, &r.channel) {
-                    continue;
-                }
-            }
-            if let Some(re_f) = &query.re {
-                let root = r.re.as_deref().unwrap_or(&r.id);
-                if root != re_f {
-                    continue;
-                }
+            let snap = build_message_snapshot_tx(conn, &r)?;
+            if !query.filter.matches_snapshot(&snap, &filter_ctx) {
+                continue;
             }
             let view = hydrate_message_view_tx(conn, &r)?;
-            if let Some(by_f) = &query.by {
-                if !matches_by_filter(by_f, caller, &view) {
-                    continue;
-                }
-            }
             matched.push((r.seq, view));
         }
 
@@ -1193,17 +1249,20 @@ pub fn list_threads(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
-    query: BasicMessageQuery,
+    query: MessageListQuery,
 ) -> BoardResult<ThreadsPage> {
     if query.after.is_some() && query.before.is_some() {
         return Err(BoardError::bad_request(
             "cannot combine 'after' and 'before'",
         ));
     }
+    query.filter.validate()?;
     let limit = validate_limit(query.limit)?;
 
     db.with_conn(|conn| {
         let board_grants = grants::load_grants_tx(conn, board_id)?;
+        let visible_actors = visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?;
+        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
         let after_seq = match &query.after {
             Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
             None => None,
@@ -1238,23 +1297,19 @@ pub fn list_threads(
             {
                 continue;
             }
-            if let Some(ch_f) = &query.channel {
-                if !matches_channel_filter(ch_f, &r.channel) {
-                    continue;
-                }
+            if !query.filter.matches_channel(&r.channel) {
+                continue;
             }
             let root_id = r.re.clone().unwrap_or_else(|| r.id.clone());
-            if let Some(re_f) = &query.re {
+            if let Some(re_f) = &query.filter.re {
                 if &root_id != re_f {
                     continue;
                 }
             }
 
+            let snap = build_message_snapshot_tx(conn, &r)?;
+            let is_match = query.filter.matches_snapshot(&snap, &filter_ctx);
             let view = hydrate_message_view_tx(conn, &r)?;
-            let is_match = match &query.by {
-                Some(by_f) => matches_by_filter(by_f, caller, &view),
-                None => true,
-            };
 
             let acc = by_root.entry(root_id).or_insert_with(|| ThreadAcc {
                 root: None,
