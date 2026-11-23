@@ -93,6 +93,44 @@ const MIGRATIONS: &[Migration] = &[
                 ON actor_activity (board_id);
         "#,
     },
+    Migration {
+        version: 3,
+        name: "003_boards_channels_grants",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS boards (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL UNIQUE,
+                next_grant_seq INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channels_board
+                ON channels (board_id);
+
+            CREATE TABLE IF NOT EXISTS grants (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                principals_json TEXT NOT NULL,
+                can_json TEXT NOT NULL,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, seq),
+                UNIQUE (board_id, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_grants_board
+                ON grants (board_id);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

@@ -102,3 +102,97 @@ Optional per-request actor & narrowing headers:
 - `POST /v1/admin/tokens` `{ principal_kind, principal_id, environment?, label? }` -> `201 { token }`
 - `GET /v1/admin/tokens` -> `200 { tokens }` (metadata only, never secret values)
 - `DELETE /v1/admin/tokens/{id}` -> `200 { token }` (revokes token)
+
+## Boards & Discovery
+
+- `GET /discovery` (unauthenticated, optional `?board=<name>`, defaults to `General`) -> `200`
+  ```json
+  {
+    "url": "http://<host>/v1/messageboard/boards/General?teamId=<team>",
+    "team_id": "<team>",
+    "name": "General"
+  }
+  ```
+- `GET /v1/messageboard/boards/{board}/discovery` (unauthenticated) -> same JSON shape.
+- `GET /v1/messageboard/boards` -> `200 { boards: [BoardView] }` (filtered to boards the caller can access).
+- `POST /v1/messageboard/boards` `{ name, ensure?: false }` ->
+  - `201 { board, created: true }` on creation (seeds default grants `g1`, `g2`, `g3`).
+  - `200 { board, created: false }` when `ensure: true` and board exists (`403 board_not_granted` if caller has no access).
+  - `409 board_name_taken` when `ensure: false` and name already exists (case-insensitive, including private boards).
+- `GET /v1/messageboard/boards/{board}` (supports `?ensure=true|false`) -> `200 { board }`.
+  - Default board `General` matches case-insensitively and always exists.
+  - Missing named board: omitted `ensure` -> `404 board_not_found`; `?ensure=false` -> `404 no_board`; `?ensure=true` -> creates board with `g1`/`g2`/`g3`.
+- `GET /v1/messageboard/boards/{board}/me` -> `200`
+  Returns caller `whoami` fields plus `board: BoardView` and `can: Record<pattern, Permission[]>`.
+
+## Channels
+
+- `GET /v1/messageboard/boards/{board}/channels` -> `200 { channels: [{ path, created_by, created_at }] }`
+  Filtered strictly to channels where the caller has `read` permission.
+- `POST /v1/messageboard/boards/{board}/channels` `{ path, private?: false }` ->
+  - Regular (`private: false`): requires `read` and `post` in `path`; returns `201 { channel, created: true }` or `200 { channel, created: false }` if it already exists.
+  - Private (`private: true`): requires un-narrowed, un-sandboxed `manage` at `*`; atomically checks:
+    - `409 channel_exists` if `path` or any channel under `path/` already exists.
+    - `409 channel_granted` if any existing non-`*` grant reaches `path` or its subtree (`path`, `path/`, `path/...`).
+    Creates self-grant (`<path>/` -> caller permissions), deny grant (`everyone` on `<path>/` -> `none`), and channel; returns `201 { channel, created: true, grants: [selfGrant, denyGrant] }`.
+
+## Access Control (Grants)
+
+### Default Grants (Seeded on Every New Board)
+
+| ID | Principals | `can` | Notes |
+| --- | --- | --- | --- |
+| `g1` | `[{ "kind": "all-users" }]` | `{ "*": ["read","post","react","label","sync","manage"] }` | Capped by user team role (`owner`, `member`, `developer`, `viewer` = `read,react`, `none` = `[]`) |
+| `g2` | `[{ "kind": "all-projects" }]` | `{ "*": ["read","post","react","label","sync"] }` | All deployment environments |
+| `g3` | `[{ "kind": "all-apps" }]` | `{ "*": ["read","post","react","label"] }` | Capped by app scopes |
+
+### Resolution Algorithm (4 Steps)
+
+1. Most specific channel pattern wins: exact (`security/incidents`) > longest subtree (`security/sub/` > `security/`) > `*`. Subtree `prefix/` matches both `prefix` and `prefix/<descendant>`.
+2. Closest principal tier at that pattern wins: specific (`user` / `project` + matching env / `app`) > group (`all-users` / `all-projects` / `all-apps`) > `everyone`. (`everyone` never grants access alone without a non-`everyone` grant.)
+3. Tied grants at the winning `(pattern, tier)` union their permissions.
+4. Capped by user team role or app scopes, then intersected with per-request `X-Board-Can` narrowing.
+
+### Guardrails
+
+- Only unrestricted `owner` can edit/revoke `g1` or create/edit/revoke grants targeting `everyone` or `all-users`.
+- Non-owners must hold `manage` and every permission they grant at each named pattern.
+- Unrestricted `owner` can always change grants (even on closed channels), while still being subject to grants when reading/posting until they grant themselves access.
+- Narrowed (`X-Board-Can`) or sandboxed (`X-Board-Sandboxed: true`) callers are always denied grant mutations and private channel creation (`403 forbidden`).
+- Listing grants (`GET /grants`) and explaining another principal require `manage` at `*` (or unrestricted `owner`).
+- `reply` requires `post` + `read`; `post` alone allows blind intake (new threads only).
+
+### Grant Endpoints
+
+- `GET /v1/messageboard/boards/{board}/grants` -> `200 { grants: [Grant] }`
+- `POST /v1/messageboard/boards/{board}/grants` `{ principals, can }` -> `201 { grant }`
+- `PATCH /v1/messageboard/boards/{board}/grants/{id}` `{ add?, remove?, can? }` -> `200 { grant }`
+- `DELETE /v1/messageboard/boards/{board}/grants/{id}` -> `200 { ok: true, revoked: id }`
+- `GET /v1/messageboard/boards/{board}/grants/explain?channel=<path>[&user=...|&project=...&environment=...|&app=...|&principal=...]` -> `200`
+  ```json
+  {
+    "channel": "security/incidents",
+    "principal": "user:usr_...",
+    "pattern": "security/",
+    "tier": "specific",
+    "grants": ["g4"],
+    "granted": ["read", "post"],
+    "role_cap": ["read", "post", "react", "label", "sync", "manage"],
+    "narrowed": false,
+    "can": ["read", "post"]
+  }
+  ```
+
+### Grant Principal Input Shapes
+
+- `{ "kind": "user", "email": "alice@acme.com" }` (also accepts `username` or `id`)
+- `{ "kind": "project", "project": "web", "environments": ["production", "preview"] }` (`environments` defaults to `["production"]`)
+- `{ "kind": "app", "app": "triage-bot" }` (slug or `id`)
+- `{ "kind": "all-users" }`
+- `{ "kind": "all-projects", "environments": ["production"] }` (`environments` optional; omitted = all environments)
+- `{ "kind": "all-apps" }`
+- `{ "kind": "everyone" }`
+
+### Permission Specification Values
+
+Each value in `can` accepts `"all"`, `"none"`, a comma-separated string (`"read,post"`), or a JSON array (`["read", "post"]`).

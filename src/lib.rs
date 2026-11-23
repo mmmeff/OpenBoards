@@ -1,8 +1,11 @@
 pub mod actors;
 pub mod api;
+pub mod boards;
+pub mod channels;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod grants;
 pub mod id;
 pub mod permissions;
 pub mod validate;
@@ -43,6 +46,7 @@ pub async fn serve(config: ServerConfig) -> BoardResult<()> {
             "bootstrapped initial owner token (shown once): {generated_token}"
         );
     }
+    boards::ensure_default_board(&db)?;
 
     let listen = config.listen;
     let state = AppState::new(db, config);
