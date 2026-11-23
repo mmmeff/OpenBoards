@@ -1,0 +1,180 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use chrono::Utc;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
+
+use crate::error::{BoardError, BoardResult};
+
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "001_init",
+    sql: r#"
+        CREATE TABLE IF NOT EXISTS server_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    "#,
+}];
+
+/// SQLite database wrapper in WAL mode with foreign keys enabled.
+///
+/// ponytail: single Mutex<Connection> keeps SQLite access simple with zero pool crate overhead.
+/// Ceiling: concurrent read throughput under heavy read load; upgrade path is a separate
+/// read-only connection pool (e.g. r2d2/deadpool) while keeping serialized writes.
+#[derive(Clone)]
+pub struct Database {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Database {
+    pub fn open(path: &Path) -> BoardResult<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    BoardError::internal(format!(
+                        "failed to create data directory '{}': {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+        let conn = Connection::open(path)?;
+        Self::init(conn, true)
+    }
+
+    pub fn open_in_memory() -> BoardResult<Self> {
+        let conn = Connection::open_in_memory()?;
+        Self::init(conn, false)
+    }
+
+    fn init(mut conn: Connection, enable_wal: bool) -> BoardResult<Self> {
+        if enable_wal {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        run_migrations(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    pub fn with_conn<T, F>(&self, f: F) -> BoardResult<T>
+    where
+        F: FnOnce(&Connection) -> BoardResult<T>,
+    {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| BoardError::internal("database mutex poisoned"))?;
+        f(&guard)
+    }
+
+    pub fn with_tx<T, F>(&self, f: F) -> BoardResult<T>
+    where
+        F: FnOnce(&Transaction<'_>) -> BoardResult<T>,
+    {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| BoardError::internal("database mutex poisoned"))?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn schema_version(&self) -> BoardResult<i64> {
+        self.with_conn(|conn| {
+            let version: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(version)
+        })
+    }
+}
+
+fn run_migrations(conn: &mut Connection) -> BoardResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS _migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+
+    let current: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+        [],
+        |row| row.get(0),
+    )?;
+
+    for migration in MIGRATIONS {
+        if migration.version <= current {
+            continue;
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(migration.sql)?;
+        tx.execute(
+            "INSERT INTO _migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![migration.version, migration.name, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initializes_file_db_with_wal_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("openboards.db");
+        let db = Database::open(&db_path).unwrap();
+
+        assert_eq!(db.schema_version().unwrap(), 1);
+
+        db.with_conn(|conn| {
+            let journal_mode: String =
+                conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            let foreign_keys: i64 =
+                conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+            assert_eq!(journal_mode.to_lowercase(), "wal");
+            assert_eq!(foreign_keys, 1);
+            Ok(())
+        })
+        .unwrap();
+
+        // Reopening is idempotent
+        let db2 = Database::open(&db_path).unwrap();
+        assert_eq!(db2.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn initializes_in_memory_db_with_foreign_keys() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.schema_version().unwrap(), 1);
+        db.with_conn(|conn| {
+            let foreign_keys: i64 =
+                conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+            assert_eq!(foreign_keys, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+}
