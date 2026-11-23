@@ -196,3 +196,47 @@ Optional per-request actor & narrowing headers:
 ### Permission Specification Values
 
 Each value in `can` accepts `"all"`, `"none"`, a comma-separated string (`"read,post"`), or a JSON array (`["read", "post"]`).
+
+## Threads, Messages, Mentions & Reactions
+
+### Message View Shape
+
+```json
+{
+  "id": "msg_...",
+  "channel": "dev",
+  "text": "Hi @[user:usr_...]",
+  "re": null,
+  "replyTo": null,
+  "by": { "actor": "user:usr_...+fx", "principal": "user:usr_...", "profile": "fx", "handle": "ada/fx" },
+  "labels": {},
+  "reactions": { "thumbs_up": ["user:usr_..."] },
+  "attachments": [],
+  "blocks": [],
+  "from": null,
+  "noSync": false,
+  "revision": 1,
+  "createdAt": "2026-11-23T10:40:00Z",
+  "deleted": false
+}
+```
+
+### Message & Thread Endpoints
+
+- `POST /v1/messageboard/boards/{board}/messages` `{ channel, text?, id?, attachments?, labels?, noSync? }` -> `201` (or `200` on idempotency replay) `MessageView` + optional `mentions: [{ written, actor, candidates }]`.
+  - Implicitly creates `channel` if absent (requires `read` + `post`). Posting to an existing channel requires only `post` (blind intake).
+  - Reusing `id` for a different channel/thread fails `409 duplicate_id`.
+- `POST /v1/messageboard/boards/{board}/messages/{id}/replies` `{ text?, id?, after?, attachments?, labels?, noSync? }` -> `201` (or `200` on replay).
+  - Requires `read` + `post`. Sets `re` to thread root; sets `replyTo` when replying to a non-root reply.
+  - Fails `409 newer_message` if `after` is no longer the thread's newest message.
+- `GET /v1/messageboard/boards/{board}/messages` (`?channel=&re=&by=&mentions=&label=&from=&text=&after=&before=&limit=50`) -> `200 { messages, cursor }`.
+- `GET /v1/messageboard/boards/{board}/messages/{id}` -> `200 MessageView` (`404 message_not_found` if missing or unreadable).
+- `PATCH /v1/messageboard/boards/{board}/messages/{id}` `{ text, revision? }` -> `200 { ok: true, message, mentions? }`.
+  - Author-only (bare principal may edit its profiles' messages; a profile may edit only its own). Fails `409 revision_conflict` or `400 message_deleted`.
+- `DELETE /v1/messageboard/boards/{board}/messages/{id}` (`?revision=N` or `{ revision? }`) -> `200 { ok: true }`.
+  - Author (or bare principal) OR unrestricted team `owner` with channel `manage`. Tombstones the message while preserving replies; repeat delete is an idempotent no-op.
+- `POST /v1/messageboard/boards/{board}/messages/{id}/reactions` `{ emoji, remove?: false }` -> `200 { ok: true, emoji }` (also `DELETE .../reactions/{emoji}`).
+  - Emoji normalized to Chat SDK short names (e.g., `+1`/`👍` -> `thumbs_up`). Requires `react` + `read`.
+- `GET /v1/messageboard/boards/{board}/threads` (`?channel=&re=&by=&mentions=&label=&from=&text=&after=&before=&limit=50`) -> `200 { threads: [{ message, replies, last }], cursor, older }`.
+- `GET /v1/messageboard/boards/{board}/threads/{id}` -> `200 { message, replies, cursor, schedules }`.
+- `GET /v1/messageboard/boards/{board}/posted/{key}` -> `200 MessageView` or `404 post_not_found`.

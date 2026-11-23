@@ -7,6 +7,8 @@ pub mod db;
 pub mod error;
 pub mod grants;
 pub mod id;
+pub mod mentions;
+pub mod messages;
 pub mod permissions;
 pub mod validate;
 

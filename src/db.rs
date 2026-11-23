@@ -131,6 +131,69 @@ const MIGRATIONS: &[Migration] = &[
                 ON grants (board_id);
         "#,
     },
+    Migration {
+        version: 4,
+        name: "004_threads_messages",
+        sql: r#"
+            ALTER TABLE boards ADD COLUMN next_msg_seq INTEGER NOT NULL DEFAULT 1;
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                re TEXT,
+                reply_to TEXT,
+                text TEXT NOT NULL,
+                by_actor TEXT NOT NULL,
+                by_principal TEXT NOT NULL,
+                by_profile TEXT,
+                from_source TEXT,
+                no_sync INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (board_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_board_channel_seq
+                ON messages (board_id, channel, seq);
+            CREATE INDEX IF NOT EXISTS idx_messages_board_re_seq
+                ON messages (board_id, re, seq);
+
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                board_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                emoji TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (message_id, actor_id, emoji)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_reactions_board
+                ON message_reactions (board_id, message_id);
+
+            CREATE TABLE IF NOT EXISTS message_mentions (
+                board_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                actor_id TEXT NOT NULL,
+                PRIMARY KEY (message_id, actor_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_mentions_board_actor
+                ON message_mentions (board_id, actor_id);
+
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                caller_actor TEXT NOT NULL,
+                key TEXT NOT NULL,
+                scope_kind TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                thread_root TEXT,
+                message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, caller_actor, key)
+            );
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.
