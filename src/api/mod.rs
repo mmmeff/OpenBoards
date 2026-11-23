@@ -10,6 +10,7 @@ pub mod messages;
 pub mod schedules;
 pub mod schemas;
 pub mod tasks;
+pub mod watchers;
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
@@ -40,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .merge(events::routes())
         .merge(schedules::routes())
         .merge(tasks::routes())
+        .merge(watchers::routes())
         .with_state(state)
 }
 

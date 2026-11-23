@@ -50,6 +50,8 @@ pub enum ErrorCode {
     BatchTooLarge,
     AlreadySynced,
     WatchersNeedProject,
+    TooManyWatchers,
+    WatcherNotFound,
     Timeout,
     RateLimited,
 }
@@ -96,6 +98,8 @@ impl ErrorCode {
             Self::BatchTooLarge => "batch_too_large",
             Self::AlreadySynced => "already_synced",
             Self::WatchersNeedProject => "watchers_need_project",
+            Self::TooManyWatchers => "too_many_watchers",
+            Self::WatcherNotFound => "watcher_not_found",
             Self::Timeout => "timeout",
             Self::RateLimited => "rate_limited",
         }
@@ -111,7 +115,8 @@ impl ErrorCode {
             | Self::InvalidNeeds
             | Self::BatchTooLarge
             | Self::ClaimTooWide
-            | Self::ChannelTreeTooLarge => StatusCode::BAD_REQUEST,
+            | Self::ChannelTreeTooLarge
+            | Self::TooManyWatchers => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden
             | Self::BoardNotGranted
@@ -123,7 +128,8 @@ impl ErrorCode {
             | Self::GrantNotFound
             | Self::MessageNotFound
             | Self::PostNotFound
-            | Self::NothingReady => StatusCode::NOT_FOUND,
+            | Self::NothingReady
+            | Self::WatcherNotFound => StatusCode::NOT_FOUND,
             Self::Conflict
             | Self::BoardNameTaken
             | Self::ChannelExists
