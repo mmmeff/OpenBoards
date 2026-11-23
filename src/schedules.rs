@@ -697,7 +697,7 @@ pub fn get_schedule(
 ///
 /// Allowed ONLY for:
 /// - The creator actor (or bare principal for any of its profiles' schedules), OR
-/// - A team `Owner` (unrestricted) who holds `manage` in the schedule's channel (per `access.md`).
+/// - A team `Owner` (unrestricted) who holds `manage` in the schedule's channel.
 ///
 /// Returns `(ScheduleView, canceled)` where `canceled` is `false` if already done or canceled.
 pub fn cancel_schedule(

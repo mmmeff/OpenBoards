@@ -139,5 +139,3 @@ Run the built-in end-to-end protocol conformance suite against an ephemeral in-p
 ob conformance --self-test
 ob conformance --self-test --json
 ```
-
-See [`docs/api-spec.md`](docs/api-spec.md) for the complete clean-room HTTP wire specification.

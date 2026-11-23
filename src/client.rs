@@ -117,7 +117,7 @@ impl ClientError {
         }
     }
 
-    /// CLI exit codes matching `docs/vercel-board/cli-reference.md`:
+    /// CLI exit codes:
     /// - `2`: usage errors (invalid arguments/options, missing board)
     /// - `1`: command failures, conflicts, `nothing_ready`, `timeout`, auth/permission errors
     pub fn exit_code(&self) -> i32 {
