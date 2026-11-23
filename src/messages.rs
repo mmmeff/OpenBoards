@@ -17,6 +17,7 @@ use crate::labels;
 use crate::mentions::{self, MentionResolution};
 use crate::schedules;
 use crate::schemas;
+use crate::tasks::{self, TaskView};
 use crate::validate::{validate_channel_path, validate_text_length};
 
 pub const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -66,6 +67,8 @@ pub struct MessageView {
     #[serde(rename = "createdAt")]
     pub created_at: String,
     pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +317,12 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
         )
     };
 
+    let task = if row.re.is_none() {
+        tasks::load_task_view_tx(conn, &row.id)?
+    } else {
+        None
+    };
+
     Ok(MessageView {
         id: row.id.clone(),
         channel: row.channel.clone(),
@@ -339,6 +348,7 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
         revision: row.revision,
         created_at: row.created_at.clone(),
         deleted,
+        task,
     })
 }
 
@@ -520,6 +530,17 @@ pub fn post_message(
     caller: &CallerContext,
     input: PostMessageInput,
 ) -> BoardResult<PostedMessageResult> {
+    db.with_tx(|tx| post_message_in_tx(tx, board_id, caller, input))
+}
+
+/// Transaction-scoped version of `post_message` so callers (e.g., `tasks::create_task` and
+/// `tasks::create_many_tasks`) can atomically compose message creation with other writes.
+pub fn post_message_in_tx(
+    tx: &Connection,
+    board_id: &str,
+    caller: &CallerContext,
+    input: PostMessageInput,
+) -> BoardResult<PostedMessageResult> {
     validate_channel_path(&input.channel)?;
     validate_text_length(&input.text)?;
     if input.text.is_empty() && input.attachments.is_empty() {
@@ -531,158 +552,156 @@ pub fn post_message(
         labels::validate_user_labels(&input.labels)?;
     }
 
-    db.with_tx(|tx| {
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &input.channel);
+    let board_grants = grants::load_grants_tx(tx, board_id)?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &input.channel);
 
-        let channel_exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
-                params![board_id, input.channel],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
+    let channel_exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
+            params![board_id, input.channel],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
 
-        if channel_exists {
-            if !perms.can_post_new_thread() {
-                return Err(BoardError::forbidden(format!(
-                    "posting in '{}' requires 'post' permission",
-                    input.channel
-                )));
-            }
-        } else if !perms.can_create_channel() {
+    if channel_exists {
+        if !perms.can_post_new_thread() {
             return Err(BoardError::forbidden(format!(
-                "creating channel '{}' on first post requires 'read' and 'post' permissions",
+                "posting in '{}' requires 'post' permission",
                 input.channel
             )));
         }
-        if !input.labels.is_empty() && !perms.can_label() {
-            return Err(BoardError::forbidden(format!(
-                "setting labels in '{}' requires 'label' permission",
-                input.channel
-            )));
-        }
+    } else if !perms.can_create_channel() {
+        return Err(BoardError::forbidden(format!(
+            "creating channel '{}' on first post requires 'read' and 'post' permissions",
+            input.channel
+        )));
+    }
+    if !input.labels.is_empty() && !perms.can_label() {
+        return Err(BoardError::forbidden(format!(
+            "setting labels in '{}' requires 'label' permission",
+            input.channel
+        )));
+    }
 
-        let actor_id = caller.actor_id();
-        if let Some(idem_key) = &input.id {
-            if let Some(existing) = check_idempotency_tx(
-                tx,
-                board_id,
-                &actor_id,
-                idem_key,
-                "post",
-                &input.channel,
-                None,
-            )? {
-                return Ok(PostedMessageResult {
-                    message: existing,
-                    mentions: Vec::new(),
-                    replayed: true,
-                    event_seq: None,
-                });
-            }
-        }
-
-        let parsed_blocks =
-            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
-
-        let now = Utc::now().to_rfc3339();
-        if !channel_exists {
-            tx.execute(
-                "INSERT INTO channels (board_id, path, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![board_id, input.channel, actor_id, now],
-            )?;
-        }
-
-        actors::record_actor_write_tx(tx, board_id, &input.channel, caller)?;
-
-        let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
-        let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
-
-        let msg_id = new_message_id();
-        let seq = next_msg_seq_tx(tx, board_id)?;
-        let by_principal = caller.principal_id();
-        let by_profile = caller.profile.as_ref().map(|p| p.name_lower.clone());
-
-        tx.execute(
-            "INSERT INTO messages (
-                id, board_id, seq, channel, re, reply_to, text,
-                by_actor, by_principal, by_profile, from_source, no_sync,
-                revision, deleted_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, NULL, ?9, 1, NULL, ?10, ?10)",
-            params![
-                msg_id,
-                board_id,
-                seq,
-                input.channel,
-                resolved_mentions.text,
-                actor_id,
-                by_principal,
-                by_profile,
-                i64::from(input.no_sync),
-                now
-            ],
-        )?;
-
-        store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
-        if !input.attachments.is_empty() {
-            attachments::validate_and_link_attachments_tx(
-                tx,
-                board_id,
-                &board_grants,
-                caller,
-                &msg_id,
-                &input.attachments,
-            )?;
-        }
-        if !input.labels.is_empty() {
-            labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
-        }
-        if !parsed_blocks.is_empty() {
-            schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
-        }
-
-        if let Some(idem_key) = &input.id {
-            store_idempotency_tx(
-                tx,
-                IdempotencyRecord {
-                    board_id,
-                    caller_actor: &actor_id,
-                    key: idem_key,
-                    scope: "post",
-                    channel: &input.channel,
-                    thread_root: None,
-                    message_id: &msg_id,
-                    now: &now,
-                },
-            )?;
-        }
-
-        let stored = load_stored_message_tx(tx, board_id, &msg_id)?
-            .expect("inserted message must exist");
-        let snap = build_message_snapshot_tx(tx, &stored)?;
-        let view = hydrate_message_view_tx(tx, &stored)?;
-        let ev = events::append_event_tx(
+    let actor_id = caller.actor_id();
+    if let Some(idem_key) = &input.id {
+        if let Some(existing) = check_idempotency_tx(
             tx,
-            EventAppend {
+            board_id,
+            &actor_id,
+            idem_key,
+            "post",
+            &input.channel,
+            None,
+        )? {
+            return Ok(PostedMessageResult {
+                message: existing,
+                mentions: Vec::new(),
+                replayed: true,
+                event_seq: None,
+            });
+        }
+    }
+
+    let parsed_blocks =
+        schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
+
+    let now = Utc::now().to_rfc3339();
+    if !channel_exists {
+        tx.execute(
+            "INSERT INTO channels (board_id, path, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![board_id, input.channel, actor_id, now],
+        )?;
+    }
+
+    actors::record_actor_write_tx(tx, board_id, &input.channel, caller)?;
+
+    let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
+    let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
+
+    let msg_id = new_message_id();
+    let seq = next_msg_seq_tx(tx, board_id)?;
+    let by_principal = caller.principal_id();
+    let by_profile = caller.profile.as_ref().map(|p| p.name_lower.clone());
+
+    tx.execute(
+        "INSERT INTO messages (
+            id, board_id, seq, channel, re, reply_to, text,
+            by_actor, by_principal, by_profile, from_source, no_sync,
+            revision, deleted_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, NULL, ?9, 1, NULL, ?10, ?10)",
+        params![
+            msg_id,
+            board_id,
+            seq,
+            input.channel,
+            resolved_mentions.text,
+            actor_id,
+            by_principal,
+            by_profile,
+            i64::from(input.no_sync),
+            now
+        ],
+    )?;
+
+    store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+    if !input.attachments.is_empty() {
+        attachments::validate_and_link_attachments_tx(
+            tx,
+            board_id,
+            &board_grants,
+            caller,
+            &msg_id,
+            &input.attachments,
+        )?;
+    }
+    if !input.labels.is_empty() {
+        labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
+    }
+    if !parsed_blocks.is_empty() {
+        schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
+    }
+
+    if let Some(idem_key) = &input.id {
+        store_idempotency_tx(
+            tx,
+            IdempotencyRecord {
                 board_id,
-                event_type: EventType::MessagePosted,
-                channel: Some(&input.channel),
-                message_id: Some(&msg_id),
-                actor_id: Some(&actor_id),
-                payload: serde_json::json!({ "channel": input.channel, "re": Value::Null }),
-                before_snapshot: None,
-                after_snapshot: Some(&snap),
-                after_message: Some(&view),
+                caller_actor: &actor_id,
+                key: idem_key,
+                scope: "post",
+                channel: &input.channel,
+                thread_root: None,
+                message_id: &msg_id,
+                now: &now,
             },
         )?;
-        Ok(PostedMessageResult {
-            message: view,
-            mentions: resolved_mentions.mentions,
-            replayed: false,
-            event_seq: Some(ev.seq),
-        })
+    }
+
+    let stored = load_stored_message_tx(tx, board_id, &msg_id)?
+        .expect("inserted message must exist");
+    let snap = build_message_snapshot_tx(tx, &stored)?;
+    let view = hydrate_message_view_tx(tx, &stored)?;
+    let ev = events::append_event_tx(
+        tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::MessagePosted,
+            channel: Some(&input.channel),
+            message_id: Some(&msg_id),
+            actor_id: Some(&actor_id),
+            payload: serde_json::json!({ "channel": input.channel, "re": Value::Null }),
+            before_snapshot: None,
+            after_snapshot: Some(&snap),
+            after_message: Some(&view),
+        },
+    )?;
+    Ok(PostedMessageResult {
+        message: view,
+        mentions: resolved_mentions.mentions,
+        replayed: false,
+        event_seq: Some(ev.seq),
     })
 }
 
@@ -889,7 +908,7 @@ pub fn edit_message(
     message_id: &str,
     caller: &CallerContext,
     input: EditMessageInput,
-) -> BoardResult<(MessageView, Vec<MentionResolution>, i64)> {
+) -> BoardResult<(MessageView, Vec<MentionResolution>, Vec<i64>)> {
     validate_text_length(&input.text)?;
     if input.text.is_empty() {
         return Err(BoardError::bad_request("edited text cannot be empty"));
@@ -973,7 +992,14 @@ pub fn edit_message(
                 after_message: Some(&view),
             },
         )?;
-        Ok((view, resolved_mentions.mentions, ev.seq))
+        let mut seqs = vec![ev.seq];
+        if msg.re.is_none() {
+            if let Some(task_seq) = tasks::on_root_edited_tx(tx, board_id, message_id, caller)? {
+                seqs.push(task_seq);
+            }
+        }
+        let final_view = hydrate_message_view_tx(tx, &updated)?;
+        Ok((final_view, resolved_mentions.mentions, seqs))
     })
 }
 
@@ -987,7 +1013,7 @@ pub fn delete_message(
     message_id: &str,
     caller: &CallerContext,
     input: DeleteMessageInput,
-) -> BoardResult<Option<i64>> {
+) -> BoardResult<Vec<i64>> {
     db.with_tx(|tx| {
         let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
             BoardError::new(
@@ -1027,7 +1053,7 @@ pub fn delete_message(
         }
 
         if msg.deleted_at.is_some() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let before_snap = build_message_snapshot_tx(tx, &msg)?;
@@ -1067,8 +1093,15 @@ pub fn delete_message(
                 after_message: Some(&view),
             },
         )?;
+        let mut seqs = vec![ev.seq];
+        if msg.re.is_none() {
+            if let Some(task_seq) = tasks::on_root_deleted_tx(tx, board_id, message_id, &actor_id)?
+            {
+                seqs.push(task_seq);
+            }
+        }
 
-        Ok(Some(ev.seq))
+        Ok(seqs)
     })
 }
 

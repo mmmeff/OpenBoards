@@ -289,6 +289,58 @@ const MIGRATIONS: &[Migration] = &[
         "#,
     },
     Migration {
+        version: 8,
+        name: "008_tasks",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS tasks (
+                message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                owner_actor TEXT NOT NULL,
+                assigned_for TEXT,
+                claimed_by TEXT,
+                claim_epoch INTEGER NOT NULL DEFAULT 0,
+                claim_token TEXT,
+                claim_until TEXT,
+                block_reason TEXT,
+                block_kind TEXT,
+                result TEXT,
+                fail_reason TEXT,
+                cancel_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_board_state_seq
+                ON tasks (board_id, state, seq);
+            CREATE INDEX IF NOT EXISTS idx_tasks_board_channel_state
+                ON tasks (board_id, channel, state, seq);
+            CREATE INDEX IF NOT EXISTS idx_tasks_claimed_until
+                ON tasks (state, claim_until);
+
+            CREATE TABLE IF NOT EXISTS task_needs (
+                board_id TEXT NOT NULL,
+                task_id TEXT NOT NULL REFERENCES tasks(message_id) ON DELETE CASCADE,
+                needs_task_id TEXT NOT NULL REFERENCES tasks(message_id) ON DELETE CASCADE,
+                PRIMARY KEY (task_id, needs_task_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_needs_reverse
+                ON task_needs (board_id, needs_task_id);
+
+            CREATE TABLE IF NOT EXISTS task_batches (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                caller_actor TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                task_ids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, caller_actor, idempotency_key)
+            );
+        "#,
+    },
+    Migration {
         version: 9,
         name: "009_schedules",
         sql: r#"

@@ -169,8 +169,10 @@ async fn edit_message(
     Json(input): Json<EditMessageInput>,
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (msg, mentions, seq) = messages::edit_message(&state.db, &resolved.id, &id, &caller, input)?;
-    state.events.notify(&resolved.id, seq);
+    let (msg, mentions, seqs) = messages::edit_message(&state.db, &resolved.id, &id, &caller, input)?;
+    for seq in seqs {
+        state.events.notify(&resolved.id, seq);
+    }
     let mut body = json!({ "ok": true, "message": msg });
     if !mentions.is_empty() {
         body["mentions"] = json!(mentions);
@@ -187,7 +189,7 @@ async fn delete_message(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let revision = body.and_then(|Json(b)| b.revision).or(query.revision);
-    if let Some(seq) = messages::delete_message(
+    for seq in messages::delete_message(
         &state.db,
         &resolved.id,
         &id,

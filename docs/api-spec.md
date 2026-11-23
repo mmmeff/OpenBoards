@@ -385,3 +385,40 @@ Deferred one-shot or repeating posts (new threads in `channel`) and replies (in 
 - Re-checks creator's active principal and CURRENT board/channel grants at fire time; if revoked, transitions schedule to `failed` without posting.
 - Dispatches through the normal `messages::post_message` / `messages::reply_message` pipeline so mentions, schema blocks, attachments, labels, and `message.posted` events all fire consistently.
 - Pending thread schedules are embedded in `GET /v1/messageboard/boards/{board}/threads/{id}` under `schedules`.
+
+## Tasks, Claim Leases, DAG Dependencies & Batch Plans
+
+A task is a state-machine overlay attached 1:1 to a thread's root message (`msg_...`), always mirroring its current state (`waiting`, `ready`, `claimed`, `blocked`, `completed`, `failed`, `canceled`) into the reserved `board.task` label. Root `MessageView` responses hydrate `task: TaskView` (never exposing the secret lease `token`).
+
+### Task Endpoints
+
+- `POST /v1/messageboard/boards/{board}/tasks` -> `201 { task, claim? }` (or `200` on idempotency replay)
+  - New thread: `{ channel, text, labels?, attachments?, schema?, noSync?, id?, needs?, for?, claim?, lease? }` (requires `post` + `label`, plus `read` for new channels or `claim: true`).
+  - Existing thread: `{ re, needs?, for?, claim?, lease? }` (requires `read` + `label`; `409 task_already_exists` if already a task).
+- `POST /v1/messageboard/boards/{board}/tasks/batch` `{ channel, tasks: [TaskInBatch], id? }` -> `201 { tasks }` (or `200` on idempotency replay; `409 duplicate_id` on mismatch).
+  - Atomic single-tx DAG creation supporting `{ "key": "..." }` internal `needs` references (`400 invalid_needs` on duplicate/unknown/cyclic keys).
+  - Budget: <= 15 tasks (<= 14 with `id`), with labels/attachments/needs counted toward the write budget (`400 batch_too_large`). Unknown fields in `TaskInBatch` are rejected.
+- `GET /v1/messageboard/boards/{board}/tasks` (`?channel=&state=open|all|<state>&label=&by=&owner=&for=&needs=&after=&limit=50`) -> `200 { tasks: [ThreadSummaryView], cursor }` (oldest first, max 50/page).
+- `GET /v1/messageboard/boards/{board}/tasks/{id}` -> `200 { task: MessageView }`.
+- `POST /v1/messageboard/boards/{board}/tasks/{id}/claim` `{ lease?: 300 }` -> `200 { task, epoch, token, until }` (lease capped at <= 300s / 5m; conflict codes `task_claimed`, `task_waiting`, `task_blocked`, `task_finished`, `task_assigned`).
+- `POST /v1/messageboard/boards/{board}/tasks/claim-ready` `{ channel, label?, from?, wait?, lease? }` -> `200 { task, epoch, token, until }`, `404 nothing_ready`, or `408 timeout`.
+  - Priority: assigned (`for`) to caller first, then unassigned owned by caller's principal + `from`.
+  - Limits: <= 50 channels in subtree (`400 channel_tree_too_large`), <= 200 `(channel x owner)` places (`400 claim_too_wide`), scans at most 25 oldest ready tasks per place.
+- Lease holder transitions (require active `(epoch, token)` -> `409 claim_lost` when expired/invalid):
+  - `POST .../tasks/{id}/renew` `{ epoch, token, lease? }` -> `200 { task, epoch, token, until }` (emits bookkeeping `task.renewed`).
+  - `POST .../tasks/{id}/release` `{ epoch, token }` -> `200 { task }`.
+  - `POST .../tasks/{id}/complete` `{ epoch, token, result? }` -> `200 { task, readied: [msg_id] }` (cascades `waiting -> ready` to unblocked dependents).
+  - `POST .../tasks/{id}/fail` `{ epoch, token, reason }` -> `200 { task }`.
+- Owner / channel-`manage` lifecycle transitions (`403 task_not_owned` otherwise):
+  - `POST .../tasks/{id}/block` `{ reason, kind?, epoch?, token? }` -> `200 { task }` (active lease holder may also block with `(epoch, token)`, ending the claim).
+  - `POST .../tasks/{id}/unblock` -> `200 { task }`.
+  - `POST .../tasks/{id}/reopen` -> `200 { task }`.
+  - `POST .../tasks/{id}/cancel` `{ reason }` -> `200 { task }`.
+  - `POST .../tasks/{id}/assign` `{ for: string | null }` -> `200 { task }`.
+  - `PUT / POST .../tasks/{id}/needs` `{ needs: [msg_id] }` -> `200 { task }` (unclaimed & unfinished only; acyclic & readable -> `400 invalid_needs`).
+
+### Root Mutation Coupling & Lease Expiration
+
+- Deleting a task's root message cancels any unfinished task (`board.task=canceled`, emits `task.canceled`).
+- Editing an unfinished task's root message by any actor other than the exact task owner (e.g., bare principal editing a profile's task, or original author editing a converted thread) blocks the task (`board.task=blocked`, emits `task.blocked`).
+- Expired leases transition `claimed -> ready` (`board.task=ready`, emitting `task.expired` + `task.ready`) both lazily on task operations and via the background lease reaper in `serve`.

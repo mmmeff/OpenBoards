@@ -37,6 +37,15 @@ pub enum ErrorCode {
     SchemaImmutable,
     ClaimLost,
     TaskNotOwned,
+    TaskClaimed,
+    TaskWaiting,
+    TaskBlocked,
+    TaskFinished,
+    TaskAssigned,
+    TaskAlreadyExists,
+    NothingReady,
+    ClaimTooWide,
+    ChannelTreeTooLarge,
     InvalidNeeds,
     BatchTooLarge,
     AlreadySynced,
@@ -74,6 +83,15 @@ impl ErrorCode {
             Self::SchemaImmutable => "schema_immutable",
             Self::ClaimLost => "claim_lost",
             Self::TaskNotOwned => "task_not_owned",
+            Self::TaskClaimed => "task_claimed",
+            Self::TaskWaiting => "task_waiting",
+            Self::TaskBlocked => "task_blocked",
+            Self::TaskFinished => "task_finished",
+            Self::TaskAssigned => "task_assigned",
+            Self::TaskAlreadyExists => "task_already_exists",
+            Self::NothingReady => "nothing_ready",
+            Self::ClaimTooWide => "claim_too_wide",
+            Self::ChannelTreeTooLarge => "channel_tree_too_large",
             Self::InvalidNeeds => "invalid_needs",
             Self::BatchTooLarge => "batch_too_large",
             Self::AlreadySynced => "already_synced",
@@ -91,7 +109,9 @@ impl ErrorCode {
             | Self::InvalidBlock
             | Self::SchemaNotFound
             | Self::InvalidNeeds
-            | Self::BatchTooLarge => StatusCode::BAD_REQUEST,
+            | Self::BatchTooLarge
+            | Self::ClaimTooWide
+            | Self::ChannelTreeTooLarge => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden
             | Self::BoardNotGranted
@@ -102,7 +122,8 @@ impl ErrorCode {
             | Self::BoardNotFound
             | Self::GrantNotFound
             | Self::MessageNotFound
-            | Self::PostNotFound => StatusCode::NOT_FOUND,
+            | Self::PostNotFound
+            | Self::NothingReady => StatusCode::NOT_FOUND,
             Self::Conflict
             | Self::BoardNameTaken
             | Self::ChannelExists
@@ -113,6 +134,12 @@ impl ErrorCode {
             | Self::DuplicateId
             | Self::SchemaImmutable
             | Self::ClaimLost
+            | Self::TaskClaimed
+            | Self::TaskWaiting
+            | Self::TaskBlocked
+            | Self::TaskFinished
+            | Self::TaskAssigned
+            | Self::TaskAlreadyExists
             | Self::AlreadySynced => StatusCode::CONFLICT,
             Self::Timeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
