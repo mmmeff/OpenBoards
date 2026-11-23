@@ -1,23 +1,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::Args;
 
 pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
 pub const DEFAULT_RATE_LIMIT_BURST: u32 = 200;
-
-#[derive(Debug, Parser)]
-#[command(name = "openboards", version, about = "Self-hostable message board for teams and coding agents")]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Start the OpenBoards HTTP server
-    Serve(ServeArgs),
-}
+pub const DEFAULT_DATA_DIR: &str = "./.openboards";
+pub const LOCAL_DATA_DIR: &str = "./.board";
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
@@ -26,8 +15,8 @@ pub struct ServeArgs {
     pub listen: SocketAddr,
 
     /// Directory for SQLite database and local blob storage
-    #[arg(long, env = "OPENBOARDS_DATA_DIR", default_value = "./.openboards")]
-    pub data_dir: PathBuf,
+    #[arg(long, env = "OPENBOARDS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// Team identifier/slug served by this instance
     #[arg(long, env = "OPENBOARDS_TEAM", default_value = "default")]
@@ -44,6 +33,10 @@ pub struct ServeArgs {
     /// Per-principal burst capacity for rate limiting
     #[arg(long, env = "OPENBOARDS_RATE_LIMIT_BURST", default_value_t = DEFAULT_RATE_LIMIT_BURST)]
     pub rate_limit_burst: u32,
+
+    /// Local development mode (defaults data dir to ./.board, persists token to .board/token, prints env exports)
+    #[arg(long, default_value_t = false)]
+    pub local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,9 +51,16 @@ pub struct ServerConfig {
 
 impl From<ServeArgs> for ServerConfig {
     fn from(args: ServeArgs) -> Self {
+        let data_dir = args.data_dir.unwrap_or_else(|| {
+            if args.local {
+                PathBuf::from(LOCAL_DATA_DIR)
+            } else {
+                PathBuf::from(DEFAULT_DATA_DIR)
+            }
+        });
         Self {
             listen: args.listen,
-            data_dir: args.data_dir,
+            data_dir,
             team: args.team,
             admin_token: args.admin_token,
             rate_limit_rps: args.rate_limit_rps,
@@ -73,25 +73,41 @@ impl ServerConfig {
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("openboards.db")
     }
+
+    pub fn local_token_path(&self) -> PathBuf {
+        self.data_dir.join("token")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
 
     #[test]
     fn parses_serve_cli_flags_and_defaults() {
-        let cli = Cli::try_parse_from(["openboards", "serve"]).unwrap();
-        let Command::Serve(args) = cli.command;
-        assert_eq!(args.listen.to_string(), "127.0.0.1:8080");
-        assert_eq!(args.data_dir, PathBuf::from("./.openboards"));
-        assert_eq!(args.team, "default");
-        assert!(args.admin_token.is_none());
-        assert_eq!(args.rate_limit_rps, DEFAULT_RATE_LIMIT_RPS);
-        assert_eq!(args.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
+        let w = Wrapper::try_parse_from(["serve"]).unwrap();
+        assert!(!w.serve.local);
+        let cfg = ServerConfig::from(w.serve);
+        assert_eq!(cfg.listen.to_string(), "127.0.0.1:8080");
+        assert_eq!(cfg.data_dir, PathBuf::from("./.openboards"));
+        assert_eq!(cfg.team, "default");
+        assert!(cfg.admin_token.is_none());
+        assert_eq!(cfg.rate_limit_rps, DEFAULT_RATE_LIMIT_RPS);
+        assert_eq!(cfg.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
 
-        let cli = Cli::try_parse_from([
-            "openboards",
+        let w = Wrapper::try_parse_from(["serve", "--local"]).unwrap();
+        assert!(w.serve.local);
+        let cfg = ServerConfig::from(w.serve);
+        assert_eq!(cfg.data_dir, PathBuf::from("./.board"));
+
+        let w = Wrapper::try_parse_from([
             "serve",
             "--listen",
             "0.0.0.0:9000",
@@ -107,8 +123,7 @@ mod tests {
             "50",
         ])
         .unwrap();
-        let Command::Serve(args) = cli.command;
-        let cfg = ServerConfig::from(args);
+        let cfg = ServerConfig::from(w.serve);
         assert_eq!(cfg.listen.to_string(), "0.0.0.0:9000");
         assert_eq!(cfg.db_path(), PathBuf::from("/tmp/ob/openboards.db"));
         assert_eq!(cfg.team, "acme");

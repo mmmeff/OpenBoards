@@ -366,6 +366,13 @@ pub fn caller_has_any_board_access(grants: &[Grant], caller: &CallerContext) -> 
             }
         }
     }
+    if let Some(narrowing) = &caller.narrowing {
+        for pattern in narrowing.rules.keys() {
+            if !caller_permissions_at_pattern(grants, caller, pattern).is_empty() {
+                return true;
+            }
+        }
+    }
     false
 }
 

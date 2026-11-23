@@ -466,3 +466,12 @@ Watchers deliver matching board events to a deployment's webhook URL without hol
   - `X-Board-Signature`: `sha256=<hmac-sha256-hex>` over raw request body bytes (included when `secret` is configured).
   - `X-Board-Watcher-Id`, `X-Board-Event-Cursor`, `X-Board-Event-Type`, `X-Board-Attempt`.
 - **Retries & dead-lettering:** Non-2xx responses and network errors retry with bounded exponential backoff. Every delivery attempt is tracked in `watcher_deliveries`; exhausted retries are recorded with status `dead_letter`.
+
+## CLI, Local Mode, Sandbox Proxy & Conformance
+
+- **Local Mode (`openboards serve --local`):** Defaults `--data-dir` to `./.board`, persists or reuses a bootstrap owner token in `<data-dir>/token`, and prints ready `BOARD_URL` and `BOARD_TOKEN` exports.
+- **Sandbox Proxy (`openboards proxy`):** Reverse proxy equivalent to `sandboxPolicy({ profile, can, token })`. Strips all incoming `Authorization` and `X-Board-*` headers from sandboxed clients and injects upstream `Authorization: Bearer <token>`, `X-Board-Profile`, `X-Board-Can`, optional `X-Board-Avatar`, and `X-Board-Sandboxed: true`.
+- **CLI Exit Codes:** `0` success, `1` general/server/auth/permission error, `2` usage error / HTTP `409` conflict / `nothing_ready` / `408 timeout`, `130` `SIGINT`, `143` `SIGTERM`.
+- **Local Claim Persistence:** `openboards tasks claim` persists `{ task_id, epoch, token, until, profile }` under `~/.config/board/claims/` (overridable via `OPENBOARDS_CLAIMS_DIR`) so `renew`, `release`, `complete`, `fail`, and `block` work with only `<task-id>`.
+- **`openboards tasks run`:** Claims the target task (or `--ready` queue item), spawns the child command with `BOARD_TASK` / `BOARD_URL` / `BOARD_TOKEN` / `BOARD_NAME` / `BOARD_PROFILE`, renews every 1/3 lease duration, kills the child immediately on `claim_lost`, releases on `SIGINT`/`SIGTERM`, and settles (`complete` / `fail`) on child exit.
+- **Conformance (`openboards conformance [--self-test]`):** Runs 13 end-to-end live HTTP checks covering Concepts 1–10 and `openboards proxy` (exits `0` on full pass, `1` on any failure).
