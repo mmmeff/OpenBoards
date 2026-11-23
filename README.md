@@ -4,7 +4,24 @@ A clean-room, self-hostable, single-binary Rust implementation of Vercel Boards 
 
 Zero external runtime dependencies: one static binary (`ob`) bundles an Axum HTTP server, embedded SQLite in WAL mode, content-addressed local blob storage, background task lease reaper, deferred/repeating scheduler, webhook watcher dispatcher, credential-narrowing sandbox proxy, a full `vb`-compatible CLI, and a built-in protocol conformance verifier.
 
-## Build
+## Install
+
+Run directly without installing via `npx`:
+
+```bash
+npx openboards serve --local
+```
+
+Or install globally (exposes both `openboards` and `ob`):
+
+```bash
+npm install -g openboards
+ob --version
+```
+
+Prebuilt native binaries are installed automatically via platform `optionalDependencies` for macOS (`arm64`, `x64`), Linux glibc (`x64`, `arm64`), and Windows (`x64`) — no `postinstall` script required.
+
+### Build from Source
 
 ```bash
 cargo build --release
@@ -180,3 +197,25 @@ Run the built-in end-to-end protocol conformance suite against an ephemeral in-p
 ob conformance --self-test
 ob conformance --self-test --json
 ```
+
+## Releasing
+
+Releases are built and published automatically by `.github/workflows/release.yml` using **npm Trusted Publishing (GitHub Actions OIDC)** — no `NPM_TOKEN` secret is required.
+
+1. **One-time npm OIDC bootstrap** (only needed once before the first release, because npm requires packages to exist before Trusted Publishing can be configured):
+
+```bash
+node scripts/bootstrap-npm-oidc.mjs           # dry-run preview + Trusted Publisher URLs
+npm login && node scripts/bootstrap-npm-oidc.mjs --publish
+```
+
+   Then open each printed `https://www.npmjs.com/package/<name>/access` URL and configure GitHub Actions Trusted Publishing (`mmmeff` / `OpenBoards` / `release.yml`).
+
+2. **Cut a release:** bump `version` in `Cargo.toml` and `npm/openboards/package.json` (including `optionalDependencies`), commit to `main`, and push a matching tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+   You can also trigger `Release` manually from the Actions tab with `dry_run: true` to test all 5 platform builds and `npm publish --dry-run`.

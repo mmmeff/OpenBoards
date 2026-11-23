@@ -1,0 +1,322 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (defaults to Cargo.toml version, e.g. 0.1.0)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build, stage, and run npm publish --dry-run without creating a release or publishing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Resolve and verify release version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="$REF_NAME"
+            VERSION="${TAG#v}"
+            DRY_RUN="false"
+          else
+            if [ -n "$INPUT_VERSION" ]; then
+              VERSION="${INPUT_VERSION#v}"
+            else
+              VERSION="$(node -e 'import("./scripts/stage-npm-packages.mjs").then(m => console.log(m.readCargoVersion()))')"
+            fi
+            TAG="v${VERSION}"
+            DRY_RUN="${INPUT_DRY_RUN:-false}"
+          fi
+          node scripts/stage-npm-packages.mjs --version "$VERSION" --check-only
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.slug }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-14
+            bin: ob
+            archive: tar.gz
+            native: true
+          - slug: darwin-x64
+            target: x86_64-apple-darwin
+            os: macos-14
+            bin: ob
+            archive: tar.gz
+            native: false
+          - slug: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bin: ob
+            archive: tar.gz
+            native: true
+          - slug: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bin: ob
+            archive: tar.gz
+            native: false
+          - slug: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: ob.exe
+            archive: zip
+            native: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux arm64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              export MACOSX_DEPLOYMENT_TARGET=11.0
+              export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+              ;;
+            x86_64-apple-darwin)
+              export MACOSX_DEPLOYMENT_TARGET=11.0
+              export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+              export CC_x86_64_apple_darwin=clang
+              export CFLAGS_x86_64_apple_darwin="-isysroot ${SDKROOT}"
+              ;;
+            aarch64-unknown-linux-gnu)
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+              export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+              ;;
+          esac
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Strip binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "$BIN"
+          else
+            strip "$BIN"
+          fi
+          ls -lh "$BIN"
+
+      - name: Smoke-test native binary
+        if: matrix.native
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="./target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          "$BIN" --version
+          "$BIN" conformance --self-test
+
+      - name: Package release archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-archives
+          ARCHIVE_BASE="openboards-v${VERSION}-${{ matrix.slug }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path 'target/${{ matrix.target }}/release/${{ matrix.bin }}' -DestinationPath 'dist-archives/${ARCHIVE_BASE}.zip' -Force"
+          else
+            tar -C "target/${{ matrix.target }}/release" -czf "dist-archives/${ARCHIVE_BASE}.tar.gz" "${{ matrix.bin }}"
+          fi
+          ls -lh dist-archives/
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.slug }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.slug }}
+          path: dist-archives/*
+          if-no-files-found: error
+
+  github-release:
+    name: Create GitHub Release
+    needs: [validate, build]
+    if: needs.validate.outputs.dry_run != 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum openboards-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" openboards-* SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" openboards-* SHA256SUMS.txt \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+  publish-npm:
+    name: Publish to npm (OIDC Trusted Publishing)
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24 (npm >= 11.5.1 for OIDC Trusted Publishing)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify npm >= 11.5.1
+        run: |
+          set -euo pipefail
+          echo "Node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map(Number);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            process.exit(ok ? 0 : 1);
+          ' "$(npm --version)" || npm install -g npm@latest
+          echo "npm (verified): $(npm --version)"
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+
+      - name: Stage all 6 npm packages
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          node scripts/stage-npm-packages.mjs \
+            --version "$VERSION" \
+            --artifacts-dir artifacts \
+            --out-dir staged \
+            --check-version
+
+      - name: Smoke-test Linux x64 npm package
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          mkdir -p "$WORK/one-artifact/linux-x64-gnu" "$WORK/pack" "$WORK/install"
+          cp staged/openboards-linux-x64-gnu/bin/ob "$WORK/one-artifact/linux-x64-gnu/ob"
+          node scripts/stage-npm-packages.mjs \
+            --version "$VERSION" \
+            --artifacts-dir "$WORK/one-artifact" \
+            --out-dir "$WORK/smoke-staged" \
+            --allow-partial
+          (cd "$WORK/pack" && npm pack "$WORK/smoke-staged/openboards-linux-x64-gnu" "$WORK/smoke-staged/openboards")
+          (cd "$WORK/install" && npm init -y >/dev/null && npm install --no-audit --no-fund "$WORK/pack/"*.tgz)
+          (cd "$WORK/install" && npx --no-install openboards --help >/dev/null)
+          (cd "$WORK/install" && npx --no-install ob --version)
+          (cd "$WORK/install" && npx --no-install openboards conformance --self-test)
+
+      - name: Publish npm packages via OIDC
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          DRY_RUN: ${{ needs.validate.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          PACKAGES=(
+            openboards-darwin-arm64
+            openboards-darwin-x64
+            openboards-linux-x64-gnu
+            openboards-linux-arm64-gnu
+            openboards-win32-x64-msvc
+            openboards
+          )
+          for pkg in "${PACKAGES[@]}"; do
+            echo "=== ${pkg}@${VERSION} ==="
+            if [ "$DRY_RUN" = "true" ]; then
+              npm publish --dry-run --access public "./staged/${pkg}"
+            else
+              if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+                echo "Already published: ${pkg}@${VERSION} (skipping)"
+              else
+                npm publish --provenance --access public "./staged/${pkg}"
+              fi
+            fi
+          done

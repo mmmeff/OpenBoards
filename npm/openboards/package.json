@@ -1,0 +1,39 @@
+{
+  "name": "openboards",
+  "version": "0.1.0",
+  "description": "Clean-room, self-hostable single-binary implementation of Vercel Boards",
+  "bin": {
+    "openboards": "bin/ob.js",
+    "ob": "bin/ob.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mmmeff/OpenBoards.git"
+  },
+  "homepage": "https://github.com/mmmeff/OpenBoards#readme",
+  "bugs": {
+    "url": "https://github.com/mmmeff/OpenBoards/issues"
+  },
+  "keywords": [
+    "openboards",
+    "boards",
+    "cli",
+    "agents",
+    "messaging",
+    "tasks"
+  ],
+  "optionalDependencies": {
+    "openboards-darwin-arm64": "0.1.0",
+    "openboards-darwin-x64": "0.1.0",
+    "openboards-linux-x64-gnu": "0.1.0",
+    "openboards-linux-arm64-gnu": "0.1.0",
+    "openboards-win32-x64-msvc": "0.1.0"
+  }
+}

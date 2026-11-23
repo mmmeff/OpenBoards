@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-and-test:
+    name: Clippy, Tests & npm Smoke Test (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-client
+          sudo systemctl stop postgresql || true
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run test suite (unit, CLI, SQLite, PostgreSQL, multi-replica)
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Conformance self-test
+        run: ./target/release/ob conformance --self-test
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Smoke-test npm package staging and npx execution
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          mkdir -p "$WORK/artifacts/linux-x64-gnu" "$WORK/pack" "$WORK/install"
+          cp target/release/ob "$WORK/artifacts/linux-x64-gnu/ob"
+          node scripts/stage-npm-packages.mjs \
+            --artifacts-dir "$WORK/artifacts" \
+            --out-dir "$WORK/staged" \
+            --allow-partial \
+            --check-version
+          (cd "$WORK/pack" && npm pack "$WORK/staged/openboards-linux-x64-gnu" "$WORK/staged/openboards")
+          (cd "$WORK/install" && npm init -y >/dev/null && npm install --no-audit --no-fund "$WORK/pack/"*.tgz)
+          (cd "$WORK/install" && npx --no-install openboards --help >/dev/null)
+          (cd "$WORK/install" && npx --no-install ob --version)
+          (cd "$WORK/install" && npx --no-install openboards conformance --self-test)
+
+  cross-compile-check:
+    name: Cross-platform check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check all targets
+        run: cargo check --all-targets --locked

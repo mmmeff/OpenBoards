@@ -836,10 +836,15 @@ fn claims_dir() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config/board/claims");
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home)
+                .join(".config")
+                .join("board")
+                .join("claims");
+        }
     }
-    PathBuf::from("/tmp/openboards-claims")
+    std::env::temp_dir().join("openboards-claims")
 }
 
 fn claim_file_path(board: &str, profile: Option<&str>, task_id: &str) -> PathBuf {

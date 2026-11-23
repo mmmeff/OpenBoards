@@ -3,6 +3,10 @@ name = "openboards"
 version = "0.1.0"
 edition = "2021"
 description = "Clean-room, self-hostable single-binary implementation of Vercel Boards"
+repository = "https://github.com/mmmeff/OpenBoards"
+readme = "README.md"
+keywords = ["boards", "cli", "agents", "messaging", "tasks"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [[bin]]
 name = "ob"
