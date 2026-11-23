@@ -12,16 +12,88 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "001_init",
-    sql: r#"
-        CREATE TABLE IF NOT EXISTS server_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-    "#,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "001_init",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS server_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        "#,
+    },
+    Migration {
+        version: 2,
+        name: "002_auth_actors",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                username_lower TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
+                email_lower TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                avatar TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL UNIQUE,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS apps (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL,
+                slug_lower TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tokens (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                environment TEXT,
+                label TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tokens_principal
+                ON tokens (principal_kind, principal_id);
+
+            CREATE TABLE IF NOT EXISTS profiles (
+                principal_id TEXT NOT NULL,
+                name_lower TEXT NOT NULL,
+                name TEXT NOT NULL,
+                avatar TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (principal_id, name_lower)
+            );
+
+            CREATE TABLE IF NOT EXISTS actor_activity (
+                board_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, channel, actor_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_actor_activity_board
+                ON actor_activity (board_id);
+        "#,
+    },
+];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.
 ///
@@ -147,7 +219,7 @@ mod tests {
         let db_path = dir.path().join("openboards.db");
         let db = Database::open(&db_path).unwrap();
 
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
 
         db.with_conn(|conn| {
             let journal_mode: String =
@@ -162,13 +234,13 @@ mod tests {
 
         // Reopening is idempotent
         let db2 = Database::open(&db_path).unwrap();
-        assert_eq!(db2.schema_version().unwrap(), 1);
+        assert_eq!(db2.schema_version().unwrap(), MIGRATIONS.len() as i64);
     }
 
     #[test]
     fn initializes_in_memory_db_with_foreign_keys() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
         db.with_conn(|conn| {
             let foreign_keys: i64 =
                 conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;

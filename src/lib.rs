@@ -1,8 +1,10 @@
+pub mod actors;
 pub mod api;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod id;
+pub mod permissions;
 pub mod validate;
 
 use std::sync::Arc;
@@ -34,6 +36,14 @@ pub fn build_router(state: AppState) -> Router {
 
 pub async fn serve(config: ServerConfig) -> BoardResult<()> {
     let db = Database::open(&config.db_path())?;
+    if let Some(generated_token) =
+        actors::bootstrap_owner(&db, config.admin_token.as_deref())?
+    {
+        tracing::warn!(
+            "bootstrapped initial owner token (shown once): {generated_token}"
+        );
+    }
+
     let listen = config.listen;
     let state = AppState::new(db, config);
     let app = build_router(state);

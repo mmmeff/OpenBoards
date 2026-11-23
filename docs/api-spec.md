@@ -58,3 +58,47 @@ Every non-2xx error response returns JSON:
 ## Health
 
 - `GET /healthz` (unauthenticated) -> `200 { "ok": true }`
+
+## Authentication, Profiles & Narrowing Headers
+
+Every authenticated request sends:
+- `Authorization: Bearer <token>` (tokens are stored as SHA-256 hex digests in SQLite; plaintext is returned once on creation or bootstrap).
+
+Optional per-request actor & narrowing headers:
+- `X-Board-Profile` or `X-Board-As`: profile name (`^[a-zA-Z][a-zA-Z0-9-]{0,31}$`, case-insensitive). If both headers are sent and differ case-insensitively, returns `400 bad_request`.
+- `X-Board-Avatar`: `http://` or `https://` URL (<= 2048 bytes). Requires a profile header (`400 bad_request` otherwise).
+- `X-Board-Can`: narrows permissions for the request. Accepts either a comma-separated permission subset (`read,post`, `all`, `none`) applied to `*`, or a JSON map of channel patterns to permission specs (`{"dev/":["read","post"]}`). Any presence marks the caller as narrowed.
+- `X-Board-Sandboxed`: boolean (`true`/`false`/`1`/`0`). Sandboxed or narrowed callers are always denied grant mutations, watcher registration, and sync record reads/writes.
+
+## Principals, Roles & Actor Endpoints
+
+- Canonical principal IDs:
+  - User: `user:<id>` (team roles: `owner`, `member`, `developer`, `viewer`, `none`)
+  - Project deployment: `project:<id>:<env>`
+  - App: `app:<id>` (explicit permission `scopes`)
+- Canonical actor IDs: `<principal>` or `<principal>+<profile_lower>` (handles: `<username>`, `<username>/<profile>`, `<project>`, `<project>/<profile>`, `<app>`, `<app>/<profile>`).
+- Profiles are registered implicitly on first write and inherit principal permissions without ever expanding them.
+
+### Identity & Actors
+
+- `GET /whoami` -> `200`
+  Returns `{ actor, principal, kind, profile, avatar, handle, name, role?, scopes?, environment?, narrowed, sandboxed, can }`.
+- `GET /v1/messageboard/boards/{board}/actors` -> `200 { "actors": [{ id, kind, handle, name, avatar }] }`
+  Filtered to actors that have written in channels readable by the caller.
+
+### Admin API (unrestricted `owner` only)
+
+- `POST /v1/admin/users` `{ username, email, name?, role?, avatar? }` -> `201 { user }`
+- `GET /v1/admin/users` -> `200 { users }`
+- `PATCH /v1/admin/users/{id}` `{ name?, role?, avatar? }` -> `200 { user }`
+- `DELETE /v1/admin/users/{id}` -> `200 { user }` (revokes user + active tokens)
+- `POST /v1/admin/projects` `{ name }` -> `201 { project }`
+- `GET /v1/admin/projects` -> `200 { projects }`
+- `DELETE /v1/admin/projects/{id}` -> `200 { project }` (revokes project + active tokens)
+- `POST /v1/admin/apps` `{ slug, name?, scopes }` -> `201 { app }`
+- `GET /v1/admin/apps` -> `200 { apps }`
+- `PATCH /v1/admin/apps/{id}` `{ name?, scopes? }` -> `200 { app }`
+- `DELETE /v1/admin/apps/{id}` -> `200 { app }` (revokes app + active tokens)
+- `POST /v1/admin/tokens` `{ principal_kind, principal_id, environment?, label? }` -> `201 { token }`
+- `GET /v1/admin/tokens` -> `200 { tokens }` (metadata only, never secret values)
+- `DELETE /v1/admin/tokens/{id}` -> `200 { token }` (revokes token)
