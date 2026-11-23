@@ -137,16 +137,16 @@ Head-to-head local throughput benchmark comparing OpenBoards (`ob serve`) agains
 
 | Workload | OpenBoards (`ob`) peak req/s | `vercel/board` (`vb`) peak req/s | Ratio (`ob` / `vb`) | Latency at `c=1` p50 (`ob` vs `vb`) | Latency at `c=64` p99 (`ob` vs `vb`) |
 | --- | ---: | ---: | ---: | --- | --- |
-| **Single-thread reads** (`GET /threads/:id` vs `/messages/:id`) | **3,101.9** (`c=16`) | 1,007.2 (`c=64`) | **3.08×** | 0.34 ms vs 1.13 ms | 39.5 ms vs 123.8 ms |
-| **Message writes** (`POST /messages`) | **1,962.9** (`c=16`) | 250.0 (`c=64`) | **7.85×** | 0.52 ms vs 3.72 ms | 73.6 ms vs 4,662.3 ms |
-| **Task lifecycle** (`create` + `claim` + `complete`) | **1,551.7** (`517.2 tasks/s`, `c=64`) | 197.4 (`65.8 tasks/s`, `c=16`) | **7.86×** | 0.52 ms vs 4.93 ms | 85.8 ms vs 4,274.1 ms |
-| **Channel thread list** (`GET /threads?channel=...&limit=25`) | 114.9 (`c=1`) | **984.2** (`c=64`) | **0.12×** | 8.20 ms vs 1.44 ms | 1,150.8 ms vs 128.9 ms |
-| **Mixed realistic** (70% reads, 20% posts/replies, 10% labels/reactions) | 192.7 (`c=1`) | **508.1** (`c=16`) | **0.38×** | 0.65 ms vs 1.50 ms | 1,065.6 ms vs 1,165.8 ms |
-| **Aggregate (all 15 timed runs, ~76 s total)** | **1,274.9** (97,916 reqs) | 530.4 (40,453 reqs) | **2.40×** | — | — |
-| **Peak RSS memory (`VmHWM`)** | **24.1 MB** (idle 12.6 MB) | 177.9 MB (idle 94.5 MB) | **7.38× less RAM** | — | — |
+| **Single-thread reads** (`GET /threads/:id` vs `/messages/:id`) | **15,735.7** (`c=64`) | 974.7 (`c=64`) | **16.14×** | 0.14 ms vs 1.30 ms | 8.2 ms vs 128.7 ms |
+| **Channel thread list** (`GET /threads?channel=...&limit=25`) | **4,640.1** (`c=64`) | 787.6 (`c=64`) | **5.89×** | 0.62 ms vs 1.67 ms | 27.3 ms vs 205.9 ms |
+| **Mixed realistic** (70% reads, 20% posts/replies, 10% labels/reactions) | **2,307.4** (`c=16`) | 488.5 (`c=64`) | **4.72×** | 0.53 ms vs 1.62 ms | 70.7 ms vs 1,343.4 ms |
+| **Message writes** (`POST /messages`) | **2,282.0** (`c=16`) | 246.5 (`c=1`) | **9.26×** | 0.51 ms vs 3.60 ms | 66.4 ms vs 5,267.7 ms |
+| **Task lifecycle** (`create` + `claim` + `complete`) | **1,913.0** (`637.7 tasks/s`, `c=16`) | 182.6 (`60.9 tasks/s`, `c=1`) | **10.48×** | 0.50 ms vs 5.15 ms | 74.2 ms vs 5,120.6 ms |
+| **Aggregate (all 15 timed runs, ~75–76 s total)** | **4,238.6** (318,723 reqs) | 476.5 (36,453 reqs) | **8.90×** | — | — |
+| **Peak RSS memory (`VmHWM`)** | **36.7 MB** (idle 13.2 MB) | 173.6 MB (idle 93.8 MB) | **4.73× less RAM** | — | — |
 
-- **Notes:** OpenBoards was started with `--rate-limit-rps 1000000 --rate-limit-burst 1000000` to match `vb serve`'s unthrottled local server. OpenBoards' lower `GET /threads` (and consequently `mixed`, where 35% of calls hit `GET /threads`) throughput is due to its current full-board scan with N+1 hydration in `list_threads()` behind a single SQLite `Mutex<Connection>`, whereas `vercel/board` reads an indexed channel-thread projection table.
-- **Environment:** 4-vCPU Intel Xeon (`x86_64` KVM), 15 GiB RAM, Linux `6.12.113+`; OpenBoards `ef7fe6c` (`rustc 1.100.0`, `--release`) vs `@vercel/board` v0.54.1 (`cd08ce1`, Node.js `v22.23.4`, `NODE_ENV=production`); compiled Go `1.22.2` HTTP/1.1 keep-alive load generator.
+- **Notes:** OpenBoards was started with `--rate-limit-rps 1000000 --rate-limit-burst 1000000` to match `vb serve`'s unthrottled local server. OpenBoards uses an indexed `threads` summary table, bulk `IN (...)` batch hydration, read-only WAL reader connections for concurrent reads, and a read-only fast path for board resolution.
+- **Environment:** 4-vCPU Intel Xeon (`x86_64` KVM), 15 GiB RAM, Linux `6.12.113+`; OpenBoards `88809d1` (`rustc 1.100.0`, `--release`) vs `@vercel/board` v0.54.1 (`cd08ce1`, Node.js `v22.23.4`, `NODE_ENV=production`); compiled Go `1.22.2` HTTP/1.1 keep-alive load generator.
 
 ## Conformance Verifier
 
