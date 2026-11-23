@@ -22,6 +22,40 @@ pub struct ClientConfig {
     pub extra_headers: Vec<(String, String)>,
 }
 
+/// Parses either a root URL (`http://127.0.0.1:8080`) or a full board URL
+/// (`http://127.0.0.1:8080/v1/messageboard/boards/security?teamId=acme`) into
+/// `(base_url, board, team)`.
+pub fn parse_board_url(raw_url: &str) -> (String, Option<String>, Option<String>) {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    let mut base_url = trimmed.to_string();
+    let mut parsed_board: Option<String> = None;
+    let mut parsed_team: Option<String> = None;
+
+    if let Some(idx) = trimmed.find("/v1/messageboard/boards/") {
+        base_url = trimmed[..idx].to_string();
+        let rest = &trimmed[idx + "/v1/messageboard/boards/".len()..];
+        let (path_part, query_part) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let b = path_part.split('/').next().unwrap_or("");
+        if !b.is_empty() {
+            parsed_board = Some(b.to_string());
+        }
+        if let Some(q) = query_part {
+            for pair in q.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k == "teamId" && !v.is_empty() {
+                        parsed_team = Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    (base_url, parsed_board, parsed_team)
+}
+
 impl ClientConfig {
     /// Parses either a root URL (`http://127.0.0.1:8080`) or a full board URL
     /// (`http://127.0.0.1:8080/v1/messageboard/boards/security?teamId=acme`).
@@ -34,35 +68,7 @@ impl ClientConfig {
         team: Option<String>,
         ensure: bool,
     ) -> Self {
-        let trimmed = raw_url.trim().trim_end_matches('/');
-        let mut base_url = trimmed.to_string();
-        let mut parsed_board: Option<String> = None;
-        let mut parsed_team = team;
-
-        if let Some(idx) = trimmed.find("/v1/messageboard/boards/") {
-            base_url = trimmed[..idx].to_string();
-            let rest = &trimmed[idx + "/v1/messageboard/boards/".len()..];
-            let (path_part, query_part) = match rest.split_once('?') {
-                Some((p, q)) => (p, Some(q)),
-                None => (rest, None),
-            };
-            let b = path_part.split('/').next().unwrap_or("");
-            if !b.is_empty() {
-                parsed_board = Some(b.to_string());
-            }
-            if parsed_team.is_none() {
-                if let Some(q) = query_part {
-                    for pair in q.split('&') {
-                        if let Some((k, v)) = pair.split_once('=') {
-                            if k == "teamId" && !v.is_empty() {
-                                parsed_team = Some(v.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        let (base_url, parsed_board, parsed_team) = parse_board_url(raw_url);
         let board = board_override
             .map(str::to_string)
             .or(parsed_board)
@@ -74,7 +80,7 @@ impl ClientConfig {
             token,
             profile,
             avatar,
-            team: parsed_team,
+            team: team.or(parsed_team),
             ensure,
             extra_headers: Vec::new(),
         }

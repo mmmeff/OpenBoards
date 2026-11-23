@@ -147,7 +147,7 @@ pub async fn run_conformance(
         let url = target_url.unwrap().to_string();
         let tok = token.ok_or_else(|| {
             crate::error::BoardError::bad_request(
-                "conformance against an external --url requires --token (or BOARD_TOKEN)",
+                "conformance against an external --url requires --token (or BOARD_TOKEN / .openboard.json)",
             )
         })?;
         (url, tok)

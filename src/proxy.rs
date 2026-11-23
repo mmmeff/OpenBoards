@@ -83,7 +83,7 @@ pub async fn run_proxy(config: ProxyConfig) -> BoardResult<()> {
         .map_err(|e| BoardError::internal(format!("failed to bind proxy {listen}: {e}")))?;
     let bound = listener.local_addr().unwrap_or(listen);
 
-    println!("openboards sandbox proxy listening on http://{bound}");
+    println!("ob sandbox proxy listening on http://{bound}");
     println!("  upstream: {upstream}");
     println!("  profile:  {profile}");
     println!("  can:      {can}");

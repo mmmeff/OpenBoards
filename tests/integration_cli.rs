@@ -11,7 +11,7 @@ use openboards::proxy::{build_proxy_router, ProxyConfig};
 use openboards::{build_router, schedules, schemas, tasks, watchers, AppState};
 
 fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_openboards")
+    env!("CARGO_BIN_EXE_ob")
 }
 
 struct LiveServer {
@@ -84,7 +84,7 @@ fn run_cli_cmd(
         .env("BOARD_TOKEN", token)
         .env("OPENBOARDS_CLAIMS_DIR", claims_dir)
         .output()
-        .expect("failed executing openboards binary");
+        .expect("failed executing ob binary");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -730,4 +730,246 @@ async fn cli_spec_audit_ergonomics_mentions_attach_shorthands_and_schedules() {
     .unwrap();
     assert_eq!(code, 0, "sync <id> failed: {stderr}");
     assert!(serde_json::from_str::<Value>(&stdout).unwrap()["targets"].is_array());
+}
+
+fn run_ob_clean_env(
+    cwd: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (i32, String, String) {
+    let mut cmd = StdCommand::new(bin_path());
+    cmd.current_dir(cwd)
+        .args(args)
+        .env_remove("BOARD_CONFIG")
+        .env_remove("BOARD_URL")
+        .env_remove("BOARD_NAME")
+        .env_remove("BOARD_TOKEN")
+        .env_remove("BOARD_PROFILE")
+        .env_remove("BOARD_AVATAR")
+        .env_remove("OPENBOARDS_TEAM");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed executing ob binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn cli_binary_help_uses_ob_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let (code, stdout, stderr) =
+        tokio::task::spawn_blocking(move || run_ob_clean_env(&dir, &[], &["--help"]))
+            .await
+            .unwrap();
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("Usage: ob"), "stdout={stdout}");
+    assert!(stdout.contains("--config"), "stdout={stdout}");
+}
+
+#[tokio::test]
+async fn cli_openboard_json_discovery_precedence_and_errors() {
+    let srv = start_live_server().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().to_path_buf();
+    let mid = root.join("packages");
+    let leaf = mid.join("service/src");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    // 1. Root `.openboard.json` discovered recursively from deeply nested `leaf`
+    let root_cfg_path = root.join(".openboard.json");
+    std::fs::write(
+        &root_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "url": srv.url,
+            "name": "cfg-root-board",
+            "token": srv.owner_token,
+            "as": "root-agent",
+            "avatar": "https://example.com/root.png",
+            "ensure": true,
+            "json": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `ob me` in `leaf` picks up url, token, board (with ensure=true creating it), profile, avatar, and json=true!
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        move || run_ob_clean_env(&cwd, &[], &["me"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "ob me via parent .openboard.json failed: stderr={stderr}");
+    let me: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(me["handle"], "admin/root-agent");
+    assert_eq!(me["board"]["name"], "cfg-root-board");
+
+    // 2. Nearest-ancestor `.openboard.json` overrides outer parent
+    let mid_cfg_path = mid.join(".openboard.json");
+    std::fs::write(
+        &mid_cfg_path,
+        serde_json::to_string_pretty(&json!({
+            "url": srv.url,
+            "board": "cfg-mid-board",
+            "token": srv.owner_token,
+            "profile": "mid-agent",
+            "ensure": true,
+            "json": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        move || run_ob_clean_env(&cwd, &[], &["me"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "nearest config failed: stderr={stderr}");
+    let me: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(me["handle"], "admin/mid-agent");
+    assert_eq!(me["board"]["name"], "cfg-mid-board");
+
+    // 3. Precedence: env vars (`BOARD_*`) override `.openboard.json`
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        move || {
+            run_ob_clean_env(
+                &cwd,
+                &[
+                    ("BOARD_PROFILE", "env-agent"),
+                    ("BOARD_NAME", "env-board"),
+                ],
+                &["me"],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "env override failed: stderr={stderr}");
+    let me: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(me["handle"], "admin/env-agent");
+    assert_eq!(me["board"]["name"], "env-board");
+
+    // 4. Precedence: explicit CLI flags override BOTH env vars and `.openboard.json` (including `--json=false`)
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        move || {
+            run_ob_clean_env(
+                &cwd,
+                &[
+                    ("BOARD_PROFILE", "env-agent"),
+                    ("BOARD_NAME", "env-board"),
+                ],
+                &["me", "--as", "cli-agent", "--board", "cli-board", "--json=false"],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "cli override failed: stderr={stderr}");
+    assert!(
+        stdout.contains("admin/cli-agent on board 'cli-board'"),
+        "expected human output with CLI overrides, got: {stdout}"
+    );
+
+    // 5. Explicit `--config` and `BOARD_CONFIG` override upward discovery (and `--config` beats `BOARD_CONFIG`)
+    let explicit_cfg = root.join("explicit.json");
+    std::fs::write(
+        &explicit_cfg,
+        serde_json::to_string_pretty(&json!({
+            "url": srv.url,
+            "board": "explicit-board",
+            "token": srv.owner_token,
+            "profile": "explicit-agent",
+            "ensure": true,
+            "json": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        let cfg_str = explicit_cfg.to_string_lossy().to_string();
+        move || run_ob_clean_env(&cwd, &[("BOARD_CONFIG", &cfg_str)], &["me"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "BOARD_CONFIG failed: stderr={stderr}");
+    let me: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(me["handle"], "admin/explicit-agent");
+    assert_eq!(me["board"]["name"], "explicit-board");
+
+    // `--config` beats `BOARD_CONFIG`
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        let env_cfg = explicit_cfg.to_string_lossy().to_string();
+        let flag_cfg = root_cfg_path.to_string_lossy().to_string();
+        move || {
+            run_ob_clean_env(
+                &cwd,
+                &[("BOARD_CONFIG", &env_cfg)],
+                &["--config", &flag_cfg, "me"],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "--config over BOARD_CONFIG failed: stderr={stderr}");
+    let me: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(me["handle"], "admin/root-agent");
+
+    // 6. Error case: missing explicit `--config` names the path
+    let missing = root.join("missing.openboard.json");
+    let (code, _, stderr) = tokio::task::spawn_blocking({
+        let cwd = leaf.clone();
+        let m = missing.to_string_lossy().to_string();
+        move || run_ob_clean_env(&cwd, &[], &["--config", &m, "whoami"])
+    })
+    .await
+    .unwrap();
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(&missing.display().to_string()),
+        "expected missing path in error, stderr={stderr}"
+    );
+
+    // 7. Error case: invalid JSON in discovered `.openboard.json` names the path
+    let bad_dir = tempfile::tempdir().unwrap();
+    let bad_cfg = bad_dir.path().join(".openboard.json");
+    std::fs::write(&bad_cfg, "{ invalid json !!!").unwrap();
+    let (code, _, stderr) = tokio::task::spawn_blocking({
+        let cwd = bad_dir.path().to_path_buf();
+        move || run_ob_clean_env(&cwd, &[], &["whoami"])
+    })
+    .await
+    .unwrap();
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(&bad_cfg.display().to_string()),
+        "expected invalid config path in error, stderr={stderr}"
+    );
+
+    // 8. Error case: unknown field in `.openboard.json` fails fast and names the path
+    let unknown_dir = tempfile::tempdir().unwrap();
+    let unknown_cfg = unknown_dir.path().join(".openboard.json");
+    std::fs::write(&unknown_cfg, r#"{"url":"http://127.0.0.1:8080","typo_key":true}"#).unwrap();
+    let (code, _, stderr) = tokio::task::spawn_blocking({
+        let cwd = unknown_dir.path().to_path_buf();
+        move || run_ob_clean_env(&cwd, &[], &["whoami"])
+    })
+    .await
+    .unwrap();
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(&unknown_cfg.display().to_string()) && stderr.contains("typo_key"),
+        "expected path and unknown key in error, stderr={stderr}"
+    );
 }

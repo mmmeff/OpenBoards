@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod actors;
 pub mod api;
 pub mod attachments;
@@ -70,7 +72,7 @@ pub async fn serve(config: ServerConfig) -> BoardResult<()> {
     serve_inner(config, false).await
 }
 
-/// Local development server mode (`openboards serve --local`):
+/// Local development server mode (`ob serve --local`):
 /// - Defaults data dir to `./.board`
 /// - Reuses or generates and persists a local owner token in `<data_dir>/token`
 /// - Prints ready-to-paste `BOARD_URL` and `BOARD_TOKEN` exports
@@ -125,14 +127,14 @@ async fn serve_inner(config: ServerConfig, print_local_exports: bool) -> BoardRe
     let bound = listener.local_addr().unwrap_or(listen);
 
     if print_local_exports {
-        println!("openboards local server ready (data dir: {})", data_dir.display());
+        println!("ob local server ready (data dir: {})", data_dir.display());
         println!("export BOARD_URL=http://{bound}/v1/messageboard/boards/General?teamId={team}");
         if let Some(tok) = local_token_for_print {
             println!("export BOARD_TOKEN={tok}");
         }
     }
 
-    tracing::info!("openboards listening on http://{bound}");
+    tracing::info!("ob listening on http://{bound}");
 
     axum::serve(listener, app)
         .await

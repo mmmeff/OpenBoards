@@ -8,18 +8,22 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::client::{BoardClient, ClientConfig, ClientError};
-use crate::config::{ServeArgs, ServerConfig};
+use crate::client::{parse_board_url, BoardClient, ClientConfig, ClientError};
+use crate::config::{load_cli_config, CliFileConfig, ServeArgs, ServerConfig};
 use crate::conformance;
 use crate::proxy::{self, ProxyConfig};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "openboards",
+    name = "ob",
     version,
     about = "Self-hostable message board and CLI for teams and coding agents"
 )]
 pub struct Cli {
+    /// Path to .openboard.json config file (defaults to upward search from cwd)
+    #[arg(long, global = true, env = "BOARD_CONFIG")]
+    pub config: Option<PathBuf>,
+
     /// Board server URL or full board URL
     #[arg(long, global = true, env = "BOARD_URL")]
     pub url: Option<String>,
@@ -45,15 +49,70 @@ pub struct Cli {
     pub team: Option<String>,
 
     /// Create named board if it does not exist
-    #[arg(long, global = true, default_value_t = false)]
-    pub ensure: bool,
+    #[arg(
+        long,
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub ensure: Option<bool>,
 
     /// Emit machine-readable JSON output
-    #[arg(long, global = true, default_value_t = false)]
-    pub json: bool,
+    #[arg(
+        long,
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub json: Option<bool>,
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGlobalOptions {
+    pub url: Option<String>,
+    pub board: Option<String>,
+    pub token: Option<String>,
+    pub profile: Option<String>,
+    pub avatar: Option<String>,
+    pub team: Option<String>,
+    pub ensure: bool,
+    pub json: bool,
+}
+
+/// Merges parsed CLI/env options over `.openboard.json` values with precedence:
+/// explicit CLI flags > environment variables > `.openboard.json` > defaults.
+pub fn resolve_global_options(cli: &Cli, file_cfg: &CliFileConfig) -> ResolvedGlobalOptions {
+    let (cli_url_board, cli_url_team) = match cli.url.as_deref() {
+        Some(u) => {
+            let (_, b, t) = parse_board_url(u);
+            (b, t)
+        }
+        None => (None, None),
+    };
+
+    ResolvedGlobalOptions {
+        url: cli.url.clone().or_else(|| file_cfg.url.clone()),
+        board: cli
+            .board
+            .clone()
+            .or(cli_url_board)
+            .or_else(|| file_cfg.board.clone()),
+        token: cli.token.clone().or_else(|| file_cfg.token.clone()),
+        profile: cli.profile.clone().or_else(|| file_cfg.profile.clone()),
+        avatar: cli.avatar.clone().or_else(|| file_cfg.avatar.clone()),
+        team: cli
+            .team
+            .clone()
+            .or(cli_url_team)
+            .or_else(|| file_cfg.team.clone()),
+        ensure: cli.ensure.or(file_cfg.ensure).unwrap_or(false),
+        json: cli.json.or(file_cfg.json).unwrap_or(false),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -853,7 +912,26 @@ fn resolve_claim_creds(
 
 /// Top-level CLI runner returning the exact process exit code.
 pub async fn run_cli(cli: Cli) -> i32 {
-    let json_mode = cli.json;
+    let cli_json_hint = cli.json.unwrap_or(false);
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            let err = ClientError::usage(format!("failed to determine current directory: {e}"));
+            print_error(&err, cli_json_hint);
+            return err.exit_code();
+        }
+    };
+    let file_cfg = match load_cli_config(cli.config.as_deref(), &cwd) {
+        Ok(Some((_, cfg))) => cfg,
+        Ok(None) => CliFileConfig::default(),
+        Err(msg) => {
+            let err = ClientError::usage(msg);
+            print_error(&err, cli_json_hint);
+            return err.exit_code();
+        }
+    };
+    let opts = resolve_global_options(&cli, &file_cfg);
+    let json_mode = opts.json;
 
     // Handle local-execution commands first (`serve`, `proxy`, `conformance`)
     match cli.command {
@@ -893,9 +971,9 @@ pub async fn run_cli(cli: Cli) -> i32 {
         }
         Command::Conformance(args) => {
             match conformance::run_conformance(
-                cli.url.as_deref(),
-                cli.token.clone(),
-                cli.board.as_deref(),
+                opts.url.as_deref(),
+                opts.token.clone(),
+                opts.board.as_deref(),
                 args.self_test,
             )
             .await
@@ -937,18 +1015,17 @@ pub async fn run_cli(cli: Cli) -> i32 {
         _ => {}
     }
 
-    let raw_url = cli
+    let raw_url = opts
         .url
-        .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let cfg = ClientConfig::from_raw(
         &raw_url,
-        cli.board.as_deref(),
-        cli.token.clone(),
-        cli.profile.clone(),
-        cli.avatar.clone(),
-        cli.team.clone(),
-        cli.ensure,
+        opts.board.as_deref(),
+        opts.token,
+        opts.profile,
+        opts.avatar,
+        opts.team,
+        opts.ensure,
     );
     let client = match BoardClient::new(cfg) {
         Ok(c) => c,
@@ -1883,7 +1960,7 @@ async fn dispatch_client_command(
                 }
                 _ => {
                     return Err(ClientError::usage(
-                        "usage: sources OR sources <key> read",
+                        "usage: ob sources OR ob sources <key> read",
                     ));
                 }
             };
@@ -2612,5 +2689,92 @@ async fn run_task_harness(client: &BoardClient, opts: TaskRunOpts) -> Result<i32
                 return Ok(143);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_global_options_with_precedence_and_boolean_overrides() {
+        let file_cfg = CliFileConfig {
+            schema: None,
+            url: Some("http://cfg:8080".to_string()),
+            board: Some("cfg-board".to_string()),
+            token: Some("ob_cfg".to_string()),
+            profile: Some("cfg-agent".to_string()),
+            avatar: Some("https://example.com/cfg.png".to_string()),
+            team: Some("cfg-team".to_string()),
+            ensure: Some(true),
+            json: Some(true),
+        };
+
+        // Bare command inherits all values from .openboard.json
+        let cli = Cli::try_parse_from(["ob", "whoami"]).unwrap();
+        let resolved = resolve_global_options(&cli, &file_cfg);
+        assert_eq!(resolved.url.as_deref(), Some("http://cfg:8080"));
+        assert_eq!(resolved.board.as_deref(), Some("cfg-board"));
+        assert_eq!(resolved.token.as_deref(), Some("ob_cfg"));
+        assert_eq!(resolved.profile.as_deref(), Some("cfg-agent"));
+        assert_eq!(resolved.avatar.as_deref(), Some("https://example.com/cfg.png"));
+        assert_eq!(resolved.team.as_deref(), Some("cfg-team"));
+        assert!(resolved.ensure);
+        assert!(resolved.json);
+
+        // Explicit CLI flags override .openboard.json (including --json=false / --ensure=false)
+        let cli = Cli::try_parse_from([
+            "ob",
+            "--url",
+            "http://cli:9090",
+            "--board",
+            "cli-board",
+            "--token",
+            "ob_cli",
+            "--as",
+            "cli-agent",
+            "--avatar",
+            "https://example.com/cli.png",
+            "--team",
+            "cli-team",
+            "--ensure=false",
+            "--json=false",
+            "whoami",
+        ])
+        .unwrap();
+        let resolved = resolve_global_options(&cli, &file_cfg);
+        assert_eq!(resolved.url.as_deref(), Some("http://cli:9090"));
+        assert_eq!(resolved.board.as_deref(), Some("cli-board"));
+        assert_eq!(resolved.token.as_deref(), Some("ob_cli"));
+        assert_eq!(resolved.profile.as_deref(), Some("cli-agent"));
+        assert_eq!(resolved.avatar.as_deref(), Some("https://example.com/cli.png"));
+        assert_eq!(resolved.team.as_deref(), Some("cli-team"));
+        assert!(!resolved.ensure);
+        assert!(!resolved.json);
+
+        // Bare --json and --ensure work before or after subcommands without consuming positional args
+        let cli = Cli::try_parse_from(["ob", "--json", "--ensure", "post", "dev", "hello"]).unwrap();
+        assert_eq!(cli.json, Some(true));
+        assert_eq!(cli.ensure, Some(true));
+        let cli2 = Cli::try_parse_from(["ob", "post", "dev", "hello", "--json"]).unwrap();
+        assert_eq!(cli2.json, Some(true));
+
+        // Full board URL from CLI/env beats config's board/team
+        let cli = Cli::try_parse_from([
+            "ob",
+            "--url",
+            "http://env:9090/v1/messageboard/boards/url-board?teamId=url-team",
+            "whoami",
+        ])
+        .unwrap();
+        let resolved = resolve_global_options(&cli, &file_cfg);
+        assert_eq!(resolved.board.as_deref(), Some("url-board"));
+        assert_eq!(resolved.team.as_deref(), Some("url-team"));
+    }
+
+    #[test]
+    fn parses_explicit_config_flag() {
+        let cli = Cli::try_parse_from(["ob", "--config", "/tmp/custom.json", "whoami"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/custom.json")));
     }
 }
