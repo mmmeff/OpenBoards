@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::actors::{self, CallerContext, ProfileOverlay};
 use crate::attachments;
-use crate::db::{Database, DbRow, Queryable};
+use crate::db::{Database, DbRow, Dialect, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::EventHub;
 use crate::grants;
@@ -758,75 +759,72 @@ pub async fn fire_due_schedules(state: &AppState) -> BoardResult<FireSummary> {
 }
 
 /// Deterministic helper for firing due schedules at a caller-supplied timestamp `now`.
+/// Claims and fires each due schedule inside a single atomic transaction (`FOR UPDATE SKIP LOCKED`
+/// on PostgreSQL) so concurrent replicas never double-post a schedule.
 pub async fn fire_due_schedules_at(
     db: &Database,
     events: &EventHub,
     now: DateTime<Utc>,
 ) -> BoardResult<FireSummary> {
     let now_str = format_utc_ms(now);
-
-    let due: Vec<StoredScheduleRow> = {
-        let mut conn = db.read_conn();
-        let rows = conn
-            .fetch_all(
-                "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
-                        no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
-                        every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
-                        last_message_id, status, error_message, created_at
-                 FROM schedules
-                 WHERE status = 'pending' AND next_run_at <= ?1
-                 ORDER BY next_run_at ASC, created_at ASC",
-                sql_args![&now_str],
-            )
-            .await?;
-        rows.iter()
-            .map(map_schedule_row)
-            .collect::<BoardResult<Vec<_>>>()?
+    let skip_locked = match db.dialect() {
+        Dialect::Sqlite => "",
+        Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
     };
+    let claim_sql = format!(
+        "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
+                no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
+                every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
+                last_message_id, status, error_message, created_at
+         FROM schedules
+         WHERE status = 'pending' AND next_run_at <= ?1
+         ORDER BY next_run_at ASC, created_at ASC
+         LIMIT 1{skip_locked}"
+    );
 
     let mut summary = FireSummary::default();
 
-    for sched in due {
-        let still_pending = {
-            let mut conn = db.read_conn();
-            load_schedule_row_tx(&mut conn, &sched.board_id, &sched.id)
-                .await?
-                .is_some_and(|r| r.status == ScheduleStatus::Pending)
+    for _ in 0..50 {
+        let mut tx = db.begin_tx().await?;
+        let Some(row) = tx.fetch_optional(&claim_sql, sql_args![&now_str]).await? else {
+            tx.commit().await?;
+            break;
         };
-        if !still_pending {
-            continue;
-        }
+        let sched = map_schedule_row(&row)?;
 
-        let creator_ctx = match reconstruct_creator_context(db, &sched).await? {
-            Some(ctx) => ctx,
-            None => {
-                mark_schedule_failed(
-                    db,
-                    &sched.board_id,
-                    &sched.id,
+        let Some(creator_ctx) = reconstruct_creator_context_tx(&mut tx, &sched).await? else {
+            tx.execute(
+                "UPDATE schedules
+                 SET status = 'failed', error_message = ?1, updated_at = ?2
+                 WHERE board_id = ?3 AND id = ?4 AND status = 'pending'",
+                sql_args![
                     "creator principal was revoked or removed",
                     &now_str,
-                )
-                .await?;
-                summary.failed += 1;
-                continue;
-            }
-        };
-
-        let has_board_access = {
-            let mut conn = db.read_conn();
-            let board_grants = grants::load_grants_tx(&mut conn, &sched.board_id).await?;
-            grants::caller_has_any_board_access(&board_grants, &creator_ctx)
-        };
-        if !has_board_access {
-            mark_schedule_failed(
-                db,
-                &sched.board_id,
-                &sched.id,
-                "creator no longer has access to board",
-                &now_str,
+                    &sched.board_id,
+                    &sched.id,
+                ],
             )
             .await?;
+            tx.commit().await?;
+            summary.failed += 1;
+            continue;
+        };
+
+        let board_grants = grants::load_grants_tx(&mut tx, &sched.board_id).await?;
+        if !grants::caller_has_any_board_access(&board_grants, &creator_ctx) {
+            tx.execute(
+                "UPDATE schedules
+                 SET status = 'failed', error_message = ?1, updated_at = ?2
+                 WHERE board_id = ?3 AND id = ?4 AND status = 'pending'",
+                sql_args![
+                    "creator no longer has access to board",
+                    &now_str,
+                    &sched.board_id,
+                    &sched.id,
+                ],
+            )
+            .await?;
+            tx.commit().await?;
             summary.failed += 1;
             continue;
         }
@@ -838,8 +836,8 @@ pub async fn fire_due_schedules_at(
 
         let post_result = match &sched.re {
             None => {
-                messages::post_message(
-                    db,
+                messages::post_message_in_tx(
+                    &mut tx,
                     &sched.board_id,
                     &creator_ctx,
                     PostMessageInput {
@@ -855,8 +853,8 @@ pub async fn fire_due_schedules_at(
                 .await
             }
             Some(root_id) => {
-                messages::reply_message(
-                    db,
+                messages::reply_message_in_tx(
+                    &mut tx,
                     &sched.board_id,
                     root_id,
                     &creator_ctx,
@@ -876,14 +874,9 @@ pub async fn fire_due_schedules_at(
 
         match post_result {
             Ok(posted) => {
-                if let Some(seq) = posted.event_seq {
-                    events.notify(&sched.board_id, seq);
-                }
-
                 let next_runs = sched.runs_completed + 1;
                 let (next_status, next_run_at) = compute_next_state(&sched, next_runs, now)?;
 
-                let mut tx = db.begin_tx().await?;
                 tx.execute(
                     "UPDATE schedules
                      SET runs_completed = ?1,
@@ -906,10 +899,16 @@ pub async fn fire_due_schedules_at(
                 .await?;
                 tx.commit().await?;
 
+                if let Some(seq) = posted.event_seq {
+                    events.notify(&sched.board_id, seq);
+                }
+
                 summary.fired += 1;
                 summary.posted_message_ids.push(posted.message.id);
             }
             Err(err) => {
+                // Roll back any partial writes / aborted PG transaction state before marking failed
+                let _ = tx.rollback().await;
                 mark_schedule_failed(db, &sched.board_id, &sched.id, &err.message, &now_str)
                     .await?;
                 summary.failed += 1;
@@ -920,13 +919,12 @@ pub async fn fire_due_schedules_at(
     Ok(summary)
 }
 
-async fn reconstruct_creator_context(
-    db: &Database,
+async fn reconstruct_creator_context_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     sched: &StoredScheduleRow,
 ) -> BoardResult<Option<CallerContext>> {
-    let mut conn = db.read_conn();
     let Some(principal) =
-        actors::resolve_active_principal_tx(&mut conn, &sched.creator_principal).await?
+        actors::resolve_active_principal_tx(conn, &sched.creator_principal).await?
     else {
         return Ok(None);
     };
@@ -992,13 +990,44 @@ async fn mark_schedule_failed(
 
 /// Spawns the background tokio scheduler loop ticking once per second.
 pub fn spawn_scheduler_loop(state: AppState) -> tokio::task::JoinHandle<()> {
+    spawn_scheduler_loop_with_shutdown(state, crate::never_shutdown_rx())
+}
+
+/// Spawns the background tokio scheduler loop with graceful shutdown and periodic orphan
+/// attachment staging cleanup (every 5 minutes).
+pub fn spawn_scheduler_loop_with_shutdown(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticks: u64 = 0;
         loop {
-            ticker.tick().await;
-            if let Err(err) = fire_due_schedules(&state).await {
-                tracing::warn!("scheduler tick error: {err}");
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    if let Err(err) = fire_due_schedules(&state).await {
+                        tracing::warn!("scheduler tick error: {err}");
+                    }
+                    ticks = ticks.wrapping_add(1);
+                    if ticks.is_multiple_of(300) {
+                        if let Err(err) = state
+                            .blobs
+                            .cleanup_expired_staging(&state.db, Duration::hours(24))
+                            .await
+                        {
+                            tracing::warn!("staging attachment cleanup error: {err}");
+                        }
+                    }
+                }
             }
         }
     })

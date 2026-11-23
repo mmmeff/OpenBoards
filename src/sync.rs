@@ -4,9 +4,10 @@ use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::actors::{CallerContext, Principal};
-use crate::db::{Database, DbRow, DbTx, Queryable};
+use crate::db::{Database, DbRow, DbTx, Dialect, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventType};
 use crate::grants;
@@ -1384,10 +1385,97 @@ async fn insert_delivery_for_link_tx(
         ],
     )
     .await?;
+    tx.queue_sync_notify();
     Ok(())
 }
 
 // --- Outbound Delivery Worker ---
+
+const SYNC_CLAIM_BATCH_LIMIT: i64 = 25;
+const SYNC_LEASE_SECS: i64 = 60;
+
+struct ClaimedSyncDelivery {
+    id: String,
+    board_id: String,
+    source_id: String,
+    link_id: String,
+    message_id: String,
+    kind: String,
+    payload_json: String,
+    prev_attempts: i64,
+}
+
+async fn claim_due_deliveries(
+    db: &Database,
+    lease_owner: &str,
+    now: DateTime<Utc>,
+) -> BoardResult<Vec<ClaimedSyncDelivery>> {
+    let now_str = format_utc_ms(now);
+    let lock_until = format_utc_ms(now + Duration::seconds(SYNC_LEASE_SECS));
+
+    let mut tx = db.begin_tx().await?;
+    let rows = match tx.dialect() {
+        Dialect::Postgres => {
+            tx.fetch_all(
+                "UPDATE sync_deliveries
+                 SET locked_until = ?1, locked_by = ?2, updated_at = ?3
+                 WHERE id IN (
+                     SELECT id FROM sync_deliveries
+                     WHERE status IN ('pending', 'retrying')
+                       AND next_attempt_at <= ?3
+                       AND (locked_until IS NULL OR locked_until <= ?3)
+                     ORDER BY created_at ASC
+                     LIMIT ?4
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 RETURNING id, board_id, source_id, link_id, message_id, kind, payload_json, attempts",
+                sql_args![&lock_until, lease_owner, &now_str, SYNC_CLAIM_BATCH_LIMIT],
+            )
+            .await?
+        }
+        Dialect::Sqlite => {
+            let selected = tx
+                .fetch_all(
+                    "SELECT id, board_id, source_id, link_id, message_id, kind, payload_json, attempts
+                     FROM sync_deliveries
+                     WHERE status IN ('pending', 'retrying')
+                       AND next_attempt_at <= ?1
+                       AND (locked_until IS NULL OR locked_until <= ?1)
+                     ORDER BY created_at ASC
+                     LIMIT ?2",
+                    sql_args![&now_str, SYNC_CLAIM_BATCH_LIMIT],
+                )
+                .await?;
+            for r in &selected {
+                let deliv_id = r.get_str(0)?;
+                tx.execute(
+                    "UPDATE sync_deliveries
+                     SET locked_until = ?1, locked_by = ?2, updated_at = ?3
+                     WHERE id = ?4",
+                    sql_args![&lock_until, lease_owner, &now_str, &deliv_id],
+                )
+                .await?;
+            }
+            selected
+        }
+    };
+    tx.commit().await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(ClaimedSyncDelivery {
+            id: r.get_str(0)?,
+            board_id: r.get_str(1)?,
+            source_id: r.get_str(2)?,
+            link_id: r.get_str(3)?,
+            message_id: r.get_str(4)?,
+            kind: r.get_str(5)?,
+            payload_json: r.get_str(6)?,
+            prev_attempts: r.get_i64(7)?,
+        });
+    }
+    Ok(out)
+}
 
 pub async fn process_pending_deliveries(state: &AppState) -> BoardResult<DeliveryTickSummary> {
     process_pending_deliveries_at(state, Utc::now()).await
@@ -1398,56 +1486,56 @@ pub async fn process_pending_deliveries_at(
     now: DateTime<Utc>,
 ) -> BoardResult<DeliveryTickSummary> {
     let now_str = format_utc_ms(now);
-    #[allow(clippy::type_complexity)]
-    let due: Vec<(String, String, String, String, String, String, String, i64)> = {
-        let mut conn = state.db.read_conn();
-        let rows = conn
-            .fetch_all(
-                "SELECT id, board_id, source_id, link_id, message_id, kind, payload_json, attempts
-                 FROM sync_deliveries
-                 WHERE status IN ('pending', 'retrying') AND next_attempt_at <= ?1
-                 ORDER BY created_at ASC
-                 LIMIT 100",
-                sql_args![&now_str],
-            )
-            .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            out.push((
-                r.get_str(0)?,
-                r.get_str(1)?,
-                r.get_str(2)?,
-                r.get_str(3)?,
-                r.get_str(4)?,
-                r.get_str(5)?,
-                r.get_str(6)?,
-                r.get_i64(7)?,
-            ));
-        }
-        out
-    };
+    let lease_owner = format!("{}:{}", state.replica_id, prefixed_id("sl"));
+    let due = claim_due_deliveries(&state.db, &lease_owner, now).await?;
 
     let mut summary = DeliveryTickSummary::default();
 
-    for (deliv_id, board_id, source_id, link_id, message_id, kind, payload_json, prev_attempts) in
-        due
-    {
+    for item in due {
+        let ClaimedSyncDelivery {
+            id: deliv_id,
+            board_id,
+            source_id,
+            link_id,
+            message_id,
+            kind,
+            payload_json,
+            prev_attempts,
+        } = item;
+
         let source = {
             let mut conn = state.db.read_conn();
             load_source_by_id_tx(&mut conn, &source_id).await?
         };
         let Some(src) = source else {
+            let mut tx = state.db.begin_tx().await?;
+            tx.execute(
+                "UPDATE sync_deliveries
+                 SET status = 'failed', last_error = 'sync source deleted',
+                     locked_until = NULL, locked_by = NULL, updated_at = ?1
+                 WHERE id = ?2 AND locked_by = ?3",
+                sql_args![&now_str, &deliv_id, &lease_owner],
+            )
+            .await?;
+            tx.commit().await?;
+            summary.failed += 1;
             continue;
         };
         let Some(outbound_url) = src.outbound_url.as_deref() else {
             let mut tx = state.db.begin_tx().await?;
-            tx.execute(
-                "UPDATE sync_deliveries SET status = 'delivered', attempts = ?1, updated_at = ?2 WHERE id = ?3",
-                sql_args![prev_attempts + 1, &now_str, &deliv_id],
-            )
-            .await?;
+            let updated = tx
+                .execute(
+                    "UPDATE sync_deliveries
+                     SET status = 'delivered', attempts = ?1,
+                         locked_until = NULL, locked_by = NULL, updated_at = ?2
+                     WHERE id = ?3 AND locked_by = ?4",
+                    sql_args![prev_attempts + 1, &now_str, &deliv_id, &lease_owner],
+                )
+                .await?;
             tx.commit().await?;
-            summary.delivered += 1;
+            if updated > 0 {
+                summary.delivered += 1;
+            }
             continue;
         };
 
@@ -1486,14 +1574,19 @@ pub async fn process_pending_deliveries_at(
 
         if ok {
             let mut tx = state.db.begin_tx().await?;
-            tx.execute(
-                "UPDATE sync_deliveries
-                 SET status = 'delivered', attempts = ?1, last_http_status = ?2,
-                     last_error = NULL, updated_at = ?3
-                 WHERE id = ?4",
-                sql_args![attempt, status_code, &now_str, &deliv_id],
-            )
-            .await?;
+            let updated = tx
+                .execute(
+                    "UPDATE sync_deliveries
+                     SET status = 'delivered', attempts = ?1, last_http_status = ?2,
+                         last_error = NULL, locked_until = NULL, locked_by = NULL, updated_at = ?3
+                     WHERE id = ?4 AND locked_by = ?5",
+                    sql_args![attempt, status_code, &now_str, &deliv_id, &lease_owner],
+                )
+                .await?;
+            if updated == 0 {
+                tx.commit().await?;
+                continue;
+            }
 
             if let Some(body) = &resp_json {
                 if let Some(p_tid) = body["platformThreadId"].as_str() {
@@ -1585,40 +1678,74 @@ pub async fn process_pending_deliveries_at(
             let is_best_effort = matches!(kind.as_str(), "edit" | "delete" | "react" | "unreact");
             if is_best_effort {
                 let mut tx = state.db.begin_tx().await?;
-                tx.execute(
-                    "UPDATE sync_deliveries
-                     SET status = 'failed', attempts = ?1, last_http_status = ?2,
-                         last_error = ?3, updated_at = ?4
-                     WHERE id = ?5",
-                    sql_args![attempt, status_code, &err_msg, &now_str, &deliv_id],
-                )
-                .await?;
+                let updated = tx
+                    .execute(
+                        "UPDATE sync_deliveries
+                         SET status = 'failed', attempts = ?1, last_http_status = ?2,
+                             last_error = ?3, locked_until = NULL, locked_by = NULL, updated_at = ?4
+                         WHERE id = ?5 AND locked_by = ?6",
+                        sql_args![
+                            attempt,
+                            status_code,
+                            &err_msg,
+                            &now_str,
+                            &deliv_id,
+                            &lease_owner
+                        ],
+                    )
+                    .await?;
                 tx.commit().await?;
-                summary.failed += 1;
+                if updated > 0 {
+                    summary.failed += 1;
+                }
             } else if attempt < MAX_SYNC_RETRIES {
                 let backoff_secs = 1i64 << (attempt - 1).min(5);
                 let next_at = format_utc_ms(now + Duration::seconds(backoff_secs));
                 let mut tx = state.db.begin_tx().await?;
-                tx.execute(
-                    "UPDATE sync_deliveries
-                     SET status = 'retrying', attempts = ?1, last_http_status = ?2,
-                         last_error = ?3, next_attempt_at = ?4, updated_at = ?5
-                     WHERE id = ?6",
-                    sql_args![attempt, status_code, &err_msg, &next_at, &now_str, &deliv_id],
-                )
-                .await?;
+                let updated = tx
+                    .execute(
+                        "UPDATE sync_deliveries
+                         SET status = 'retrying', attempts = ?1, last_http_status = ?2,
+                             last_error = ?3, next_attempt_at = ?4,
+                             locked_until = NULL, locked_by = NULL, updated_at = ?5
+                         WHERE id = ?6 AND locked_by = ?7",
+                        sql_args![
+                            attempt,
+                            status_code,
+                            &err_msg,
+                            &next_at,
+                            &now_str,
+                            &deliv_id,
+                            &lease_owner
+                        ],
+                    )
+                    .await?;
                 tx.commit().await?;
-                summary.retried += 1;
+                if updated > 0 {
+                    summary.retried += 1;
+                }
             } else {
                 let mut tx = state.db.begin_tx().await?;
-                tx.execute(
-                    "UPDATE sync_deliveries
-                     SET status = 'failed', attempts = ?1, last_http_status = ?2,
-                         last_error = ?3, updated_at = ?4
-                     WHERE id = ?5",
-                    sql_args![attempt, status_code, &err_msg, &now_str, &deliv_id],
-                )
-                .await?;
+                let updated = tx
+                    .execute(
+                        "UPDATE sync_deliveries
+                         SET status = 'failed', attempts = ?1, last_http_status = ?2,
+                             last_error = ?3, locked_until = NULL, locked_by = NULL, updated_at = ?4
+                         WHERE id = ?5 AND locked_by = ?6",
+                        sql_args![
+                            attempt,
+                            status_code,
+                            &err_msg,
+                            &now_str,
+                            &deliv_id,
+                            &lease_owner
+                        ],
+                    )
+                    .await?;
+                if updated == 0 {
+                    tx.commit().await?;
+                    continue;
+                }
                 let emitted_seq = if let Some(stored) =
                     messages::load_stored_message_tx(&mut tx, &board_id, &message_id).await?
                 {
@@ -1661,13 +1788,28 @@ pub async fn process_pending_deliveries_at(
 }
 
 pub fn spawn_sync_worker(state: AppState) -> tokio::task::JoinHandle<()> {
+    spawn_sync_worker_with_shutdown(state, crate::never_shutdown_rx())
+}
+
+pub fn spawn_sync_worker_with_shutdown(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
                 _ = ticker.tick() => {}
                 _ = state.sync_wake.notified() => {}
+            }
+            if *shutdown.borrow() {
+                break;
             }
             if let Err(err) = process_pending_deliveries(&state).await {
                 tracing::warn!("sync delivery worker error: {err}");

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::actors::{self, CallerContext};
 use crate::db::{escape_like_prefix, sql_placeholders, Database, DbRow, DbTx, Dialect, Queryable, SqlArg};
@@ -683,13 +684,17 @@ pub async fn expire_due_leases_tx(
         };
         let before_snap = messages::build_message_snapshot_tx(tx, &stored_msg).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'ready', claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
-             WHERE message_id = ?2",
-            sql_args![&now_str, &task.message_id],
-        )
-        .await?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks
+                 SET state = 'ready', claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
+                 WHERE message_id = ?2 AND state = 'claimed' AND claim_until <= ?1",
+                sql_args![&now_str, &task.message_id],
+            )
+            .await?;
+        if updated == 0 {
+            continue;
+        }
         labels::set_system_label_tx(
             tx,
             &task.board_id,
@@ -742,7 +747,11 @@ pub async fn expire_due_leases_tx(
 
 /// Public reaper called by background tokio loop and deterministic tests.
 pub async fn reap_expired_leases(state: &AppState) -> BoardResult<usize> {
-    reap_expired_leases_at(&state.db, &state.events, Utc::now()).await
+    let count = reap_expired_leases_at(&state.db, &state.events, Utc::now()).await?;
+    if count > 0 {
+        state.tasks_notify.notify_waiters();
+    }
+    Ok(count)
 }
 
 pub async fn reap_expired_leases_at(
@@ -750,24 +759,49 @@ pub async fn reap_expired_leases_at(
     events_hub: &EventHub,
     now: DateTime<Utc>,
 ) -> BoardResult<usize> {
-    let mut tx = db.begin_tx().await?;
-    let emitted = expire_due_leases_tx(&mut tx, None, now).await?;
-    tx.commit().await?;
-    let count = emitted.len() / 2;
-    for (bid, seq) in emitted {
-        events_hub.notify(&bid, seq);
+    let mut total = 0usize;
+    for _ in 0..20 {
+        let mut tx = db.begin_tx().await?;
+        let emitted = expire_due_leases_tx(&mut tx, None, now).await?;
+        tx.commit().await?;
+        let count = emitted.len() / 2;
+        for (bid, seq) in emitted {
+            events_hub.notify(&bid, seq);
+        }
+        total += count;
+        if count < 50 {
+            break;
+        }
     }
-    Ok(count)
+    Ok(total)
 }
 
 pub fn spawn_lease_reaper_loop(state: AppState) -> tokio::task::JoinHandle<()> {
+    spawn_lease_reaper_loop_with_shutdown(state, crate::never_shutdown_rx())
+}
+
+pub fn spawn_lease_reaper_loop_with_shutdown(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            if let Err(err) = reap_expired_leases(&state).await {
-                tracing::warn!("lease reaper tick error: {err}");
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    if let Err(err) = reap_expired_leases(&state).await {
+                        tracing::warn!("lease reaper tick error: {err}");
+                    }
+                }
             }
         }
     })

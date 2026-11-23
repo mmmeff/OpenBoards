@@ -17,6 +17,8 @@ use crate::events::{
 use crate::filter::{LabelPredicate, QueryFilter};
 use crate::AppState;
 
+const SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/messageboard/boards/{board}/events", get(poll_events))
@@ -127,6 +129,19 @@ async fn poll_events(
 
     let deadline = tokio::time::Instant::now() + wait_dur;
     loop {
+        let now_instant = tokio::time::Instant::now();
+        if now_instant >= deadline {
+            let page = events::query_events_after(
+                &state.db,
+                &resolved.id,
+                &caller,
+                after_seq,
+                &parsed.query,
+            )
+            .await?;
+            return Ok(Json(json!(page)));
+        }
+        let safety_wake = (now_instant + SAFETY_POLL_INTERVAL).min(deadline);
         tokio::select! {
             recv = rx.recv() => {
                 match recv {
@@ -154,7 +169,7 @@ async fn poll_events(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(safety_wake) => {
                 let page = events::query_events_after(
                     &state.db,
                     &resolved.id,
@@ -162,7 +177,9 @@ async fn poll_events(
                     after_seq,
                     &parsed.query,
                 ).await?;
-                return Ok(Json(json!(page)));
+                if !page.events.is_empty() || tokio::time::Instant::now() >= deadline {
+                    return Ok(Json(json!(page)));
+                }
             }
         }
     }
@@ -213,6 +230,11 @@ async fn wait_event(
 
     let deadline = tokio::time::Instant::now() + timeout_dur;
     loop {
+        let now_instant = tokio::time::Instant::now();
+        if now_instant >= deadline {
+            break;
+        }
+        let safety_wake = (now_instant + SAFETY_POLL_INTERVAL).min(deadline);
         tokio::select! {
             recv = rx.recv() => {
                 match recv {
@@ -232,7 +254,22 @@ async fn wait_event(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep_until(safety_wake) => {
+                let page = events::query_events_after(
+                    &state.db,
+                    &resolved.id,
+                    &caller,
+                    after_seq,
+                    &parsed.query,
+                ).await?;
+                if let Some(ev) = page.events.into_iter().next() {
+                    let cursor = ev.cursor.clone();
+                    return Ok((StatusCode::OK, Json(json!({ "event": ev, "cursor": cursor }))));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
         }
     }
 

@@ -1,21 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 use crate::actors::{CallerContext, Principal, ProfileOverlay};
 use crate::boards;
-use crate::db::{Database, DbRow, Queryable};
+use crate::db::{Database, DbRow, Dialect, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventQuery, EventType, EventView};
 use crate::filter::{LabelPredicate, QueryFilter};
 use crate::grants;
 use crate::id::prefixed_id;
+use crate::schedules::format_utc_ms;
 use crate::sql_args;
 use crate::AppState;
 
@@ -855,6 +856,7 @@ pub async fn upsert_watcher(
         .await?
         .expect("upserted watcher must exist");
     let view = stored_to_view_tx(&mut tx, stored).await?;
+    tx.queue_watcher_notify();
     tx.commit().await?;
     Ok((view, created))
 }
@@ -983,6 +985,7 @@ pub async fn sync_deployment_watchers(
         views.push(stored_to_view_tx(&mut tx, stored).await?);
     }
 
+    tx.queue_watcher_notify();
     tx.commit().await?;
     Ok(SyncWatchersResult {
         watchers: views,
@@ -1261,22 +1264,192 @@ async fn load_event_raw_actor_id(
     }
 }
 
-async fn advance_watcher_cursor(
+const WATCHER_LEASE_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryMode {
+    BlockingSleep,
+    ScheduleInDb,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_claim_watcher_lease(
     db: &Database,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
+    lease_owner: &str,
+    now: DateTime<Utc>,
+    respect_retry_at: bool,
+) -> BoardResult<Option<StoredWatcher>> {
+    let now_str = format_utc_ms(now);
+    let lock_until = format_utc_ms(now + ChronoDuration::seconds(WATCHER_LEASE_SECS));
+    let skip_locked = match db.dialect() {
+        Dialect::Sqlite => "",
+        Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
+    };
+    let retry_clause = if respect_retry_at {
+        " AND (next_retry_at IS NULL OR next_retry_at <= ?4)"
+    } else {
+        ""
+    };
+    let select_sql = format!(
+        "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
+                secret, last_cursor, created_at, updated_at
+         FROM watchers
+         WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3
+           AND (dispatch_locked_until IS NULL OR dispatch_locked_until <= ?4){retry_clause}{skip_locked}"
+    );
+
+    let mut tx = db.begin_tx().await?;
+    let Some(row) = tx
+        .fetch_optional(
+            &select_sql,
+            sql_args![board_id, owner_principal, watcher_id, &now_str],
+        )
+        .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let stored = parse_stored_watcher_row(&row)?;
+    let updated = tx
+        .execute(
+            "UPDATE watchers
+             SET dispatch_locked_until = ?1, dispatch_owner = ?2
+             WHERE board_id = ?3 AND owner_principal = ?4 AND id = ?5",
+            sql_args![
+                &lock_until,
+                lease_owner,
+                board_id,
+                owner_principal,
+                watcher_id
+            ],
+        )
+        .await?;
+    tx.commit().await?;
+    if updated == 0 {
+        return Ok(None);
+    }
+    Ok(Some(stored))
+}
+
+async fn renew_watcher_lease(
+    db: &Database,
+    board_id: &str,
+    owner_principal: &str,
+    watcher_id: &str,
+    lease_owner: &str,
+    now: DateTime<Utc>,
+) -> BoardResult<bool> {
+    let lock_until = format_utc_ms(now + ChronoDuration::seconds(WATCHER_LEASE_SECS));
+    let mut tx = db.begin_tx().await?;
+    let updated = tx
+        .execute(
+            "UPDATE watchers
+             SET dispatch_locked_until = ?1
+             WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4 AND dispatch_owner = ?5",
+            sql_args![
+                &lock_until,
+                board_id,
+                owner_principal,
+                watcher_id,
+                lease_owner
+            ],
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(updated > 0)
+}
+
+async fn advance_watcher_cursor_owned(
+    db: &Database,
+    board_id: &str,
+    owner_principal: &str,
+    watcher_id: &str,
+    lease_owner: &str,
     seq: i64,
 ) -> BoardResult<()> {
     let mut tx = db.begin_tx().await?;
     tx.execute(
         "UPDATE watchers
-         SET last_cursor = CASE WHEN last_cursor >= ?1 THEN last_cursor ELSE ?1 END
-         WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4",
-        sql_args![seq, board_id, owner_principal, watcher_id],
+         SET last_cursor = CASE WHEN last_cursor >= ?1 THEN last_cursor ELSE ?1 END,
+             next_retry_at = NULL
+         WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4 AND dispatch_owner = ?5",
+        sql_args![seq, board_id, owner_principal, watcher_id, lease_owner],
     )
     .await?;
     tx.commit().await
+}
+
+async fn release_watcher_lease(
+    db: &Database,
+    board_id: &str,
+    owner_principal: &str,
+    watcher_id: &str,
+    lease_owner: &str,
+    next_retry_at: Option<&str>,
+) -> BoardResult<()> {
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "UPDATE watchers
+         SET dispatch_locked_until = NULL, dispatch_owner = NULL, next_retry_at = ?1
+         WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4 AND dispatch_owner = ?5",
+        sql_args![
+            next_retry_at,
+            board_id,
+            owner_principal,
+            watcher_id,
+            lease_owner
+        ],
+    )
+    .await?;
+    tx.commit().await
+}
+
+/// Checks whether new events landed on `board_id` past `cursor_seq`. If not, atomically releases
+/// the watcher lease and returns `true`; otherwise renews the lease and returns `false` so the
+/// caller runs one more pass without missing concurrent writes.
+async fn release_or_continue_watcher_lease(
+    db: &Database,
+    board_id: &str,
+    owner_principal: &str,
+    watcher_id: &str,
+    lease_owner: &str,
+    cursor_seq: i64,
+) -> BoardResult<bool> {
+    let now = Utc::now();
+    let lock_until = format_utc_ms(now + ChronoDuration::seconds(WATCHER_LEASE_SECS));
+    let mut tx = db.begin_tx().await?;
+    let latest_seq = events::current_event_seq_tx(&mut tx, board_id).await?;
+    if latest_seq > cursor_seq {
+        let renewed = tx
+            .execute(
+                "UPDATE watchers
+                 SET dispatch_locked_until = ?1
+                 WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4 AND dispatch_owner = ?5",
+                sql_args![
+                    &lock_until,
+                    board_id,
+                    owner_principal,
+                    watcher_id,
+                    lease_owner
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(renewed == 0)
+    } else {
+        tx.execute(
+            "UPDATE watchers
+             SET dispatch_locked_until = NULL, dispatch_owner = NULL, next_retry_at = NULL
+             WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3 AND dispatch_owner = ?4",
+            sql_args![board_id, owner_principal, watcher_id, lease_owner],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
 async fn watcher_still_exists(
@@ -1300,16 +1473,21 @@ enum DeliveryOutcome {
     DeadLetter,
     AlreadySettled,
     WatcherDeleted,
+    RetryScheduled(String),
+    LeaseLost,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_event_with_retries(
     db: &Database,
     client: &reqwest::Client,
     watcher: &StoredWatcher,
+    lease_owner: &str,
     board_name: &str,
     event: &EventView,
     event_seq: i64,
     policy: &DeliveryPolicy,
+    retry_mode: RetryMode,
 ) -> BoardResult<DeliveryOutcome> {
     let delivery_id = compute_delivery_id(
         &watcher.board_id,
@@ -1435,6 +1613,19 @@ async fn deliver_event_with_retries(
             return Ok(DeliveryOutcome::WatcherDeleted);
         }
 
+        if !renew_watcher_lease(
+            db,
+            &watcher.board_id,
+            &watcher.owner_principal,
+            &watcher.id,
+            lease_owner,
+            Utc::now(),
+        )
+        .await?
+        {
+            return Ok(DeliveryOutcome::LeaseLost);
+        }
+
         let mut req = client
             .post(&watcher.webhook_url)
             .timeout(policy.request_timeout)
@@ -1489,10 +1680,10 @@ async fn deliver_event_with_retries(
             Err((status_opt, err_msg)) => {
                 if attempt < max_attempts {
                     let delay = policy.backoff_for_attempt(attempt);
-                    let next_at = (now
+                    let next_dt = now
                         + ChronoDuration::from_std(delay)
-                            .unwrap_or_else(|_| ChronoDuration::seconds(30)))
-                    .to_rfc3339();
+                            .unwrap_or_else(|_| ChronoDuration::seconds(30));
+                    let next_at = format_utc_ms(next_dt);
                     let mut tx = db.begin_tx().await?;
                     tx.execute(
                         "UPDATE watcher_deliveries
@@ -1511,7 +1702,12 @@ async fn deliver_event_with_retries(
                     )
                     .await?;
                     tx.commit().await?;
-                    tokio::time::sleep(delay).await;
+                    match retry_mode {
+                        RetryMode::BlockingSleep => tokio::time::sleep(delay).await,
+                        RetryMode::ScheduleInDb => {
+                            return Ok(DeliveryOutcome::RetryScheduled(next_at));
+                        }
+                    }
                 } else {
                     let mut tx = db.begin_tx().await?;
                     tx.execute(
@@ -1550,27 +1746,102 @@ pub async fn dispatch_watcher_once(
     watcher_id: &str,
     policy: &DeliveryPolicy,
 ) -> BoardResult<DispatchReport> {
-    let loaded = {
+    let lease_owner = prefixed_id("rep");
+    dispatch_watcher_leased(
+        db,
+        client,
+        board_id,
+        owner_principal,
+        watcher_id,
+        &lease_owner,
+        policy,
+        RetryMode::BlockingSleep,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_watcher_leased(
+    db: &Database,
+    client: &reqwest::Client,
+    board_id: &str,
+    owner_principal: &str,
+    watcher_id: &str,
+    lease_owner: &str,
+    policy: &DeliveryPolicy,
+    retry_mode: RetryMode,
+    respect_retry_at: bool,
+) -> BoardResult<DispatchReport> {
+    let Some(watcher) = try_claim_watcher_lease(
+        db,
+        board_id,
+        owner_principal,
+        watcher_id,
+        lease_owner,
+        Utc::now(),
+        respect_retry_at,
+    )
+    .await?
+    else {
+        return Ok(DispatchReport::default());
+    };
+
+    let res = dispatch_claimed_watcher(db, client, watcher, lease_owner, policy, retry_mode).await;
+    match res {
+        Ok((report, next_retry_at, already_released)) => {
+            if !already_released {
+                let _ = release_watcher_lease(
+                    db,
+                    board_id,
+                    owner_principal,
+                    watcher_id,
+                    lease_owner,
+                    next_retry_at.as_deref(),
+                )
+                .await;
+            }
+            Ok(report)
+        }
+        Err(err) => {
+            let _ = release_watcher_lease(
+                db,
+                board_id,
+                owner_principal,
+                watcher_id,
+                lease_owner,
+                None,
+            )
+            .await;
+            Err(err)
+        }
+    }
+}
+
+async fn dispatch_claimed_watcher(
+    db: &Database,
+    client: &reqwest::Client,
+    watcher: StoredWatcher,
+    lease_owner: &str,
+    policy: &DeliveryPolicy,
+    retry_mode: RetryMode,
+) -> BoardResult<(DispatchReport, Option<String>, bool)> {
+    let resolved = {
         let mut conn = db.read_conn();
-        match load_stored_watcher_tx(&mut conn, board_id, owner_principal, watcher_id).await? {
+        match resolve_watcher_caller(&mut conn, &watcher.owner_principal, &watcher.id).await? {
             None => None,
-            Some(stored) => {
-                match resolve_watcher_caller(&mut conn, owner_principal, watcher_id).await? {
-                    None => None,
-                    Some(caller) => {
-                        let board_name = boards::find_board_tx(&mut conn, board_id)
-                            .await?
-                            .map(|b| b.name)
-                            .unwrap_or_else(|| board_id.to_string());
-                        Some((stored, caller, board_name))
-                    }
-                }
+            Some(caller) => {
+                let board_name = boards::find_board_tx(&mut conn, &watcher.board_id)
+                    .await?
+                    .map(|b| b.name)
+                    .unwrap_or_else(|| watcher.board_id.clone());
+                Some((caller, board_name))
             }
         }
     };
 
-    let Some((watcher, watcher_caller, board_name)) = loaded else {
-        return Ok(DispatchReport::default());
+    let Some((watcher_caller, board_name)) = resolved else {
+        return Ok((DispatchReport::default(), None, false));
     };
 
     let event_query = watcher.filter.to_event_query()?;
@@ -1591,17 +1862,31 @@ pub async fn dispatch_watcher_once(
         if page.events.is_empty() {
             if let Some(tip_seq) = events::parse_event_cursor_seq(&page.cursor) {
                 if tip_seq > cursor_seq {
-                    advance_watcher_cursor(
+                    advance_watcher_cursor_owned(
                         db,
                         &watcher.board_id,
                         &watcher.owner_principal,
                         &watcher.id,
+                        lease_owner,
                         tip_seq,
                     )
                     .await?;
+                    cursor_seq = tip_seq;
                 }
             }
-            break;
+            if release_or_continue_watcher_lease(
+                db,
+                &watcher.board_id,
+                &watcher.owner_principal,
+                &watcher.id,
+                lease_owner,
+                cursor_seq,
+            )
+            .await?
+            {
+                return Ok((report, None, true));
+            }
+            continue;
         }
 
         for ev in &page.events {
@@ -1616,11 +1901,12 @@ pub async fn dispatch_watcher_once(
 
             if ev_actor_id == Some(self_actor_id.as_str()) {
                 report.skipped_self += 1;
-                advance_watcher_cursor(
+                advance_watcher_cursor_owned(
                     db,
                     &watcher.board_id,
                     &watcher.owner_principal,
                     &watcher.id,
+                    lease_owner,
                     ev_seq,
                 )
                 .await?;
@@ -1633,32 +1919,38 @@ pub async fn dispatch_watcher_once(
                 db,
                 client,
                 &watcher,
+                lease_owner,
                 &board_name,
                 ev,
                 ev_seq,
                 policy,
+                retry_mode,
             )
             .await?
             {
                 DeliveryOutcome::Delivered => report.delivered += 1,
                 DeliveryOutcome::DeadLetter => report.dead_lettered += 1,
                 DeliveryOutcome::AlreadySettled => {}
-                DeliveryOutcome::WatcherDeleted => return Ok(report),
+                DeliveryOutcome::WatcherDeleted | DeliveryOutcome::LeaseLost => {
+                    return Ok((report, None, false));
+                }
+                DeliveryOutcome::RetryScheduled(next_at) => {
+                    return Ok((report, Some(next_at), false));
+                }
             }
 
-            advance_watcher_cursor(
+            advance_watcher_cursor_owned(
                 db,
                 &watcher.board_id,
                 &watcher.owner_principal,
                 &watcher.id,
+                lease_owner,
                 ev_seq,
             )
             .await?;
             cursor_seq = ev_seq;
         }
     }
-
-    Ok(report)
 }
 
 /// Deterministically dispatches pending events for all watchers registered on `board_id`.
@@ -1720,36 +2012,24 @@ pub async fn dispatch_all_once(
     Ok(total)
 }
 
-type WatcherLockKey = (String, String, String);
-
-#[derive(Clone, Default)]
-struct WatcherLocks {
-    locks: Arc<Mutex<HashMap<WatcherLockKey, Arc<tokio::sync::Mutex<()>>>>>,
-}
-
-impl WatcherLocks {
-    fn lock_for(&self, key: WatcherLockKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut guard = self.locks.lock().expect("watcher locks poisoned");
-        guard
-            .entry(key)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-}
-
-async fn dispatch_board_serialized(
+async fn dispatch_board_leased(
     db: &Database,
     client: &reqwest::Client,
     board_id: &str,
+    replica_id: &str,
     policy: &DeliveryPolicy,
-    locks: &WatcherLocks,
 ) {
+    let now_str = format_utc_ms(Utc::now());
     let keys: Vec<(String, String)> = {
         let mut conn = db.read_conn();
         match conn
             .fetch_all(
-                "SELECT owner_principal, id FROM watchers WHERE board_id = ?1 ORDER BY owner_principal ASC, id ASC",
-                sql_args![board_id],
+                "SELECT owner_principal, id FROM watchers
+                 WHERE board_id = ?1
+                   AND (dispatch_locked_until IS NULL OR dispatch_locked_until <= ?2)
+                   AND (next_retry_at IS NULL OR next_retry_at <= ?2)
+                 ORDER BY owner_principal ASC, id ASC",
+                sql_args![board_id, &now_str],
             )
             .await
         {
@@ -1773,12 +2053,21 @@ async fn dispatch_board_serialized(
         let db = db.clone();
         let client = client.clone();
         let board_id = board_id.to_string();
+        let lease_owner = format!("{replica_id}:{}", prefixed_id("wl"));
         let policy = policy.clone();
-        let lock = locks.lock_for((board_id.clone(), owner.clone(), id.clone()));
         tokio::spawn(async move {
-            let _guard = lock.lock().await;
-            if let Err(err) =
-                dispatch_watcher_once(&db, &client, &board_id, &owner, &id, &policy).await
+            if let Err(err) = dispatch_watcher_leased(
+                &db,
+                &client,
+                &board_id,
+                &owner,
+                &id,
+                &lease_owner,
+                &policy,
+                RetryMode::ScheduleInDb,
+                true,
+            )
+            .await
             {
                 tracing::warn!(
                     "watcher dispatch failed for board={board_id} owner={owner} id={id}: {err}"
@@ -1794,18 +2083,28 @@ pub fn spawn_watcher_dispatcher(state: AppState) -> tokio::task::JoinHandle<()> 
 }
 
 /// Spawns the background watcher webhook dispatcher with a custom `DeliveryPolicy`.
-/// Subscribes to `state.events.subscribe(&board_id)` for each board that has watchers and
-/// wakes dynamically whenever new watchers are registered.
 pub fn spawn_watcher_dispatcher_with_policy(
     state: AppState,
     policy: DeliveryPolicy,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_watcher_dispatcher_with_policy_and_shutdown(state, policy, crate::never_shutdown_rx())
+}
+
+/// Spawns the multi-replica DB-leased watcher webhook dispatcher with graceful shutdown.
+pub fn spawn_watcher_dispatcher_with_policy_and_shutdown(
+    state: AppState,
+    policy: DeliveryPolicy,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = state.http.clone();
-        let locks = WatcherLocks::default();
         let mut board_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
         loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
             let board_ids: Vec<String> = {
                 let mut conn = state.db.read_conn();
                 match conn
@@ -1827,33 +2126,57 @@ pub fn spawn_watcher_dispatcher_with_policy(
                     let task_state = state.clone();
                     let task_client = client.clone();
                     let task_policy = policy.clone();
-                    let task_locks = locks.clone();
+                    let mut task_shutdown = shutdown.clone();
                     let bid = board_id.clone();
 
                     let mut rx = task_state.events.subscribe(&bid);
 
                     let handle = tokio::spawn(async move {
-                        dispatch_board_serialized(
+                        let mut retry_ticker = tokio::time::interval(Duration::from_millis(500));
+                        retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                        dispatch_board_leased(
                             &task_state.db,
                             &task_client,
                             &bid,
+                            &task_state.replica_id,
                             &task_policy,
-                            &task_locks,
                         )
                         .await;
 
-                        while let Ok(_)
-                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
-                            rx.recv().await
-                        {
-                            dispatch_board_serialized(
-                                &task_state.db,
-                                &task_client,
-                                &bid,
-                                &task_policy,
-                                &task_locks,
-                            )
-                            .await;
+                        loop {
+                            tokio::select! {
+                                changed = task_shutdown.changed() => {
+                                    if changed.is_err() || *task_shutdown.borrow() {
+                                        break;
+                                    }
+                                }
+                                recv = rx.recv() => {
+                                    match recv {
+                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                            dispatch_board_leased(
+                                                &task_state.db,
+                                                &task_client,
+                                                &bid,
+                                                &task_state.replica_id,
+                                                &task_policy,
+                                            )
+                                            .await;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                                _ = retry_ticker.tick() => {
+                                    dispatch_board_leased(
+                                        &task_state.db,
+                                        &task_client,
+                                        &bid,
+                                        &task_state.replica_id,
+                                        &task_policy,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     });
                     e.insert(handle);
@@ -1861,9 +2184,18 @@ pub fn spawn_watcher_dispatcher_with_policy(
             }
 
             tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
                 _ = state.watcher_wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
+        }
+
+        for (_, handle) in board_tasks {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
     })
 }

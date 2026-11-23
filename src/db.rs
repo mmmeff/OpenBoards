@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
@@ -918,6 +919,66 @@ const MIGRATIONS: &[Migration] = &[
         "#,
         postgres_sql: None,
     },
+    Migration {
+        version: 13,
+        name: "013_horizontal_scaling",
+        sqlite_sql: r#"
+            ALTER TABLE watchers ADD COLUMN dispatch_locked_until TEXT;
+            ALTER TABLE watchers ADD COLUMN dispatch_owner TEXT;
+            ALTER TABLE watchers ADD COLUMN next_retry_at TEXT;
+            CREATE INDEX IF NOT EXISTS idx_watchers_dispatch
+                ON watchers (dispatch_locked_until, next_retry_at);
+
+            ALTER TABLE sync_deliveries ADD COLUMN locked_until TEXT;
+            ALTER TABLE sync_deliveries ADD COLUMN locked_by TEXT;
+            CREATE INDEX IF NOT EXISTS idx_sync_deliveries_claim
+                ON sync_deliveries (status, next_attempt_at, locked_until);
+        "#,
+        postgres_sql: Some(
+            r#"
+            ALTER TABLE watchers ADD COLUMN IF NOT EXISTS dispatch_locked_until TEXT;
+            ALTER TABLE watchers ADD COLUMN IF NOT EXISTS dispatch_owner TEXT;
+            ALTER TABLE watchers ADD COLUMN IF NOT EXISTS next_retry_at TEXT;
+            CREATE INDEX IF NOT EXISTS idx_watchers_dispatch
+                ON watchers (dispatch_locked_until, next_retry_at);
+
+            ALTER TABLE sync_deliveries ADD COLUMN IF NOT EXISTS locked_until TEXT;
+            ALTER TABLE sync_deliveries ADD COLUMN IF NOT EXISTS locked_by TEXT;
+            CREATE INDEX IF NOT EXISTS idx_sync_deliveries_claim
+                ON sync_deliveries (status, next_attempt_at, locked_until);
+
+            CREATE TABLE IF NOT EXISTS blob_objects (
+                sha256 TEXT PRIMARY KEY,
+                size BIGINT NOT NULL,
+                chunk_count BIGINT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS blob_chunks (
+                sha256 TEXT NOT NULL REFERENCES blob_objects(sha256) ON DELETE CASCADE,
+                chunk_idx BIGINT NOT NULL,
+                data BYTEA NOT NULL,
+                PRIMARY KEY (sha256, chunk_idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS blob_staging_chunks (
+                attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+                chunk_idx BIGINT NOT NULL,
+                data BYTEA NOT NULL,
+                PRIMARY KEY (attachment_id, chunk_idx)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blob_staging_attachment
+                ON blob_staging_chunks (attachment_id);
+
+            CREATE UNLOGGED TABLE IF NOT EXISTS rate_limit_buckets (
+                principal_id TEXT PRIMARY KEY,
+                tokens_milli BIGINT NOT NULL,
+                last_refill_ms BIGINT NOT NULL,
+                last_allowed BIGINT NOT NULL
+            );
+        "#,
+        ),
+    },
 ];
 
 #[derive(Clone)]
@@ -946,10 +1007,19 @@ enum TxBackend {
     Postgres(Transaction<'static, Postgres>),
 }
 
+#[derive(Default)]
+struct PendingPgNotifies {
+    board_events: HashMap<String, i64>,
+    task_events: HashMap<String, i64>,
+    notify_watcher: bool,
+    notify_sync: bool,
+}
+
 /// Active database transaction (`BEGIN IMMEDIATE` on SQLite, `BEGIN` on PostgreSQL).
 /// Dropping without calling `commit().await` rolls back automatically.
 pub struct DbTx {
     backend: TxBackend,
+    pending_notifies: PendingPgNotifies,
 }
 
 /// Unified query execution interface implemented for both `DbRead<'_>` (pool reads)
@@ -1235,7 +1305,77 @@ impl DbTx {
         }
     }
 
-    pub async fn commit(self) -> BoardResult<()> {
+    /// Queues a PostgreSQL `pg_notify('ob_events', '<board_id>:<seq>')` emitted inside this
+    /// transaction right before commit (no-op on SQLite and discarded on rollback).
+    pub fn queue_event_notify(&mut self, board_id: &str, seq: i64) {
+        if self.dialect() == Dialect::Postgres {
+            let entry = self
+                .pending_notifies
+                .board_events
+                .entry(board_id.to_string())
+                .or_insert(seq);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+    }
+
+    /// Queues a PostgreSQL `pg_notify('ob_tasks', '<board_id>:<seq>')` emitted inside this
+    /// transaction right before commit (no-op on SQLite and discarded on rollback).
+    pub fn queue_task_notify(&mut self, board_id: &str, seq: i64) {
+        if self.dialect() == Dialect::Postgres {
+            let entry = self
+                .pending_notifies
+                .task_events
+                .entry(board_id.to_string())
+                .or_insert(seq);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+    }
+
+    /// Queues a PostgreSQL watcher wakeup notification emitted inside this transaction on commit.
+    pub fn queue_watcher_notify(&mut self) {
+        if self.dialect() == Dialect::Postgres {
+            self.pending_notifies.notify_watcher = true;
+        }
+    }
+
+    /// Queues a PostgreSQL `pg_notify('ob_sync', 'sync')` emitted inside this transaction on commit.
+    pub fn queue_sync_notify(&mut self) {
+        if self.dialect() == Dialect::Postgres {
+            self.pending_notifies.notify_sync = true;
+        }
+    }
+
+    pub async fn commit(mut self) -> BoardResult<()> {
+        if let TxBackend::Postgres(ref mut tx) = self.backend {
+            for (board_id, seq) in &self.pending_notifies.board_events {
+                let payload = format!("{board_id}:{seq}");
+                sqlx::query("SELECT pg_notify('ob_events', $1)")
+                    .bind(&payload)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            for (board_id, seq) in &self.pending_notifies.task_events {
+                let payload = format!("{board_id}:{seq}");
+                sqlx::query("SELECT pg_notify('ob_tasks', $1)")
+                    .bind(&payload)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            if self.pending_notifies.notify_watcher {
+                sqlx::query("SELECT pg_notify('ob_events', '__watcher__')")
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            if self.pending_notifies.notify_sync {
+                sqlx::query("SELECT pg_notify('ob_sync', 'sync')")
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
         match self.backend {
             TxBackend::Sqlite(tx) => tx.commit().await?,
             TxBackend::Postgres(tx) => tx.commit().await?,
@@ -1413,12 +1553,14 @@ impl Database {
                 let tx = writer.begin_with("BEGIN IMMEDIATE").await?;
                 Ok(DbTx {
                     backend: TxBackend::Sqlite(tx),
+                    pending_notifies: PendingPgNotifies::default(),
                 })
             }
             DbBackend::Postgres(pool) => {
                 let tx = pool.begin().await?;
                 Ok(DbTx {
                     backend: TxBackend::Postgres(tx),
+                    pending_notifies: PendingPgNotifies::default(),
                 })
             }
         }
@@ -1449,8 +1591,13 @@ impl Database {
         }
     }
 
-    /// Applies all unapplied schema migrations (`001`–`012`).
+    /// Applies all unapplied schema migrations (`001`–`013`).
     pub async fn run_migrations(&self) -> BoardResult<()> {
+        self.run_migrations_up_to(i64::MAX).await
+    }
+
+    /// Applies unapplied schema migrations up to and including `max_version`.
+    pub async fn run_migrations_up_to(&self, max_version: i64) -> BoardResult<()> {
         let dialect = self.dialect();
         let meta_ddl = match dialect {
             Dialect::Sqlite => {
@@ -1476,6 +1623,9 @@ impl Database {
         }
 
         for migration in MIGRATIONS {
+            if migration.version > max_version {
+                break;
+            }
             let applied = self
                 .read_conn()
                 .fetch_optional(
@@ -1597,7 +1747,7 @@ mod tests {
 
     #[test]
     fn generates_clean_postgres_ddl_for_all_migrations() {
-        assert_eq!(MIGRATIONS.len(), 12);
+        assert_eq!(MIGRATIONS.len(), 13);
         for m in MIGRATIONS {
             let pg = m.ddl_for(Dialect::Postgres);
             assert!(

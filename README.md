@@ -47,7 +47,31 @@ ob serve \
   --rate-limit-burst 200
 ```
 
-If `--admin-token` is omitted on first boot, OpenBoards generates a random bootstrap owner token (`ob_...`), stores its SHA-256 digest in SQLite, and logs it once on startup.
+If `--admin-token` is omitted on first boot, OpenBoards generates a random bootstrap owner token (`ob_...`), stores its SHA-256 digest in the database, and logs it once on startup.
+
+### Database Backends & Horizontal Scaling (`DATABASE_URL`)
+
+OpenBoards supports embedded **SQLite** (default) and **PostgreSQL** for multi-replica horizontal scaling:
+
+- **Env-var-only `DATABASE_URL`:** Database connection strings are read strictly from the `DATABASE_URL` environment variable — never via CLI flags (`--database-url` is rejected) and never via `.openboard.json` (rejected as an unknown key). Credentials are redacted from logs and errors.
+  - **Unset (default):** Embedded SQLite in WAL mode at `<data-dir>/openboards.db` with local blob storage under `<data-dir>/blobs/`.
+  - **`sqlite://...` / `sqlite:...`:** Explicit SQLite URL.
+  - **`postgres://...` / `postgresql://...`:** Shared PostgreSQL backend (incompatible with `ob serve --local`; no local `--data-dir` files are created).
+- **Pool sizing:** Set `OPENBOARDS_DB_MAX_CONNECTIONS` to tune the PostgreSQL connection pool per replica (default: `20`).
+- **Multi-replica horizontal scaling (PostgreSQL):** Run multiple stateless `ob serve` instances behind any load balancer against the same `DATABASE_URL`:
+  - **Safe concurrent startup:** Advisory-locked migrations and first-boot seeding serialize simultaneous cold boots across replicas.
+  - **Cross-replica real-time wakeups:** Post-commit PostgreSQL `LISTEN`/`NOTIFY` (`ob_events`, `ob_tasks`, `ob_sync`) wakes long-polling `events`/`wait`, `tasks claim --ready --wait`, watchers, and sync workers across replicas with automatic reconnect catch-up and a 5 s safety tick.
+  - **Coordinated background workers:** Task lease reaping, scheduled posts, watcher webhooks, and sync outbox deliveries use `FOR UPDATE SKIP LOCKED` and DB-backed leases so concurrent replicas never double-execute or double-deliver.
+  - **Shared attachments & distributed rate limits:** Attachments are stored as 1 MiB content-addressed `BYTEA` chunks (supporting streaming inline, single-PUT, and multi-part uploads split across replicas); per-principal rate limits use an atomic `UNLOGGED` PostgreSQL token bucket.
+- **Health & readiness probes:**
+  - `GET /healthz` — liveness check (`200 {"ok": true}`).
+  - `GET /readyz` — readiness check verifying live DB connectivity (`SELECT 1` with 2 s timeout) and `LISTEN`/`NOTIFY` bridge status on PostgreSQL (`200 {"ok": true, "dialect": "postgres", "listener_ok": true}` or `503` when unreachable).
+
+```bash
+DATABASE_URL="postgres://openboards:secret@db.internal:5432/openboards" \
+OPENBOARDS_DB_MAX_CONNECTIONS=20 \
+ob serve --listen 0.0.0.0:8080 --team acme --admin-token "$OPENBOARDS_ADMIN_TOKEN"
+```
 
 ### Bootstrapping Users, Projects, Apps & Tokens
 

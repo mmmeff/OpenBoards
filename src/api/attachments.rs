@@ -21,6 +21,12 @@ struct InlineUploadQuery {
     name: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PutUploadQuery {
+    ensure: Option<bool>,
+    part: Option<u32>,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -71,7 +77,7 @@ async fn upload_inline(
 
     let att = attachments::upload_inline(
         &state.db,
-        &state.config.data_dir,
+        &state.blobs,
         &resolved.id,
         &caller,
         &filename,
@@ -99,15 +105,16 @@ async fn put_upload(
     State(state): State<AppState>,
     caller: CallerContext,
     Path((board, id)): Path<(String, String)>,
-    Query(query): Query<EnsureQuery>,
+    Query(query): Query<PutUploadQuery>,
     body: Body,
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = attachments::put_streaming_upload(
         &state.db,
-        &state.config.data_dir,
+        &state.blobs,
         &resolved.id,
         &id,
+        query.part,
         &caller,
         body,
     )
@@ -124,7 +131,7 @@ async fn complete_upload(
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let att = attachments::complete_streaming_upload(
         &state.db,
-        &state.config.data_dir,
+        &state.blobs,
         &resolved.id,
         &id,
         &caller,
@@ -141,33 +148,7 @@ async fn download_attachment(
 ) -> BoardResult<Response> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let att = attachments::authorize_download(&state.db, &resolved.id, &id, &caller).await?;
-    let blob_path = attachments::content_blob_path(&state.config.data_dir, &att.sha256);
-
-    let file = tokio::fs::File::open(&blob_path)
-        .await
-        .map_err(|e| BoardError::internal(format!("failed to open attachment blob: {e}")))?;
-
-    // Stream file in 64 KiB chunks so large downloads never buffer in RAM
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut reader = file;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-    });
+    let rx = state.blobs.open_download_stream(&att.sha256).await?;
 
     let stream = ReceiverStream(rx);
     let mut resp = Body::from_stream(stream).into_response();

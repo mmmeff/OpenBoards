@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::broadcast;
+use sqlx::postgres::PgListener;
+use tokio::sync::{broadcast, watch};
 
 use crate::actors::{self, ActorView, CallerContext};
 use crate::db::{Database, DbTx, Queryable};
@@ -13,7 +15,7 @@ use crate::error::{BoardError, BoardResult};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
 use crate::grants;
 use crate::messages::{MessageView, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
-use crate::sql_args;
+use crate::{sql_args, AppState};
 
 pub const MAX_POLL_WAIT_SECS: f64 = 300.0;
 pub const DEFAULT_WAIT_TIMEOUT_SECS: f64 = 1800.0;
@@ -146,6 +148,26 @@ impl EventType {
         matches!(
             self,
             Self::TaskRenewed | Self::MessageSynced | Self::MessageFilesSynced
+        )
+    }
+
+    pub const fn is_task_event(self) -> bool {
+        matches!(
+            self,
+            Self::TaskCreated
+                | Self::TaskReady
+                | Self::TaskClaimed
+                | Self::TaskReleased
+                | Self::TaskCompleted
+                | Self::TaskFailed
+                | Self::TaskBlocked
+                | Self::TaskUnblocked
+                | Self::TaskCanceled
+                | Self::TaskReopened
+                | Self::TaskAssigned
+                | Self::TaskNeedsChanged
+                | Self::TaskExpired
+                | Self::TaskRenewed
         )
     }
 }
@@ -295,6 +317,11 @@ pub async fn append_event_tx(tx: &mut DbTx, input: EventAppend<'_>) -> BoardResu
     )
     .await?;
 
+    tx.queue_event_notify(input.board_id, seq);
+    if input.event_type.is_task_event() {
+        tx.queue_task_notify(input.board_id, seq);
+    }
+
     Ok(AppendedEvent { seq, cursor })
 }
 
@@ -365,6 +392,131 @@ impl EventHub {
             let _ = tx.send(seq);
         }
     }
+}
+
+fn broadcast_catchup(state: &AppState) {
+    state.events.notify_all(0);
+    state.tasks_notify.notify_waiters();
+    state.watcher_wake.notify_one();
+    state.sync_wake.notify_one();
+}
+
+fn dispatch_pg_notification(state: &AppState, channel: &str, payload: &str) {
+    match channel {
+        "ob_events" => {
+            if payload == "__watcher__" {
+                state.watcher_wake.notify_one();
+            } else if let Some((board_id, seq_str)) = payload.rsplit_once(':') {
+                let seq = seq_str.parse::<i64>().unwrap_or(0);
+                state.events.notify(board_id, seq);
+                state.watcher_wake.notify_one();
+            } else {
+                state.events.notify_all(0);
+                state.watcher_wake.notify_one();
+            }
+        }
+        "ob_tasks" => {
+            if let Some((board_id, seq_str)) = payload.rsplit_once(':') {
+                let seq = seq_str.parse::<i64>().unwrap_or(0);
+                state.events.notify(board_id, seq);
+            }
+            state.tasks_notify.notify_waiters();
+        }
+        "ob_sync" => {
+            state.sync_wake.notify_one();
+        }
+        _ => {}
+    }
+}
+
+/// Spawns the PostgreSQL `LISTEN`/`NOTIFY` bridge subscribing to `ob_events`, `ob_tasks`, and
+/// `ob_sync` and forwarding wakeups to local waiters with reconnect backoff and catch-up fan-out.
+/// Returns `None` on SQLite.
+pub fn spawn_pg_notify_bridge(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let pool = state.db.pg_pool()?.clone();
+
+    Some(tokio::spawn(async move {
+        let mut backoff = Duration::from_millis(100);
+        let mut was_disconnected = false;
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let connect_res = async {
+                let mut listener = PgListener::connect_with(&pool).await?;
+                listener
+                    .listen_all(["ob_events", "ob_tasks", "ob_sync"])
+                    .await?;
+                Ok::<PgListener, sqlx::Error>(listener)
+            }
+            .await;
+
+            match connect_res {
+                Ok(mut listener) => {
+                    backoff = Duration::from_millis(100);
+                    state.pg_listener_healthy.store(true, Ordering::Relaxed);
+                    if std::mem::take(&mut was_disconnected) {
+                        tracing::info!("pg_listener reconnected; broadcasting catch-up wakeups");
+                        broadcast_catchup(&state);
+                    }
+
+                    loop {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                            }
+                            recv = listener.try_recv() => {
+                                match recv {
+                                    Ok(Some(notif)) => {
+                                        dispatch_pg_notification(
+                                            &state,
+                                            notif.channel(),
+                                            notif.payload(),
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        tracing::info!(
+                                            "pg_listener recovered connection; broadcasting catch-up wakeups"
+                                        );
+                                        state.pg_listener_healthy.store(true, Ordering::Relaxed);
+                                        broadcast_catchup(&state);
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("pg_listener recv error: {err}; reconnecting");
+                                        state.pg_listener_healthy.store(false, Ordering::Relaxed);
+                                        was_disconnected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("pg_listener connect failed: {err}; retrying in {backoff:?}");
+                    state.pg_listener_healthy.store(false, Ordering::Relaxed);
+                    was_disconnected = true;
+                }
+            }
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
+    }))
 }
 
 /// Fetches matching events strictly after `after_seq` (with visibility & before-or-after filtering).

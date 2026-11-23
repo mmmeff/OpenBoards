@@ -303,10 +303,28 @@ async fn pg_migrations_startup_lock_readyz_discovery_and_env_only_validation() {
     res_a.expect("replica A startup failed");
     res_b.expect("replica B startup failed");
 
-    assert_eq!(db_a.schema_version().await.unwrap(), 12);
-    assert_eq!(db_b.schema_version().await.unwrap(), 12);
+    assert_eq!(db_a.schema_version().await.unwrap(), 13);
+    assert_eq!(db_b.schema_version().await.unwrap(), 13);
     assert_eq!(actors::list_users(&db_a).await.unwrap().len(), 1);
     assert_eq!(schemas::list_schemas(&db_a).await.unwrap().len(), 2);
+
+    // Verify clean upgrade path from Migration 12 -> 13 on an existing Postgres database
+    let upgrade_url = pg.create_database("ob_upgrade_12_to_13");
+    let upgrade_target = DbTarget::PostgresUrl(upgrade_url);
+    let db_up = Database::connect_raw(&upgrade_target, 5).await.unwrap();
+    db_up.run_migrations_up_to(12).await.unwrap();
+    assert_eq!(db_up.schema_version().await.unwrap(), 12);
+    db_up.run_migrations().await.unwrap();
+    assert_eq!(db_up.schema_version().await.unwrap(), 13);
+
+    // Verify clean upgrade path from Migration 12 -> 13 on an existing SQLite database
+    let sqlite_tmp = tempfile::tempdir().unwrap();
+    let sqlite_target = DbTarget::SqlitePath(sqlite_tmp.path().join("upgrade.db"));
+    let db_sq = Database::connect_raw(&sqlite_target, 1).await.unwrap();
+    db_sq.run_migrations_up_to(12).await.unwrap();
+    assert_eq!(db_sq.schema_version().await.unwrap(), 12);
+    db_sq.run_migrations().await.unwrap();
+    assert_eq!(db_sq.schema_version().await.unwrap(), 13);
 
     let h = PgHarness::new(&url).await;
 

@@ -13,6 +13,8 @@ pub mod sync;
 pub mod tasks;
 pub mod watchers;
 
+use std::sync::atomic::Ordering;
+
 use axum::extract::{FromRequestParts, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -24,6 +26,7 @@ use serde_json::{json, Value};
 use crate::actors::{
     authenticate_bearer_token, parse_profile_headers, parse_sandboxed_header, CallerContext,
 };
+use crate::db::Dialect;
 use crate::error::{BoardError, BoardResult};
 use crate::permissions::NarrowingPolicy;
 use crate::AppState;
@@ -54,20 +57,37 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let dialect = state.db.dialect().as_str();
+    let dialect_enum = state.db.dialect();
+    let dialect = dialect_enum.as_str();
+    let listener_ok = state.pg_listener_healthy.load(Ordering::Relaxed);
     match state.db.ping().await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "dialect": dialect })),
-        ),
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "ok": false,
-                "dialect": dialect,
-                "error": err.message
-            })),
-        ),
+        Ok(()) => {
+            let body = match dialect_enum {
+                Dialect::Sqlite => json!({ "ok": true, "dialect": dialect }),
+                Dialect::Postgres => json!({
+                    "ok": true,
+                    "dialect": dialect,
+                    "listener_ok": listener_ok
+                }),
+            };
+            (StatusCode::OK, Json(body))
+        }
+        Err(err) => {
+            let body = match dialect_enum {
+                Dialect::Sqlite => json!({
+                    "ok": false,
+                    "dialect": dialect,
+                    "error": err.message
+                }),
+                Dialect::Postgres => json!({
+                    "ok": false,
+                    "dialect": dialect,
+                    "listener_ok": listener_ok,
+                    "error": err.message
+                }),
+            };
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+        }
     }
 }
 
@@ -105,7 +125,7 @@ impl FromRequestParts<AppState> for CallerContext {
             })?;
 
         let principal = authenticate_bearer_token(&state.db, raw_token).await?;
-        state.rate_limiter.check(&principal.principal_id())?;
+        state.rate_limiter.check(&principal.principal_id()).await?;
 
         let profile = parse_profile_headers(
             header_str(parts, "x-board-profile")?,

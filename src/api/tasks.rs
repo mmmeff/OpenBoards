@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -88,8 +90,11 @@ async fn create_task(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::create_task(&state.db, &resolved.id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     let status = if res.replayed {
         StatusCode::OK
@@ -112,8 +117,11 @@ async fn create_many_tasks(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::create_many_tasks(&state.db, &resolved.id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     let status = if res.replayed {
         StatusCode::OK
@@ -231,16 +239,17 @@ async fn claim_ready(
             break;
         }
 
-        // Wake up at either the overall wait deadline OR the earliest active lease expiry
+        // Wake up at earliest of: overall wait deadline, earliest active lease expiry, or 5s safety tick
+        let safety_wake = (now_instant + Duration::from_secs(5)).min(deadline);
         let wake_at = match next_expiry {
             Some(exp_utc) => {
                 let remaining = (exp_utc - Utc::now())
                     .to_std()
-                    .unwrap_or(std::time::Duration::from_millis(5));
-                let exp_instant = now_instant + remaining + std::time::Duration::from_millis(10);
-                exp_instant.min(deadline)
+                    .unwrap_or(Duration::from_millis(5));
+                let exp_instant = now_instant + remaining + Duration::from_millis(10);
+                exp_instant.min(safety_wake)
             }
-            None => deadline,
+            None => safety_wake,
         };
 
         tokio::select! {
@@ -249,6 +258,7 @@ async fn claim_ready(
                     break;
                 }
             }
+            _ = state.tasks_notify.notified() => {}
             _ = tokio::time::sleep_until(wake_at) => {}
         }
 
@@ -308,8 +318,11 @@ async fn release_task(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::release_task(&state.db, &resolved.id, &id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task })))
 }
@@ -323,8 +336,11 @@ async fn complete_task(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::complete_task(&state.db, &resolved.id, &id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.readied.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task, "readied": res.readied })))
 }
@@ -367,8 +383,11 @@ async fn unblock_task(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::unblock_task(&state.db, &resolved.id, &id, &caller).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task })))
 }
@@ -381,8 +400,11 @@ async fn reopen_task(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::reopen_task(&state.db, &resolved.id, &id, &caller).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task })))
 }
@@ -411,8 +433,11 @@ async fn assign_task(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::assign_task(&state.db, &resolved.id, &id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task })))
 }
@@ -426,8 +451,11 @@ async fn update_needs(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = tasks::update_task_needs(&state.db, &resolved.id, &id, &caller, input).await?;
-    for seq in res.event_seqs {
-        state.events.notify(&resolved.id, seq);
+    for seq in &res.event_seqs {
+        state.events.notify(&resolved.id, *seq);
+    }
+    if !res.event_seqs.is_empty() {
+        state.tasks_notify.notify_waiters();
     }
     Ok(Json(json!({ "task": res.task })))
 }

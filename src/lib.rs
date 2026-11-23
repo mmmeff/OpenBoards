@@ -28,12 +28,14 @@ pub mod tasks;
 pub mod validate;
 pub mod watchers;
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
+use crate::attachments::BlobStore;
 use crate::config::ServerConfig;
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult};
@@ -44,18 +46,23 @@ use crate::ratelimit::RateLimiter;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    pub blobs: BlobStore,
     pub config: Arc<ServerConfig>,
     pub events: EventHub,
     pub rate_limiter: RateLimiter,
+    pub tasks_notify: Arc<Notify>,
     pub watcher_wake: Arc<Notify>,
     pub sync_wake: Arc<Notify>,
+    pub pg_listener_healthy: Arc<AtomicBool>,
     pub http: reqwest::Client,
     pub replica_id: String,
 }
 
 impl AppState {
     pub fn new(db: Database, config: ServerConfig) -> Self {
-        let rate_limiter = RateLimiter::new(config.rate_limit_rps, config.rate_limit_burst);
+        let blobs = BlobStore::for_database(&db, config.data_dir.clone());
+        let rate_limiter =
+            RateLimiter::for_database(&db, config.rate_limit_rps, config.rate_limit_burst);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -64,14 +71,82 @@ impl AppState {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             db,
+            blobs,
             config: Arc::new(config),
             events: EventHub::new(),
             rate_limiter,
+            tasks_notify: Arc::new(Notify::new()),
             watcher_wake: Arc::new(Notify::new()),
             sync_wake: Arc::new(Notify::new()),
+            pg_listener_healthy: Arc::new(AtomicBool::new(true)),
             http,
             replica_id: prefixed_id("rep"),
         }
+    }
+}
+
+pub(crate) fn never_shutdown_rx() -> watch::Receiver<bool> {
+    static NEVER_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    NEVER_TX.get_or_init(|| watch::channel(false).0).subscribe()
+}
+
+/// Manages all background worker tasks (and the PostgreSQL `PgListener` bridge when on Postgres)
+/// with coordinated graceful shutdown via a `tokio::sync::watch` channel.
+pub struct BackgroundWorkers {
+    shutdown_tx: watch::Sender<bool>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl BackgroundWorkers {
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        let handles = std::mem::take(&mut self.handles);
+        for handle in handles {
+            let abort_handle = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(3), handle)
+                .await
+                .is_err()
+            {
+                abort_handle.abort();
+            }
+        }
+    }
+}
+
+impl Drop for BackgroundWorkers {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawns all background loops (`PgListener` bridge on Postgres, scheduler, lease reaper,
+/// watcher dispatcher, sync outbox worker) wired to one coordinated shutdown channel.
+pub fn spawn_background_workers(state: AppState) -> BackgroundWorkers {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(5);
+    if let Some(pg_bridge) = events::spawn_pg_notify_bridge(state.clone(), shutdown_rx.clone()) {
+        handles.push(pg_bridge);
+    }
+    handles.push(schedules::spawn_scheduler_loop_with_shutdown(
+        state.clone(),
+        shutdown_rx.clone(),
+    ));
+    handles.push(tasks::spawn_lease_reaper_loop_with_shutdown(
+        state.clone(),
+        shutdown_rx.clone(),
+    ));
+    handles.push(watchers::spawn_watcher_dispatcher_with_policy_and_shutdown(
+        state.clone(),
+        watchers::DeliveryPolicy::default(),
+        shutdown_rx.clone(),
+    ));
+    handles.push(sync::spawn_sync_worker_with_shutdown(state, shutdown_rx));
+    BackgroundWorkers {
+        shutdown_tx,
+        handles,
     }
 }
 
@@ -167,10 +242,7 @@ async fn serve_inner(config: ServerConfig, print_local_exports: bool) -> BoardRe
     let team = config.team.clone();
     let data_dir = config.data_dir.clone();
     let state = AppState::new(db, config);
-    let scheduler_handle = schedules::spawn_scheduler_loop(state.clone());
-    let lease_reaper_handle = tasks::spawn_lease_reaper_loop(state.clone());
-    let watcher_dispatcher = watchers::spawn_watcher_dispatcher(state.clone());
-    let sync_worker = sync::spawn_sync_worker(state.clone());
+    let workers = spawn_background_workers(state.clone());
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(listen)
@@ -193,10 +265,7 @@ async fn serve_inner(config: ServerConfig, print_local_exports: bool) -> BoardRe
         .await
         .map_err(|e| BoardError::internal(format!("server error: {e}")));
 
-    scheduler_handle.abort();
-    lease_reaper_handle.abort();
-    watcher_dispatcher.abort();
-    sync_worker.abort();
+    workers.shutdown().await;
 
     serve_res
 }
