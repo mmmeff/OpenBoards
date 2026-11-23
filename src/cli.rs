@@ -937,7 +937,13 @@ pub async fn run_cli(cli: Cli) -> i32 {
     match cli.command {
         Command::Serve(args) => {
             let local = args.local;
-            let cfg = ServerConfig::from(args);
+            let cfg = match ServerConfig::from_serve_args(args) {
+                Ok(cfg) => cfg,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    return 2;
+                }
+            };
             let res = if local {
                 crate::serve_local(cfg).await
             } else {

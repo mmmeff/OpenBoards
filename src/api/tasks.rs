@@ -86,8 +86,8 @@ async fn create_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateTaskInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::create_task(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::create_task(&state.db, &resolved.id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -110,8 +110,8 @@ async fn create_many_tasks(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateManyTasksInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::create_many_tasks(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::create_many_tasks(&state.db, &resolved.id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -151,8 +151,8 @@ async fn list_tasks(
             _ => {}
         }
     }
-    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
-    let page = tasks::list_tasks(&state.db, &state.events, &resolved.id, &caller, query)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller).await?;
+    let page = tasks::list_tasks(&state.db, &state.events, &resolved.id, &caller, query).await?;
     Ok(Json(json!(page)))
 }
 
@@ -162,8 +162,8 @@ async fn get_task(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let task = tasks::get_task(&state.db, &state.events, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let task = tasks::get_task(&state.db, &state.events, &resolved.id, &id, &caller).await?;
     Ok(Json(json!({ "task": task })))
 }
 
@@ -174,9 +174,9 @@ async fn claim_task(
     Query(query): Query<EnsureQuery>,
     body: Option<Json<ClaimInput>>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let input = body.map(|Json(b)| b).unwrap_or_default();
-    let res = tasks::claim_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let res = tasks::claim_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -190,7 +190,7 @@ async fn claim_ready(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<ClaimReadyInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let (preds, lease_ms, wait_dur) = tasks::parse_claim_ready_params(&input)?;
 
     // Subscribe BEFORE querying SQLite so concurrent task.ready events cannot be missed.
@@ -204,7 +204,8 @@ async fn claim_ready(
         &preds,
         &input.from,
         lease_ms,
-    )?;
+    )
+    .await?;
     for seq in attempt.expired_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -259,7 +260,8 @@ async fn claim_ready(
             &preds,
             &input.from,
             lease_ms,
-        )?;
+        )
+        .await?;
         for seq in attempt.expired_seqs {
             state.events.notify(&resolved.id, seq);
         }
@@ -289,8 +291,8 @@ async fn renew_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<RenewInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::renew_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::renew_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -304,8 +306,8 @@ async fn release_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<ReleaseInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::release_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::release_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -319,8 +321,8 @@ async fn complete_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CompleteInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::complete_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::complete_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -334,8 +336,8 @@ async fn fail_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<FailInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::fail_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::fail_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -349,8 +351,8 @@ async fn block_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<BlockInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::block_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::block_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -363,8 +365,8 @@ async fn unblock_task(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::unblock_task(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::unblock_task(&state.db, &resolved.id, &id, &caller).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -377,8 +379,8 @@ async fn reopen_task(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::reopen_task(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::reopen_task(&state.db, &resolved.id, &id, &caller).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -392,8 +394,8 @@ async fn cancel_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CancelInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::cancel_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::cancel_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -407,8 +409,8 @@ async fn assign_task(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<AssignInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::assign_task(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::assign_task(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -422,8 +424,8 @@ async fn update_needs(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<UpdateNeedsInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = tasks::update_task_needs(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = tasks::update_task_needs(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in res.event_seqs {
         state.events.notify(&resolved.id, seq);
     }

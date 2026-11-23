@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig, DEFAULT_DB_MAX_CONNECTIONS};
 use openboards::db::Database;
 use openboards::proxy::{build_proxy_router, ProxyConfig};
 use openboards::{build_router, schedules, schemas, tasks, watchers, AppState};
@@ -36,18 +36,22 @@ impl Drop for LiveServer {
 async fn start_live_server() -> LiveServer {
     let tmp = tempfile::tempdir().unwrap();
     let owner_token = "ob_cli_test_owner_token_123456".to_string();
+    let data_dir = tmp.path().to_path_buf();
+    let db_path = data_dir.join("openboards.db");
     let cfg = ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        data_dir: tmp.path().to_path_buf(),
+        data_dir,
         team: "acme".to_string(),
         admin_token: Some(owner_token.clone()),
         rate_limit_rps: 0,
         rate_limit_burst: 500,
+        db_target: DbTarget::SqlitePath(db_path.clone()),
+        db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
     };
-    let db = Database::open(&cfg.db_path()).unwrap();
-    actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-    boards::ensure_default_board(&db).unwrap();
-    schemas::seed_builtin_schemas(&db).unwrap();
+    let db = Database::open(&db_path).await.unwrap();
+    actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+    boards::ensure_default_board(&db).await.unwrap();
+    schemas::seed_builtin_schemas(&db).await.unwrap();
 
     let state = AppState::new(db, cfg);
     let scheduler_handle = schedules::spawn_scheduler_loop(state.clone());

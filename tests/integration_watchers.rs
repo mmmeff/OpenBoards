@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::watchers::{
     self, DeliveryPolicy, HEADER_ATTEMPT, HEADER_DELIVERY_ID, HEADER_EVENT_CURSOR,
@@ -30,12 +30,12 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -45,6 +45,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: 0,
                 rate_limit_burst: 100,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -273,7 +275,7 @@ fn fast_policy(max_attempts: u32) -> DeliveryPolicy {
 
 #[tokio::test]
 async fn real_http_webhook_delivery_hmac_signature_and_cursor_persistence() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
@@ -415,7 +417,7 @@ async fn real_http_webhook_delivery_hmac_signature_and_cursor_persistence() {
 
 #[tokio::test]
 async fn before_and_after_label_triggers_and_channel_visibility() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
@@ -547,7 +549,7 @@ async fn before_and_after_label_triggers_and_channel_visibility() {
 
 #[tokio::test]
 async fn self_write_loop_suppression_blocks_own_actor_but_allows_other_watchers() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_pid, proj_tok) = h.create_project_with_token("swarm", "production").await;
 
@@ -629,7 +631,7 @@ async fn self_write_loop_suppression_blocks_own_actor_but_allows_other_watchers(
 
 #[tokio::test]
 async fn exponential_backoff_retries_preserve_delivery_id_and_record_dead_letter() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(2).await; // Fail first 2 calls on /flaky, succeed on 3rd
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
@@ -752,7 +754,7 @@ async fn exponential_backoff_retries_preserve_delivery_id_and_record_dead_letter
 
 #[tokio::test]
 async fn background_dispatcher_wakes_on_event_notify_and_delivers() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
@@ -808,7 +810,7 @@ async fn background_dispatcher_wakes_on_event_notify_and_delivers() {
 
 #[tokio::test]
 async fn atomic_deployment_sync_preserves_cursors_inserts_new_and_deletes_omitted() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
@@ -957,7 +959,7 @@ async fn atomic_deployment_sync_preserves_cursors_inserts_new_and_deletes_omitte
 
 #[tokio::test]
 async fn enforces_32_watcher_cap_validation_and_sandboxed_caller_denial() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
         .await;
@@ -1168,7 +1170,7 @@ async fn enforces_32_watcher_cap_validation_and_sandboxed_caller_denial() {
 
 #[tokio::test]
 async fn mentions_and_types_filters_with_dispatch_watcher_once() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let mock = MockWebhookServer::start(0).await;
     let (_alice_id, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")

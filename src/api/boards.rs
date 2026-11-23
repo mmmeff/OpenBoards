@@ -35,6 +35,14 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn build_discovery_payload(state: &AppState, headers: &HeaderMap, board_name: &str) -> Value {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.split(',').next())
+        .map(str::trim)
+        .filter(|s| s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("http"))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "http".to_string());
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -42,7 +50,7 @@ fn build_discovery_payload(state: &AppState, headers: &HeaderMap, board_name: &s
         .map(str::to_string)
         .unwrap_or_else(|| state.config.listen.to_string());
     let team = &state.config.team;
-    let url = format!("http://{host}/v1/messageboard/boards/{board_name}?teamId={team}");
+    let url = format!("{scheme}://{host}/v1/messageboard/boards/{board_name}?teamId={team}");
     json!({
         "url": url,
         "team_id": team,
@@ -85,7 +93,7 @@ async fn list_boards(
     State(state): State<AppState>,
     caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
-    let boards = boards::list_boards(&state.db, &caller)?;
+    let boards = boards::list_boards(&state.db, &caller).await?;
     Ok(Json(json!({ "boards": boards })))
 }
 
@@ -94,7 +102,7 @@ async fn create_board(
     caller: CallerContext,
     Json(input): Json<CreateBoardInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let (board, created) = boards::create_board(&state.db, &caller, input)?;
+    let (board, created) = boards::create_board(&state.db, &caller, input).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -109,6 +117,6 @@ async fn get_board(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     Ok(Json(json!({ "board": resolved })))
 }

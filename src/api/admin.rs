@@ -41,7 +41,7 @@ async fn create_user(
     Json(input): Json<CreateUserInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     require_admin(&caller)?;
-    let user = actors::create_user(&state.db, input)?;
+    let user = actors::create_user(&state.db, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "user": user }))))
 }
 
@@ -50,7 +50,7 @@ async fn list_users(
     caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let users = actors::list_users(&state.db)?;
+    let users = actors::list_users(&state.db).await?;
     Ok(Json(json!({ "users": users })))
 }
 
@@ -61,7 +61,7 @@ async fn update_user(
     Json(input): Json<UpdateUserInput>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let user = actors::update_user(&state.db, &id, input)?;
+    let user = actors::update_user(&state.db, &id, input).await?;
     Ok(Json(json!({ "user": user })))
 }
 
@@ -71,7 +71,7 @@ async fn revoke_user(
     Path(id): Path<String>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let user = actors::revoke_user(&state.db, &id)?;
+    let user = actors::revoke_user(&state.db, &id).await?;
     Ok(Json(json!({ "user": user })))
 }
 
@@ -81,7 +81,7 @@ async fn create_project(
     Json(input): Json<CreateProjectInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     require_admin(&caller)?;
-    let project = actors::create_project(&state.db, input)?;
+    let project = actors::create_project(&state.db, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "project": project }))))
 }
 
@@ -90,7 +90,7 @@ async fn list_projects(
     caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let projects = actors::list_projects(&state.db)?;
+    let projects = actors::list_projects(&state.db).await?;
     Ok(Json(json!({ "projects": projects })))
 }
 
@@ -100,7 +100,7 @@ async fn revoke_project(
     Path(id): Path<String>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let project = actors::revoke_project(&state.db, &id)?;
+    let project = actors::revoke_project(&state.db, &id).await?;
     Ok(Json(json!({ "project": project })))
 }
 
@@ -110,7 +110,7 @@ async fn create_app(
     Json(input): Json<CreateAppInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     require_admin(&caller)?;
-    let app = actors::create_app(&state.db, input)?;
+    let app = actors::create_app(&state.db, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "app": app }))))
 }
 
@@ -119,7 +119,7 @@ async fn list_apps(
     caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let apps = actors::list_apps(&state.db)?;
+    let apps = actors::list_apps(&state.db).await?;
     Ok(Json(json!({ "apps": apps })))
 }
 
@@ -130,7 +130,7 @@ async fn update_app(
     Json(input): Json<UpdateAppInput>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let app = actors::update_app(&state.db, &id, input)?;
+    let app = actors::update_app(&state.db, &id, input).await?;
     Ok(Json(json!({ "app": app })))
 }
 
@@ -140,7 +140,7 @@ async fn revoke_app(
     Path(id): Path<String>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let app = actors::revoke_app(&state.db, &id)?;
+    let app = actors::revoke_app(&state.db, &id).await?;
     Ok(Json(json!({ "app": app })))
 }
 
@@ -150,7 +150,7 @@ async fn create_token(
     Json(input): Json<CreateTokenInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     require_admin(&caller)?;
-    let created = actors::create_token(&state.db, input)?;
+    let created = actors::create_token(&state.db, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "token": created }))))
 }
 
@@ -159,7 +159,7 @@ async fn list_tokens(
     caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let tokens = actors::list_tokens(&state.db)?;
+    let tokens = actors::list_tokens(&state.db).await?;
     Ok(Json(json!({ "tokens": tokens })))
 }
 
@@ -169,6 +169,6 @@ async fn revoke_token(
     Path(id): Path<String>,
 ) -> BoardResult<Json<Value>> {
     require_admin(&caller)?;
-    let token = actors::revoke_token(&state.db, &id)?;
+    let token = actors::revoke_token(&state.db, &id).await?;
     Ok(Json(json!({ "token": token })))
 }

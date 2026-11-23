@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::sync;
 use openboards::watchers::hmac_sha256_hex;
@@ -27,12 +27,12 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-sync-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -42,6 +42,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: 0,
                 rate_limit_burst: 500,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -208,7 +210,7 @@ async fn start_mock_platform_server(
 
 #[tokio::test]
 async fn slack_bidirectional_signatures_mrkdwn_files_synced_and_echo_suppression() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (pid, prod_tok) = h.create_project_token("support", "production").await;
     let preview_tok = h.mint_project_token(&pid, "preview").await;
     let (_alice_id, alice_tok) = h.create_user("alice", "member").await;
@@ -438,7 +440,7 @@ async fn slack_bidirectional_signatures_mrkdwn_files_synced_and_echo_suppression
 
 #[tokio::test]
 async fn github_linear_custom_sync_nosync_root_retries_permissions_and_typing() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_pid, proj_tok) = h.create_project_token("ops", "production").await;
     let (_alice_id, alice_tok) = h.create_user("alice", "member").await;
     let (_eve_id, eve_tok) = h.create_user("eve", "viewer").await;
@@ -790,7 +792,7 @@ async fn github_linear_custom_sync_nosync_root_retries_permissions_and_typing() 
 
 #[tokio::test]
 async fn spec_audit_github_label_change_events_and_webhook_dedup() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_pid, proj_tok) = h.create_project_token("ops", "production").await;
     let (_alice_id, alice_tok) = h.create_user("alice", "member").await;
 

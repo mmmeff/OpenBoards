@@ -31,8 +31,8 @@ async fn create_schedule(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateScheduleInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let sched = schedules::create_schedule(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let sched = schedules::create_schedule(&state.db, &resolved.id, &caller, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "schedule": sched }))))
 }
 
@@ -54,8 +54,8 @@ async fn list_schedules(
             _ => {}
         }
     }
-    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
-    let list = schedules::list_schedules(&state.db, &resolved.id, &caller, query)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller).await?;
+    let list = schedules::list_schedules(&state.db, &resolved.id, &caller, query).await?;
     Ok(Json(json!({ "schedules": list })))
 }
 
@@ -65,8 +65,8 @@ async fn get_schedule(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let sched = schedules::get_schedule(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let sched = schedules::get_schedule(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!({ "schedule": sched })))
 }
 
@@ -76,7 +76,8 @@ async fn cancel_schedule(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (sched, canceled) = schedules::cancel_schedule(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (sched, canceled) =
+        schedules::cancel_schedule(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!({ "schedule": sched, "canceled": canceled })))
 }

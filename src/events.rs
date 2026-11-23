@@ -3,17 +3,17 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::actors::{self, ActorView, CallerContext};
-use crate::db::Database;
+use crate::db::{Database, DbTx, Queryable};
 use crate::error::{BoardError, BoardResult};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
 use crate::grants;
 use crate::messages::{MessageView, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
+use crate::sql_args;
 
 pub const MAX_POLL_WAIT_SECS: f64 = 300.0;
 pub const DEFAULT_WAIT_TIMEOUT_SECS: f64 = 1800.0;
@@ -168,22 +168,25 @@ pub fn parse_event_cursor_seq(cursor: &str) -> Option<i64> {
 }
 
 /// Resolves an `after` cursor (either `"0"`, `"ev_<seq>"`, or a `"msg_..."` ID) to its board event `seq`.
-pub fn resolve_event_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) -> BoardResult<i64> {
+pub async fn resolve_event_cursor_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+    cursor: &str,
+) -> BoardResult<i64> {
     if let Some(seq) = parse_event_cursor_seq(cursor) {
         return Ok(seq);
     }
     if cursor.starts_with("msg_") {
-        let seq: Option<i64> = conn
-            .query_row(
+        let row = conn
+            .fetch_optional(
                 "SELECT seq FROM events
                  WHERE board_id = ?1 AND message_id = ?2 AND event_type = 'message.posted'
                  ORDER BY seq ASC LIMIT 1",
-                params![board_id, cursor],
-                |r| r.get(0),
+                sql_args![board_id, cursor],
             )
-            .optional()?;
-        if let Some(s) = seq {
-            return Ok(s);
+            .await?;
+        if let Some(r) = row {
+            return r.get_i64(0);
         }
         return Err(BoardError::bad_request(format!(
             "message cursor '{cursor}' not found on this board"
@@ -194,15 +197,26 @@ pub fn resolve_event_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) 
     )))
 }
 
-pub fn current_event_seq_tx(conn: &Connection, board_id: &str) -> BoardResult<i64> {
-    let mut stmt =
-        conn.prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE board_id = ?1")?;
-    let seq: i64 = stmt.query_row(params![board_id], |r| r.get(0))?;
-    Ok(seq)
+pub async fn current_event_seq_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+) -> BoardResult<i64> {
+    let row = conn
+        .fetch_one(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE board_id = ?1",
+            sql_args![board_id],
+        )
+        .await?;
+    row.get_i64(0)
 }
 
-pub fn current_event_cursor_tx(conn: &Connection, board_id: &str) -> BoardResult<String> {
-    Ok(format_event_cursor(current_event_seq_tx(conn, board_id)?))
+pub async fn current_event_cursor_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+) -> BoardResult<String> {
+    Ok(format_event_cursor(
+        current_event_seq_tx(conn, board_id).await?,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -225,16 +239,17 @@ pub struct AppendedEvent {
 }
 
 /// Atomically appends an event to the board's single total-order event log inside an active tx.
-pub fn append_event_tx(conn: &Connection, input: EventAppend<'_>) -> BoardResult<AppendedEvent> {
-    let seq: i64 = conn.query_row(
-        "SELECT next_event_seq FROM boards WHERE id = ?1",
-        params![input.board_id],
-        |r| r.get(0),
-    )?;
-    conn.execute(
-        "UPDATE boards SET next_event_seq = ?1 WHERE id = ?2",
-        params![seq + 1, input.board_id],
-    )?;
+pub async fn append_event_tx(tx: &mut DbTx, input: EventAppend<'_>) -> BoardResult<AppendedEvent> {
+    let seq = tx
+        .fetch_one(
+            "UPDATE boards
+             SET next_event_seq = next_event_seq + 1
+             WHERE id = ?1
+             RETURNING next_event_seq - 1",
+            sql_args![input.board_id],
+        )
+        .await?
+        .get_i64(0)?;
 
     let cursor = format_event_cursor(seq);
     let now = Utc::now().to_rfc3339();
@@ -256,28 +271,29 @@ pub fn append_event_tx(conn: &Connection, input: EventAppend<'_>) -> BoardResult
         .transpose()
         .map_err(|e| BoardError::internal(format!("failed to serialize after message: {e}")))?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO events (
             board_id, seq, cursor, event_type, channel, message_id, actor_id,
             bookkeeping, payload_json, before_snapshot_json, after_snapshot_json,
             after_message_json, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
+        sql_args![
             input.board_id,
             seq,
-            cursor,
+            &cursor,
             input.event_type.as_str(),
             input.channel,
             input.message_id,
             input.actor_id,
             i64::from(input.event_type.is_bookkeeping()),
-            payload_json,
-            before_json,
-            after_snap_json,
-            after_msg_json,
-            now
+            &payload_json,
+            &before_json,
+            &after_snap_json,
+            &after_msg_json,
+            &now
         ],
-    )?;
+    )
+    .await?;
 
     Ok(AppendedEvent { seq, cursor })
 }
@@ -342,10 +358,17 @@ impl EventHub {
             let _ = tx.send(seq);
         }
     }
+
+    pub fn notify_all(&self, seq: i64) {
+        let guard = self.channels.read().expect("EventHub lock poisoned");
+        for tx in guard.values() {
+            let _ = tx.send(seq);
+        }
+    }
 }
 
 /// Fetches matching events strictly after `after_seq` (with visibility & before-or-after filtering).
-pub fn query_events_after(
+pub async fn query_events_after(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -360,150 +383,134 @@ pub fn query_events_after(
         )));
     }
 
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let can_read_all = grants::caller_can_read_all_channels(&board_grants, caller);
-        let has_wildcard_read =
-            grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_read();
-        let visible_actors = actors::list_board_actors(conn, board_id, has_wildcard_read, |ch| {
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let can_read_all = grants::caller_can_read_all_channels(&board_grants, caller);
+    let has_wildcard_read =
+        grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_read();
+    let visible_actors =
+        actors::list_board_actors(&mut conn, board_id, has_wildcard_read, |ch| {
             grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read()
-        })?;
-        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
+        })
+        .await?;
+    let filter_ctx =
+        FilterContext::build(&mut conn, caller, &visible_actors, &query.filter).await?;
 
-        let mut stmt = conn.prepare(
+    let rows = conn
+        .fetch_all(
             "SELECT seq, cursor, event_type, channel, message_id, actor_id, bookkeeping,
                     payload_json, before_snapshot_json, after_snapshot_json, after_message_json,
                     created_at
              FROM events
              WHERE board_id = ?1 AND seq > ?2
              ORDER BY seq ASC",
-        )?;
+            sql_args![board_id, after_seq],
+        )
+        .await?;
 
-        #[allow(clippy::type_complexity)]
-        let rows = stmt.query_map(params![board_id, after_seq], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)? != 0,
-                r.get::<_, String>(7)?,
-                r.get::<_, Option<String>>(8)?,
-                r.get::<_, Option<String>>(9)?,
-                r.get::<_, Option<String>>(10)?,
-                r.get::<_, String>(11)?,
-            ))
-        })?;
+    let mut matched: Vec<EventView> = Vec::new();
+    let mut last_scanned_seq = after_seq;
 
-        let mut matched: Vec<EventView> = Vec::new();
-        let mut last_scanned_seq = after_seq;
+    for row in rows {
+        let seq = row.get_i64(0)?;
+        let cursor = row.get_str(1)?;
+        let ev_type_str = row.get_str(2)?;
+        let channel = row.get_opt_str(3)?;
+        let message_id = row.get_opt_str(4)?;
+        let actor_id = row.get_opt_str(5)?;
+        let bookkeeping = row.get_i64(6)? != 0;
+        let payload_json = row.get_str(7)?;
+        let before_json = row.get_opt_str(8)?;
+        let after_snap_json = row.get_opt_str(9)?;
+        let after_msg_json = row.get_opt_str(10)?;
+        let created_at = row.get_str(11)?;
 
-        for row in rows {
-            let (
-                seq,
-                cursor,
-                ev_type_str,
-                channel,
-                message_id,
-                actor_id,
-                bookkeeping,
-                payload_json,
-                before_json,
-                after_snap_json,
-                after_msg_json,
-                created_at,
-            ) = row?;
+        last_scanned_seq = seq;
 
-            last_scanned_seq = seq;
+        if bookkeeping && !query.all {
+            continue;
+        }
+        let event_type = EventType::parse(&ev_type_str)?;
+        if !query.types.is_empty() && !query.types.contains(&event_type) {
+            continue;
+        }
 
-            if bookkeeping && !query.all {
+        if message_id.is_none() {
+            if !can_read_all {
                 continue;
             }
-            let event_type = EventType::parse(&ev_type_str)?;
-            if !query.types.is_empty() && !query.types.contains(&event_type) {
+            if query.filter.has_message_specific_filters() {
                 continue;
             }
-
-            if message_id.is_none() {
-                // Message-less events (e.g. channel.created) require `*` read across every channel.
-                if !can_read_all {
-                    continue;
-                }
-                if query.filter.has_message_specific_filters() {
-                    continue;
-                }
-                if let Some(ch) = &channel {
-                    if !query.filter.matches_channel(ch) {
-                        continue;
-                    }
-                }
-            } else {
-                let ch = channel.as_deref().unwrap_or("");
-                if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
-                    continue;
-                }
-                let before_snap: Option<MessageSnapshot> = before_json
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|e| BoardError::internal(format!("corrupted before snapshot: {e}")))?;
-                let after_snap: Option<MessageSnapshot> = after_snap_json
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|e| BoardError::internal(format!("corrupted after snapshot: {e}")))?;
-
-                let matches_before = before_snap
-                    .as_ref()
-                    .is_some_and(|b| query.filter.matches_snapshot(b, &filter_ctx));
-                let matches_after = after_snap
-                    .as_ref()
-                    .is_some_and(|a| query.filter.matches_snapshot(a, &filter_ctx));
-
-                if !matches_before && !matches_after {
+            if let Some(ch) = &channel {
+                if !query.filter.matches_channel(ch) {
                     continue;
                 }
             }
-
-            let payload: Value = serde_json::from_str(&payload_json)
-                .map_err(|e| BoardError::internal(format!("corrupted event payload: {e}")))?;
-            let message: Option<MessageView> = after_msg_json
+        } else {
+            let ch = channel.as_deref().unwrap_or("");
+            if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
+                continue;
+            }
+            let before_snap: Option<MessageSnapshot> = before_json
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()
-                .map_err(|e| BoardError::internal(format!("corrupted event message: {e}")))?;
-            let actor = match &actor_id {
-                Some(aid) => actors::resolve_actor_view(conn, aid)?,
-                None => None,
-            };
+                .map_err(|e| BoardError::internal(format!("corrupted before snapshot: {e}")))?;
+            let after_snap: Option<MessageSnapshot> = after_snap_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| BoardError::internal(format!("corrupted after snapshot: {e}")))?;
 
-            matched.push(EventView {
-                cursor,
-                event_type,
-                created_at,
-                payload,
-                message,
-                actor,
-            });
+            let matches_before = before_snap
+                .as_ref()
+                .is_some_and(|b| query.filter.matches_snapshot(b, &filter_ctx));
+            let matches_after = after_snap
+                .as_ref()
+                .is_some_and(|a| query.filter.matches_snapshot(a, &filter_ctx));
 
-            if matched.len() >= limit {
-                break;
+            if !matches_before && !matches_after {
+                continue;
             }
         }
 
-        let cursor = if let Some(last) = matched.last() {
-            last.cursor.clone()
-        } else {
-            let latest = current_event_seq_tx(conn, board_id)?;
-            format_event_cursor(latest.max(last_scanned_seq))
+        let payload: Value = serde_json::from_str(&payload_json)
+            .map_err(|e| BoardError::internal(format!("corrupted event payload: {e}")))?;
+        let message: Option<MessageView> = after_msg_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| BoardError::internal(format!("corrupted event message: {e}")))?;
+        let actor = match &actor_id {
+            Some(aid) => actors::resolve_actor_view(&mut conn, aid).await?,
+            None => None,
         };
 
-        Ok(EventsPage {
-            events: matched,
+        matched.push(EventView {
             cursor,
-        })
+            event_type,
+            created_at,
+            payload,
+            message,
+            actor,
+        });
+
+        if matched.len() >= limit {
+            break;
+        }
+    }
+
+    let cursor = if let Some(last) = matched.last() {
+        last.cursor.clone()
+    } else {
+        let latest = current_event_seq_tx(&mut conn, board_id).await?;
+        format_event_cursor(latest.max(last_scanned_seq))
+    };
+
+    Ok(EventsPage {
+        events: matched,
+        cursor,
     })
 }
 

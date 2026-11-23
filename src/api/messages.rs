@@ -117,8 +117,8 @@ async fn post_message(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<PostMessageInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = messages::post_message(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = messages::post_message(&state.db, &resolved.id, &caller, input).await?;
     if let Some(seq) = res.event_seq {
         state.events.notify(&resolved.id, seq);
         state.sync_wake.notify_one();
@@ -138,8 +138,8 @@ async fn reply_message(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<ReplyMessageInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = messages::reply_message(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = messages::reply_message(&state.db, &resolved.id, &id, &caller, input).await?;
     if let Some(seq) = res.event_seq {
         state.events.notify(&resolved.id, seq);
         state.sync_wake.notify_one();
@@ -158,8 +158,8 @@ async fn get_message(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let msg = messages::get_message(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let msg = messages::get_message(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!(msg)))
 }
 
@@ -170,8 +170,9 @@ async fn edit_message(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<EditMessageInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (msg, mentions, seqs) = messages::edit_message(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (msg, mentions, seqs) =
+        messages::edit_message(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -190,7 +191,7 @@ async fn delete_message(
     Query(query): Query<DeleteQueryParams>,
     body: Option<Json<DeleteMessageInput>>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let revision = body.and_then(|Json(b)| b.revision).or(query.revision);
     for seq in messages::delete_message(
         &state.db,
@@ -198,7 +199,9 @@ async fn delete_message(
         &id,
         &caller,
         DeleteMessageInput { revision },
-    )? {
+    )
+    .await?
+    {
         state.events.notify(&resolved.id, seq);
     }
     state.sync_wake.notify_one();
@@ -212,8 +215,9 @@ async fn react_message(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<ReactInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (emoji, event_seq) = messages::react_message(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (emoji, event_seq) =
+        messages::react_message(&state.db, &resolved.id, &id, &caller, input).await?;
     if let Some(seq) = event_seq {
         state.events.notify(&resolved.id, seq);
         state.sync_wake.notify_one();
@@ -227,7 +231,7 @@ async fn remove_reaction(
     Path((board, id, emoji)): Path<(String, String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let (emoji, event_seq) = messages::react_message(
         &state.db,
         &resolved.id,
@@ -237,7 +241,8 @@ async fn remove_reaction(
             emoji,
             remove: true,
         },
-    )?;
+    )
+    .await?;
     if let Some(seq) = event_seq {
         state.events.notify(&resolved.id, seq);
         state.sync_wake.notify_one();
@@ -252,8 +257,8 @@ async fn list_messages(
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> BoardResult<Json<Value>> {
     let (ensure, query) = parse_list_query_pairs(pairs)?;
-    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
-    let page = messages::list_messages(&state.db, &resolved.id, &caller, query)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller).await?;
+    let page = messages::list_messages(&state.db, &resolved.id, &caller, query).await?;
     Ok(Json(json!(page)))
 }
 
@@ -264,8 +269,8 @@ async fn list_threads(
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> BoardResult<Json<Value>> {
     let (ensure, query) = parse_list_query_pairs(pairs)?;
-    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller)?;
-    let page = messages::list_threads(&state.db, &resolved.id, &caller, query)?;
+    let resolved = boards::resolve_board(&state.db, &board, ensure, &caller).await?;
+    let page = messages::list_threads(&state.db, &resolved.id, &caller, query).await?;
     Ok(Json(json!(page)))
 }
 
@@ -275,8 +280,8 @@ async fn get_thread(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let thread = messages::get_thread(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let thread = messages::get_thread(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!(thread)))
 }
 
@@ -286,7 +291,8 @@ async fn get_posted(
     Path((board, key)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let msg = messages::get_posted_by_idempotency_key(&state.db, &resolved.id, &caller, &key)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let msg =
+        messages::get_posted_by_idempotency_key(&state.db, &resolved.id, &caller, &key).await?;
     Ok(Json(json!(msg)))
 }

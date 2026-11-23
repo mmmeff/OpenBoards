@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::actors::{
-    self, CallerContext, Principal,
-};
-use crate::db::Database;
+use crate::actors::{self, CallerContext, Principal};
+use crate::db::{Database, DbTx, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::id::format_grant_id;
 use crate::permissions::{NarrowingPolicy, Permissions};
+use crate::sql_args;
 use crate::validate::{
     match_channel_pattern, match_pattern_at_pattern, validate_channel_path,
     validate_channel_pattern, validate_slug, PatternSpecificity,
@@ -219,7 +217,6 @@ fn resolve_candidates(
     let mut granted = Permissions::NONE;
 
     if best_tier == PrincipalTier::Everyone && !has_non_everyone_access {
-        // `everyone` never lets anyone in by itself.
         granted = Permissions::NONE;
     } else {
         for w in &winners {
@@ -405,58 +402,54 @@ pub fn summarize_caller_can(
 }
 
 /// Seeds default grants `g1`, `g2`, `g3` for a newly created board inside a transaction.
-pub fn seed_default_grants_tx(conn: &Connection, board_id: &str) -> BoardResult<Vec<Grant>> {
+pub async fn seed_default_grants_tx(tx: &mut DbTx, board_id: &str) -> BoardResult<Vec<Grant>> {
     let mut seeded = Vec::with_capacity(3);
 
     let mut g1_can = BTreeMap::new();
     g1_can.insert("*".to_string(), Permissions::ALL);
-    seeded.push(insert_grant_tx(
-        conn,
-        board_id,
-        vec![GrantPrincipal::AllUsers],
-        g1_can,
-        None,
-    )?);
+    seeded.push(
+        insert_grant_tx(tx, board_id, vec![GrantPrincipal::AllUsers], g1_can, None).await?,
+    );
 
     let mut g2_can = BTreeMap::new();
     g2_can.insert("*".to_string(), Permissions::DEFAULT_PROJECTS);
-    seeded.push(insert_grant_tx(
-        conn,
-        board_id,
-        vec![GrantPrincipal::AllProjects { environments: None }],
-        g2_can,
-        None,
-    )?);
+    seeded.push(
+        insert_grant_tx(
+            tx,
+            board_id,
+            vec![GrantPrincipal::AllProjects { environments: None }],
+            g2_can,
+            None,
+        )
+        .await?,
+    );
 
     let mut g3_can = BTreeMap::new();
     g3_can.insert("*".to_string(), Permissions::DEFAULT_APPS);
-    seeded.push(insert_grant_tx(
-        conn,
-        board_id,
-        vec![GrantPrincipal::AllApps],
-        g3_can,
-        None,
-    )?);
+    seeded.push(
+        insert_grant_tx(tx, board_id, vec![GrantPrincipal::AllApps], g3_can, None).await?,
+    );
 
     Ok(seeded)
 }
 
-pub fn insert_grant_tx(
-    conn: &Connection,
+pub async fn insert_grant_tx(
+    tx: &mut DbTx,
     board_id: &str,
     principals: Vec<GrantPrincipal>,
     can: BTreeMap<String, Permissions>,
     created_by: Option<&str>,
 ) -> BoardResult<Grant> {
-    let seq: i64 = conn.query_row(
-        "SELECT next_grant_seq FROM boards WHERE id = ?1",
-        params![board_id],
-        |r| r.get(0),
-    )?;
-    conn.execute(
-        "UPDATE boards SET next_grant_seq = ?1 WHERE id = ?2",
-        params![seq + 1, board_id],
-    )?;
+    let seq = tx
+        .fetch_one(
+            "UPDATE boards
+             SET next_grant_seq = next_grant_seq + 1
+             WHERE id = ?1
+             RETURNING next_grant_seq - 1",
+            sql_args![board_id],
+        )
+        .await?
+        .get_i64(0)?;
 
     let id = format_grant_id(seq);
     let now = Utc::now().to_rfc3339();
@@ -465,11 +458,20 @@ pub fn insert_grant_tx(
     let can_json = serde_json::to_string(&can)
         .map_err(|e| BoardError::internal(format!("failed to serialize grant permissions: {e}")))?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO grants (board_id, seq, id, principals_json, can_json, created_by, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![board_id, seq, id, principals_json, can_json, created_by, now],
-    )?;
+        sql_args![
+            board_id,
+            seq,
+            &id,
+            &principals_json,
+            &can_json,
+            created_by,
+            &now
+        ],
+    )
+    .await?;
 
     Ok(Grant {
         id,
@@ -482,27 +484,28 @@ pub fn insert_grant_tx(
     })
 }
 
-pub fn load_grants_tx(conn: &Connection, board_id: &str) -> BoardResult<Vec<Grant>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, seq, principals_json, can_json, created_by, created_at, updated_at
-         FROM grants
-         WHERE board_id = ?1
-         ORDER BY seq ASC",
-    )?;
-    let rows = stmt.query_map(params![board_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, Option<String>>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, seq, p_json, c_json, created_by, created_at, updated_at) = row?;
+pub async fn load_grants_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+) -> BoardResult<Vec<Grant>> {
+    let rows = conn
+        .fetch_all(
+            "SELECT id, seq, principals_json, can_json, created_by, created_at, updated_at
+             FROM grants
+             WHERE board_id = ?1
+             ORDER BY seq ASC",
+            sql_args![board_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let id = r.get_str(0)?;
+        let seq = r.get_i64(1)?;
+        let p_json = r.get_str(2)?;
+        let c_json = r.get_str(3)?;
+        let created_by = r.get_opt_str(4)?;
+        let created_at = r.get_str(5)?;
+        let updated_at = r.get_str(6)?;
         let principals: Vec<GrantPrincipal> = serde_json::from_str(&p_json)
             .map_err(|e| BoardError::internal(format!("corrupted grant principals: {e}")))?;
         let can: BTreeMap<String, Permissions> = serde_json::from_str(&c_json)
@@ -520,12 +523,13 @@ pub fn load_grants_tx(conn: &Connection, board_id: &str) -> BoardResult<Vec<Gran
     Ok(out)
 }
 
-pub fn load_grants(db: &Database, board_id: &str) -> BoardResult<Vec<Grant>> {
-    db.with_conn(|conn| load_grants_tx(conn, board_id))
+pub async fn load_grants(db: &Database, board_id: &str) -> BoardResult<Vec<Grant>> {
+    let mut conn = db.read_conn();
+    load_grants_tx(&mut conn, board_id).await
 }
 
-pub fn resolve_principal_input(
-    conn: &Connection,
+pub async fn resolve_principal_input<C: Queryable + ?Sized>(
+    conn: &mut C,
     input: GrantPrincipalInput,
 ) -> BoardResult<GrantPrincipal> {
     match input {
@@ -539,10 +543,12 @@ pub fn resolve_principal_input(
                 .or(email)
                 .or(username)
                 .or(user)
-                .ok_or_else(|| BoardError::bad_request("user principal requires id, email, or username"))?;
-            let rec = actors::lookup_user_by_identifier(conn, &ident)?.ok_or_else(|| {
-                BoardError::bad_request(format!("user '{ident}' not found"))
-            })?;
+                .ok_or_else(|| {
+                    BoardError::bad_request("user principal requires id, email, or username")
+                })?;
+            let rec = actors::lookup_user_by_identifier(conn, &ident)
+                .await?
+                .ok_or_else(|| BoardError::bad_request(format!("user '{ident}' not found")))?;
             Ok(GrantPrincipal::User { id: rec.id })
         }
         GrantPrincipalInput::Project {
@@ -550,12 +556,12 @@ pub fn resolve_principal_input(
             project,
             environments,
         } => {
-            let ident = id
-                .or(project)
-                .ok_or_else(|| BoardError::bad_request("project principal requires project or id"))?;
-            let rec = actors::lookup_project_by_identifier(conn, &ident)?.ok_or_else(|| {
-                BoardError::bad_request(format!("project '{ident}' not found"))
+            let ident = id.or(project).ok_or_else(|| {
+                BoardError::bad_request("project principal requires project or id")
             })?;
+            let rec = actors::lookup_project_by_identifier(conn, &ident)
+                .await?
+                .ok_or_else(|| BoardError::bad_request(format!("project '{ident}' not found")))?;
             let envs = match environments {
                 Some(list) if !list.is_empty() => {
                     let mut normalized = Vec::with_capacity(list.len());
@@ -584,9 +590,9 @@ pub fn resolve_principal_input(
             let ident = id
                 .or(app)
                 .ok_or_else(|| BoardError::bad_request("app principal requires app or id"))?;
-            let rec = actors::lookup_app_by_identifier(conn, &ident)?.ok_or_else(|| {
-                BoardError::bad_request(format!("app '{ident}' not found"))
-            })?;
+            let rec = actors::lookup_app_by_identifier(conn, &ident)
+                .await?
+                .ok_or_else(|| BoardError::bad_request(format!("app '{ident}' not found")))?;
             Ok(GrantPrincipal::App { id: rec.id })
         }
         GrantPrincipalInput::AllUsers => Ok(GrantPrincipal::AllUsers),
@@ -657,7 +663,7 @@ pub struct CreateGrantInput {
     pub can: BTreeMap<String, Permissions>,
 }
 
-pub fn create_grant(
+pub async fn create_grant(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -675,37 +681,42 @@ pub fn create_grant(
     }
     validate_can_map(&input.can)?;
 
-    db.with_tx(|tx| {
-        let existing = load_grants_tx(tx, board_id)?;
-        let mut principals = Vec::with_capacity(input.principals.len());
-        for p in input.principals {
-            principals.push(resolve_principal_input(tx, p)?);
-        }
-        let principals = dedup_principals(principals);
+    let mut tx = db.begin_tx().await?;
+    let lock_sql = format!("SELECT id FROM boards WHERE id = ?1{}", tx.lock_row_suffix());
+    let _ = tx.fetch_one(&lock_sql, sql_args![board_id]).await?;
 
-        if !caller.is_unrestricted_owner() {
-            if principals.iter().any(GrantPrincipal::is_owner_only_target) {
-                return Err(BoardError::forbidden(
-                    "only team owners can create grants targeting 'everyone' or 'all-users'",
-                ));
+    let existing = load_grants_tx(&mut tx, board_id).await?;
+    let mut principals = Vec::with_capacity(input.principals.len());
+    for p in input.principals {
+        principals.push(resolve_principal_input(&mut tx, p).await?);
+    }
+    let principals = dedup_principals(principals);
+
+    if !caller.is_unrestricted_owner() {
+        if principals.iter().any(GrantPrincipal::is_owner_only_target) {
+            return Err(BoardError::forbidden(
+                "only team owners can create grants targeting 'everyone' or 'all-users'",
+            ));
+        }
+        for (pattern, &perms) in &input.can {
+            let caller_perms = caller_permissions_at_pattern(&existing, caller, pattern);
+            if !caller_perms.can_manage() {
+                return Err(BoardError::forbidden(format!(
+                    "creating a grant on '{pattern}' requires 'manage' at '{pattern}'"
+                )));
             }
-            for (pattern, &perms) in &input.can {
-                let caller_perms = caller_permissions_at_pattern(&existing, caller, pattern);
-                if !caller_perms.can_manage() {
-                    return Err(BoardError::forbidden(format!(
-                        "creating a grant on '{pattern}' requires 'manage' at '{pattern}'"
-                    )));
-                }
-                if !caller_perms.contains(perms) {
-                    return Err(BoardError::forbidden(format!(
-                        "cannot grant permissions on '{pattern}' that you do not hold"
-                    )));
-                }
+            if !caller_perms.contains(perms) {
+                return Err(BoardError::forbidden(format!(
+                    "cannot grant permissions on '{pattern}' that you do not hold"
+                )));
             }
         }
+    }
 
-        insert_grant_tx(tx, board_id, principals, input.can, Some(&caller.actor_id()))
-    })
+    let actor_id = caller.actor_id();
+    let grant = insert_grant_tx(&mut tx, board_id, principals, input.can, Some(&actor_id)).await?;
+    tx.commit().await?;
+    Ok(grant)
 }
 
 #[derive(Debug, Deserialize)]
@@ -715,7 +726,7 @@ pub struct UpdateGrantInput {
     pub can: Option<BTreeMap<String, Permissions>>,
 }
 
-pub fn update_grant(
+pub async fn update_grant(
     db: &Database,
     board_id: &str,
     grant_id: &str,
@@ -736,114 +747,116 @@ pub fn update_grant(
         validate_can_map(can)?;
     }
 
-    db.with_tx(|tx| {
-        let existing = load_grants_tx(tx, board_id)?;
-        let mut target = existing
-            .iter()
-            .find(|g| g.id == grant_id)
-            .cloned()
-            .ok_or_else(|| {
-                BoardError::new(
-                    ErrorCode::GrantNotFound,
-                    format!("grant '{grant_id}' not found"),
-                )
-            })?;
+    let mut tx = db.begin_tx().await?;
+    let lock_sql = format!("SELECT id FROM boards WHERE id = ?1{}", tx.lock_row_suffix());
+    let _ = tx.fetch_one(&lock_sql, sql_args![board_id]).await?;
 
-        let add_resolved = match input.add {
-            Some(list) => {
-                let mut v = Vec::with_capacity(list.len());
-                for p in list {
-                    v.push(resolve_principal_input(tx, p)?);
-                }
-                v
-            }
-            None => Vec::new(),
-        };
-        let remove_resolved = match input.remove {
-            Some(list) => {
-                let mut v = Vec::with_capacity(list.len());
-                for p in list {
-                    v.push(resolve_principal_input(tx, p)?);
-                }
-                v
-            }
-            None => Vec::new(),
-        };
+    let existing = load_grants_tx(&mut tx, board_id).await?;
+    let mut target = existing
+        .iter()
+        .find(|g| g.id == grant_id)
+        .cloned()
+        .ok_or_else(|| {
+            BoardError::new(
+                ErrorCode::GrantNotFound,
+                format!("grant '{grant_id}' not found"),
+            )
+        })?;
 
-        let mut next_principals = target.principals.clone();
-        for p in add_resolved {
-            if !next_principals.contains(&p) {
-                next_principals.push(p);
+    let add_resolved = match input.add {
+        Some(list) => {
+            let mut v = Vec::with_capacity(list.len());
+            for p in list {
+                v.push(resolve_principal_input(&mut tx, p).await?);
             }
+            v
         }
-        next_principals.retain(|p| !remove_resolved.contains(p));
-        if next_principals.is_empty() {
-            return Err(BoardError::bad_request(
-                "cannot remove all principals from a grant; revoke it instead",
+        None => Vec::new(),
+    };
+    let remove_resolved = match input.remove {
+        Some(list) => {
+            let mut v = Vec::with_capacity(list.len());
+            for p in list {
+                v.push(resolve_principal_input(&mut tx, p).await?);
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+
+    let mut next_principals = target.principals.clone();
+    for p in add_resolved {
+        if !next_principals.contains(&p) {
+            next_principals.push(p);
+        }
+    }
+    next_principals.retain(|p| !remove_resolved.contains(p));
+    if next_principals.is_empty() {
+        return Err(BoardError::bad_request(
+            "cannot remove all principals from a grant; revoke it instead",
+        ));
+    }
+
+    let next_can = input.can.unwrap_or_else(|| target.can.clone());
+
+    if !caller.is_unrestricted_owner() {
+        if target.id == "g1" {
+            return Err(BoardError::forbidden(
+                "only team owners can edit default grant 'g1'",
             ));
         }
-
-        let next_can = input.can.unwrap_or_else(|| target.can.clone());
-
-        if !caller.is_unrestricted_owner() {
-            if target.id == "g1" {
-                return Err(BoardError::forbidden(
-                    "only team owners can edit default grant 'g1'",
-                ));
-            }
-            if target.targets_owner_only_principal()
-                || next_principals
-                    .iter()
-                    .any(GrantPrincipal::is_owner_only_target)
-            {
-                return Err(BoardError::forbidden(
-                    "only team owners can modify grants targeting 'everyone' or 'all-users'",
-                ));
-            }
-            // Must hold manage at all existing patterns in the grant
-            for pattern in target.can.keys() {
-                if !caller_permissions_at_pattern(&existing, caller, pattern).can_manage() {
-                    return Err(BoardError::forbidden(format!(
-                        "modifying this grant requires 'manage' at '{pattern}'"
-                    )));
-                }
-            }
-            // Must hold manage and every granted permission at all resulting patterns
-            for (pattern, &perms) in &next_can {
-                let caller_perms = caller_permissions_at_pattern(&existing, caller, pattern);
-                if !caller_perms.can_manage() {
-                    return Err(BoardError::forbidden(format!(
-                        "modifying a grant on '{pattern}' requires 'manage' at '{pattern}'"
-                    )));
-                }
-                if !caller_perms.contains(perms) {
-                    return Err(BoardError::forbidden(format!(
-                        "cannot grant permissions on '{pattern}' that you do not hold"
-                    )));
-                }
+        if target.targets_owner_only_principal()
+            || next_principals
+                .iter()
+                .any(GrantPrincipal::is_owner_only_target)
+        {
+            return Err(BoardError::forbidden(
+                "only team owners can modify grants targeting 'everyone' or 'all-users'",
+            ));
+        }
+        for pattern in target.can.keys() {
+            if !caller_permissions_at_pattern(&existing, caller, pattern).can_manage() {
+                return Err(BoardError::forbidden(format!(
+                    "modifying this grant requires 'manage' at '{pattern}'"
+                )));
             }
         }
+        for (pattern, &perms) in &next_can {
+            let caller_perms = caller_permissions_at_pattern(&existing, caller, pattern);
+            if !caller_perms.can_manage() {
+                return Err(BoardError::forbidden(format!(
+                    "modifying a grant on '{pattern}' requires 'manage' at '{pattern}'"
+                )));
+            }
+            if !caller_perms.contains(perms) {
+                return Err(BoardError::forbidden(format!(
+                    "cannot grant permissions on '{pattern}' that you do not hold"
+                )));
+            }
+        }
+    }
 
-        let now = Utc::now().to_rfc3339();
-        let principals_json = serde_json::to_string(&next_principals)
-            .map_err(|e| BoardError::internal(format!("failed to serialize principals: {e}")))?;
-        let can_json = serde_json::to_string(&next_can)
-            .map_err(|e| BoardError::internal(format!("failed to serialize can map: {e}")))?;
+    let now = Utc::now().to_rfc3339();
+    let principals_json = serde_json::to_string(&next_principals)
+        .map_err(|e| BoardError::internal(format!("failed to serialize principals: {e}")))?;
+    let can_json = serde_json::to_string(&next_can)
+        .map_err(|e| BoardError::internal(format!("failed to serialize can map: {e}")))?;
 
-        tx.execute(
-            "UPDATE grants SET principals_json = ?1, can_json = ?2, updated_at = ?3
-             WHERE board_id = ?4 AND id = ?5",
-            params![principals_json, can_json, now, board_id, grant_id],
-        )?;
+    tx.execute(
+        "UPDATE grants SET principals_json = ?1, can_json = ?2, updated_at = ?3
+         WHERE board_id = ?4 AND id = ?5",
+        sql_args![&principals_json, &can_json, &now, board_id, grant_id],
+    )
+    .await?;
+    tx.commit().await?;
 
-        target.principals = next_principals;
-        target.can = next_can;
-        target.updated_at = now;
-        Ok(target)
-    })
+    target.principals = next_principals;
+    target.can = next_can;
+    target.updated_at = now;
+    Ok(target)
 }
 
-pub fn revoke_grant(
+pub async fn revoke_grant(
     db: &Database,
     board_id: &str,
     grant_id: &str,
@@ -855,44 +868,47 @@ pub fn revoke_grant(
         ));
     }
 
-    db.with_tx(|tx| {
-        let existing = load_grants_tx(tx, board_id)?;
-        let target = existing
-            .iter()
-            .find(|g| g.id == grant_id)
-            .ok_or_else(|| {
-                BoardError::new(
-                    ErrorCode::GrantNotFound,
-                    format!("grant '{grant_id}' not found"),
-                )
-            })?;
+    let mut tx = db.begin_tx().await?;
+    let lock_sql = format!("SELECT id FROM boards WHERE id = ?1{}", tx.lock_row_suffix());
+    let _ = tx.fetch_one(&lock_sql, sql_args![board_id]).await?;
 
-        if !caller.is_unrestricted_owner() {
-            if target.id == "g1" {
-                return Err(BoardError::forbidden(
-                    "only team owners can revoke default grant 'g1'",
-                ));
-            }
-            if target.targets_owner_only_principal() {
-                return Err(BoardError::forbidden(
-                    "only team owners can revoke grants targeting 'everyone' or 'all-users'",
-                ));
-            }
-            for pattern in target.can.keys() {
-                if !caller_permissions_at_pattern(&existing, caller, pattern).can_manage() {
-                    return Err(BoardError::forbidden(format!(
-                        "revoking this grant requires 'manage' at '{pattern}'"
-                    )));
-                }
+    let existing = load_grants_tx(&mut tx, board_id).await?;
+    let target = existing
+        .iter()
+        .find(|g| g.id == grant_id)
+        .ok_or_else(|| {
+            BoardError::new(
+                ErrorCode::GrantNotFound,
+                format!("grant '{grant_id}' not found"),
+            )
+        })?;
+
+    if !caller.is_unrestricted_owner() {
+        if target.id == "g1" {
+            return Err(BoardError::forbidden(
+                "only team owners can revoke default grant 'g1'",
+            ));
+        }
+        if target.targets_owner_only_principal() {
+            return Err(BoardError::forbidden(
+                "only team owners can revoke grants targeting 'everyone' or 'all-users'",
+            ));
+        }
+        for pattern in target.can.keys() {
+            if !caller_permissions_at_pattern(&existing, caller, pattern).can_manage() {
+                return Err(BoardError::forbidden(format!(
+                    "revoking this grant requires 'manage' at '{pattern}'"
+                )));
             }
         }
+    }
 
-        tx.execute(
-            "DELETE FROM grants WHERE board_id = ?1 AND id = ?2",
-            params![board_id, grant_id],
-        )?;
-        Ok(())
-    })
+    tx.execute(
+        "DELETE FROM grants WHERE board_id = ?1 AND id = ?2",
+        sql_args![board_id, grant_id],
+    )
+    .await?;
+    tx.commit().await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -905,7 +921,7 @@ pub struct ExplainQuery {
     pub principal: Option<String>,
 }
 
-pub fn explain_access(
+pub async fn explain_access(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -918,38 +934,39 @@ pub fn explain_access(
         || query.app.is_some()
         || query.principal.is_some();
 
-    db.with_conn(|conn| {
-        let grants = load_grants_tx(conn, board_id)?;
+    let mut conn = db.read_conn();
+    let grants = load_grants_tx(&mut conn, board_id).await?;
 
-        if !explaining_other {
-            return Ok(resolve_for_channel(
-                &grants,
-                &caller.principal,
-                caller.narrowing.as_ref(),
-                &query.channel,
-            ));
-        }
-
-        if !caller.is_unrestricted_owner()
-            && !caller_permissions_at_pattern(&grants, caller, "*").can_manage()
-        {
-            return Err(BoardError::forbidden(
-                "explaining another actor's access requires 'manage' permission at '*'",
-            ));
-        }
-
-        let target_principal = resolve_explain_target(conn, &query)?;
-        // Explaining another principal reflects their grant + role/scope resolution (no caller narrowing).
-        Ok(resolve_for_channel(
+    if !explaining_other {
+        return Ok(resolve_for_channel(
             &grants,
-            &target_principal,
-            None,
+            &caller.principal,
+            caller.narrowing.as_ref(),
             &query.channel,
-        ))
-    })
+        ));
+    }
+
+    if !caller.is_unrestricted_owner()
+        && !caller_permissions_at_pattern(&grants, caller, "*").can_manage()
+    {
+        return Err(BoardError::forbidden(
+            "explaining another actor's access requires 'manage' permission at '*'",
+        ));
+    }
+
+    let target_principal = resolve_explain_target(&mut conn, &query).await?;
+    Ok(resolve_for_channel(
+        &grants,
+        &target_principal,
+        None,
+        &query.channel,
+    ))
 }
 
-fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResult<Principal> {
+async fn resolve_explain_target<C: Queryable + ?Sized>(
+    conn: &mut C,
+    query: &ExplainQuery,
+) -> BoardResult<Principal> {
     let mut specified = 0;
     if query.user.is_some() {
         specified += 1;
@@ -970,7 +987,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
     }
 
     if let Some(user_ident) = &query.user {
-        let u = actors::lookup_user_by_identifier(conn, user_ident)?
+        let u = actors::lookup_user_by_identifier(conn, user_ident)
+            .await?
             .ok_or_else(|| BoardError::not_found(format!("user '{user_ident}' not found")))?;
         return Ok(Principal::User {
             id: u.id,
@@ -983,7 +1001,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
     }
 
     if let Some(proj_ident) = &query.project {
-        let p = actors::lookup_project_by_identifier(conn, proj_ident)?
+        let p = actors::lookup_project_by_identifier(conn, proj_ident)
+            .await?
             .ok_or_else(|| BoardError::not_found(format!("project '{proj_ident}' not found")))?;
         let env = query
             .environment
@@ -1000,7 +1019,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
     }
 
     if let Some(app_ident) = &query.app {
-        let a = actors::lookup_app_by_identifier(conn, app_ident)?
+        let a = actors::lookup_app_by_identifier(conn, app_ident)
+            .await?
             .ok_or_else(|| BoardError::not_found(format!("app '{app_ident}' not found")))?;
         return Ok(Principal::App {
             id: a.id,
@@ -1012,7 +1032,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
 
     if let Some(raw) = &query.principal {
         if let Some(uid) = raw.strip_prefix("user:") {
-            let u = actors::lookup_user_by_identifier(conn, uid)?
+            let u = actors::lookup_user_by_identifier(conn, uid)
+                .await?
                 .ok_or_else(|| BoardError::not_found(format!("user '{uid}' not found")))?;
             return Ok(Principal::User {
                 id: u.id,
@@ -1029,7 +1050,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
                     "project principal must have format 'project:<id>:<env>'",
                 )
             })?;
-            let p = actors::lookup_project_by_identifier(conn, pid)?
+            let p = actors::lookup_project_by_identifier(conn, pid)
+                .await?
                 .ok_or_else(|| BoardError::not_found(format!("project '{pid}' not found")))?;
             validate_slug("environment", env)?;
             return Ok(Principal::Project {
@@ -1039,7 +1061,8 @@ fn resolve_explain_target(conn: &Connection, query: &ExplainQuery) -> BoardResul
             });
         }
         if let Some(aid) = raw.strip_prefix("app:") {
-            let a = actors::lookup_app_by_identifier(conn, aid)?
+            let a = actors::lookup_app_by_identifier(conn, aid)
+                .await?
                 .ok_or_else(|| BoardError::not_found(format!("app '{aid}' not found")))?;
             return Ok(Principal::App {
                 id: a.id,
@@ -1072,15 +1095,18 @@ pub fn has_overlapping_grant_for_private_channel(grants: &[Grant], path: &str) -
 }
 
 /// Checks if a grant exists by ID on a board.
-pub fn grant_exists_tx(conn: &Connection, board_id: &str, grant_id: &str) -> BoardResult<bool> {
+pub async fn grant_exists_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+    grant_id: &str,
+) -> BoardResult<bool> {
     Ok(conn
-        .query_row(
+        .fetch_optional(
             "SELECT 1 FROM grants WHERE board_id = ?1 AND id = ?2",
-            params![board_id, grant_id],
-            |_| Ok(true),
+            sql_args![board_id, grant_id],
         )
-        .optional()?
-        .unwrap_or(false))
+        .await?
+        .is_some())
 }
 
 #[cfg(test)]
@@ -1150,9 +1176,7 @@ mod tests {
                 vec![GrantPrincipal::AllApps],
                 &[("*", Permissions::DEFAULT_APPS)],
             ),
-            // Close security/ to everyone
             make_grant("g4", vec![GrantPrincipal::Everyone], &[("security/", Permissions::NONE)]),
-            // Tied specific grants for Alice on security/
             make_grant(
                 "g5",
                 vec![GrantPrincipal::User { id: "alice".to_string() }],
@@ -1163,13 +1187,11 @@ mod tests {
                 vec![GrantPrincipal::User { id: "alice".to_string() }],
                 &[("security/", Permissions::POST)],
             ),
-            // Exact channel beats subtree for Bob
             make_grant(
                 "g7",
                 vec![GrantPrincipal::User { id: "bob".to_string() }],
                 &[("security/public", Permissions::READ)],
             ),
-            // Specific project (production only) gets all on security/
             make_grant(
                 "g8",
                 vec![GrantPrincipal::Project {
@@ -1180,7 +1202,6 @@ mod tests {
             ),
         ];
 
-        // Alice: tied g5 + g6 union -> read + post (beats everyone=none at security/)
         let r = resolve_for_channel(&grants, &alice, None, "security/incidents");
         assert_eq!(r.pattern.as_deref(), Some("security/"));
         assert_eq!(r.tier, Some(PrincipalTier::Specific));
@@ -1188,27 +1209,22 @@ mod tests {
         assert_eq!(r.can, Permissions::READ.union(Permissions::POST));
         assert!(r.can.can_reply());
 
-        // Bob: closed on security/incidents by everyone=none
         let r = resolve_for_channel(&grants, &bob, None, "security/incidents");
         assert_eq!(r.pattern.as_deref(), Some("security/"));
         assert_eq!(r.tier, Some(PrincipalTier::Everyone));
         assert_eq!(r.can, Permissions::NONE);
 
-        // Bob: exact channel security/public beats security/
         let r = resolve_for_channel(&grants, &bob, None, "security/public");
         assert_eq!(r.pattern.as_deref(), Some("security/public"));
         assert_eq!(r.can, Permissions::READ);
 
-        // Viewer: g1 grants ALL on dev, capped by Viewer role to read+react
         let r = resolve_for_channel(&grants, &viewer, None, "dev");
         assert_eq!(r.granted, Permissions::ALL);
         assert_eq!(r.can, Permissions::VIEWER);
 
-        // TeamRole::None: capped to empty
         let r = resolve_for_channel(&grants, &nobody, None, "dev");
         assert_eq!(r.can, Permissions::NONE);
 
-        // Production project matches g8 on security/; preview project hits g4 everyone=none
         assert_eq!(
             resolve_for_channel(&grants, &prod_proj, None, "security/alerts").can,
             Permissions::ALL
@@ -1218,11 +1234,9 @@ mod tests {
             Permissions::NONE
         );
 
-        // App: g3 grants read,post,react,label, capped by app scopes read+label
         let r = resolve_for_channel(&grants, &app, None, "dev");
         assert_eq!(r.can, Permissions::READ.union(Permissions::LABEL));
 
-        // Caller narrowing intersects with effective permissions
         let narrow = NarrowingPolicy::parse_header("post").unwrap();
         let r = resolve_for_channel(&grants, &alice, Some(&narrow), "security/incidents");
         assert_eq!(r.can, Permissions::POST);

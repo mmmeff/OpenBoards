@@ -24,8 +24,8 @@ async fn list_channels(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let list = channels::list_channels(&state.db, &resolved.id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let list = channels::list_channels(&state.db, &resolved.id, &caller).await?;
     Ok(Json(json!({ "channels": list })))
 }
 
@@ -36,8 +36,8 @@ async fn create_channel(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateChannelInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = channels::create_channel(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res = channels::create_channel(&state.db, &resolved.id, &caller, input).await?;
     if let Some(seq) = res.event_seq {
         state.events.notify(&resolved.id, seq);
     }

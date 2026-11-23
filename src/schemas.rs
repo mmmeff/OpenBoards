@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::actors::CallerContext;
-use crate::db::{sql_placeholders, Database};
+use crate::db::{sql_placeholders, Database, Queryable, SqlArg};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::grants;
 use crate::messages::ParsedBlock;
+use crate::sql_args;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaView {
@@ -61,9 +61,9 @@ pub fn parse_schema_id(id: &str) -> BoardResult<(String, i64)> {
         ))
     })?;
     validate_schema_name(name)?;
-    let version: i64 = ver_str.parse().map_err(|_| {
-        BoardError::bad_request(format!("invalid schema version in '{id}'"))
-    })?;
+    let version: i64 = ver_str
+        .parse()
+        .map_err(|_| BoardError::bad_request(format!("invalid schema version in '{id}'")))?;
     if version < 1 {
         return Err(BoardError::bad_request("schema version must be >= 1"));
     }
@@ -71,11 +71,13 @@ pub fn parse_schema_id(id: &str) -> BoardResult<(String, i64)> {
 }
 
 /// Seeds built-in team-wide schemas `git-commit@1` and `vercel-deployment@1`.
-pub fn seed_builtin_schemas(db: &Database) -> BoardResult<()> {
-    db.with_tx(|tx| seed_builtin_schemas_tx(tx))
+pub async fn seed_builtin_schemas(db: &Database) -> BoardResult<()> {
+    let mut tx = db.begin_tx().await?;
+    seed_builtin_schemas_tx(&mut tx).await?;
+    tx.commit().await
 }
 
-pub fn seed_builtin_schemas_tx(conn: &Connection) -> BoardResult<()> {
+pub async fn seed_builtin_schemas_tx<C: Queryable + ?Sized>(conn: &mut C) -> BoardResult<()> {
     let builtins = [
         (
             "git-commit",
@@ -126,83 +128,82 @@ pub fn seed_builtin_schemas_tx(conn: &Connection) -> BoardResult<()> {
         let schema_json = serde_json::to_string(&schema_val)
             .map_err(|e| BoardError::internal(format!("failed to serialize builtin schema: {e}")))?;
         conn.execute(
-            "INSERT OR IGNORE INTO schemas (id, name, version, description, schema_json, created_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-            params![id, name, version, desc, schema_json, now],
-        )?;
+            "INSERT INTO schemas (id, name, version, description, schema_json, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+             ON CONFLICT (id) DO NOTHING",
+            sql_args![&id, name, version, desc, &schema_json, &now],
+        )
+        .await?;
     }
     Ok(())
 }
 
-pub fn get_schema_tx(conn: &Connection, id: &str) -> BoardResult<Option<SchemaView>> {
-    seed_builtin_schemas_tx(conn)?;
-    let row: Option<(String, String, i64, Option<String>, String, String)> = conn
-        .query_row(
+pub async fn get_schema_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<SchemaView>> {
+    seed_builtin_schemas_tx(conn).await?;
+    let row = conn
+        .fetch_optional(
             "SELECT id, name, version, description, schema_json, created_at
              FROM schemas WHERE id = ?1",
-            params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            sql_args![id],
         )
-        .optional()?;
+        .await?;
     match row {
         None => Ok(None),
-        Some((id, name, version, description, schema_json, created_at)) => {
+        Some(r) => {
+            let schema_json = r.get_str(4)?;
             let schema: Value = serde_json::from_str(&schema_json)
                 .map_err(|e| BoardError::internal(format!("corrupted schema JSON: {e}")))?;
             Ok(Some(SchemaView {
-                id,
-                name,
-                version,
-                description,
+                id: r.get_str(0)?,
+                name: r.get_str(1)?,
+                version: r.get_i64(2)?,
+                description: r.get_opt_str(3)?,
                 schema,
-                created_at,
+                created_at: r.get_str(5)?,
             }))
         }
     }
 }
 
-pub fn list_schemas(db: &Database) -> BoardResult<Vec<SchemaView>> {
-    db.with_tx(|tx| {
-        seed_builtin_schemas_tx(tx)?;
-        let mut stmt = tx.prepare(
+pub async fn list_schemas(db: &Database) -> BoardResult<Vec<SchemaView>> {
+    let mut tx = db.begin_tx().await?;
+    seed_builtin_schemas_tx(&mut tx).await?;
+    let rows = tx
+        .fetch_all(
             "SELECT id, name, version, description, schema_json, created_at
              FROM schemas ORDER BY name ASC, version ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, name, version, description, schema_json, created_at) = row?;
-            let schema: Value = serde_json::from_str(&schema_json)
-                .map_err(|e| BoardError::internal(format!("corrupted schema JSON: {e}")))?;
-            out.push(SchemaView {
-                id,
-                name,
-                version,
-                description,
-                schema,
-                created_at,
-            });
-        }
-        Ok(out)
-    })
+            sql_args![],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let schema_json = r.get_str(4)?;
+        let schema: Value = serde_json::from_str(&schema_json)
+            .map_err(|e| BoardError::internal(format!("corrupted schema JSON: {e}")))?;
+        out.push(SchemaView {
+            id: r.get_str(0)?,
+            name: r.get_str(1)?,
+            version: r.get_i64(2)?,
+            description: r.get_opt_str(3)?,
+            schema,
+            created_at: r.get_str(5)?,
+        });
+    }
+    tx.commit().await?;
+    Ok(out)
 }
 
-pub fn get_schema(db: &Database, id: &str) -> BoardResult<SchemaView> {
-    db.with_tx(|tx| {
-        get_schema_tx(tx, id)?.ok_or_else(|| {
-            BoardError::new(ErrorCode::SchemaNotFound, format!("schema '{id}' not found"))
-                .with_status(axum::http::StatusCode::NOT_FOUND)
-        })
-    })
+pub async fn get_schema(db: &Database, id: &str) -> BoardResult<SchemaView> {
+    let mut tx = db.begin_tx().await?;
+    let view = get_schema_tx(&mut tx, id).await?.ok_or_else(|| {
+        BoardError::new(ErrorCode::SchemaNotFound, format!("schema '{id}' not found"))
+            .with_status(axum::http::StatusCode::NOT_FOUND)
+    })?;
+    tx.commit().await?;
+    Ok(view)
 }
 
 /// Registers an immutable schema version `name@version`.
@@ -210,7 +211,7 @@ pub fn get_schema(db: &Database, id: &str) -> BoardResult<SchemaView> {
 /// Requires `manage` at `*` on `board_id` (if board-scoped) or unrestricted `owner`.
 /// Re-registering an identical definition returns `created: false`; differing definition
 /// fails with `409 schema_immutable`.
-pub fn create_schema(
+pub async fn create_schema(
     db: &Database,
     board_id: Option<&str>,
     caller: &CallerContext,
@@ -225,10 +226,8 @@ pub fn create_schema(
             "schema definition must be a JSON Schema object",
         ));
     }
-    // Verify schema compiles cleanly with jsonschema
-    jsonschema::validator_for(&input.schema).map_err(|e| {
-        BoardError::bad_request(format!("invalid JSON Schema definition: {e}"))
-    })?;
+    jsonschema::validator_for(&input.schema)
+        .map_err(|e| BoardError::bad_request(format!("invalid JSON Schema definition: {e}")))?;
 
     if caller.is_restricted() {
         return Err(BoardError::forbidden(
@@ -236,69 +235,73 @@ pub fn create_schema(
         ));
     }
 
-    db.with_tx(|tx| {
-        seed_builtin_schemas_tx(tx)?;
+    let id = format!("{}@{}", input.name, input.version);
+    let mut tx = db.begin_tx().await?;
+    tx.advisory_xact_lock("schema", &id).await?;
+    seed_builtin_schemas_tx(&mut tx).await?;
 
-        if !caller.is_unrestricted_owner() {
-            let Some(bid) = board_id else {
-                return Err(BoardError::forbidden(
-                    "registering schemas without a board requires an unrestricted owner or board-level 'manage' at '*'",
-                ));
-            };
-            let board_grants = grants::load_grants_tx(tx, bid)?;
-            if !grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage() {
-                return Err(BoardError::forbidden(
-                    "registering schemas requires 'manage' permission at '*'",
-                ));
-            }
+    if !caller.is_unrestricted_owner() {
+        let Some(bid) = board_id else {
+            return Err(BoardError::forbidden(
+                "registering schemas without a board requires an unrestricted owner or board-level 'manage' at '*'",
+            ));
+        };
+        let board_grants = grants::load_grants_tx(&mut tx, bid).await?;
+        if !grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage() {
+            return Err(BoardError::forbidden(
+                "registering schemas requires 'manage' permission at '*'",
+            ));
         }
+    }
 
-        let id = format!("{}@{}", input.name, input.version);
-        if let Some(existing) = get_schema_tx(tx, &id)? {
-            if existing.schema == input.schema && existing.description == input.description {
-                return Ok((existing, false));
-            }
-            return Err(BoardError::new(
-                ErrorCode::SchemaImmutable,
-                format!("schema '{id}' already exists with a different definition"),
-            )
-            .with_hint(format!(
-                "Register '{}@{}' for a new version.",
-                input.name,
-                input.version + 1
-            )));
+    if let Some(existing) = get_schema_tx(&mut tx, &id).await? {
+        if existing.schema == input.schema && existing.description == input.description {
+            tx.commit().await?;
+            return Ok((existing, false));
         }
+        return Err(BoardError::new(
+            ErrorCode::SchemaImmutable,
+            format!("schema '{id}' already exists with a different definition"),
+        )
+        .with_hint(format!(
+            "Register '{}@{}' for a new version.",
+            input.name,
+            input.version + 1
+        )));
+    }
 
-        let now = Utc::now().to_rfc3339();
-        let schema_json = serde_json::to_string(&input.schema)
-            .map_err(|e| BoardError::internal(format!("failed to serialize schema: {e}")))?;
+    let now = Utc::now().to_rfc3339();
+    let schema_json = serde_json::to_string(&input.schema)
+        .map_err(|e| BoardError::internal(format!("failed to serialize schema: {e}")))?;
+    let actor_id = caller.actor_id();
 
-        tx.execute(
-            "INSERT INTO schemas (id, name, version, description, schema_json, created_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id,
-                input.name,
-                input.version,
-                input.description,
-                schema_json,
-                caller.actor_id(),
-                now
-            ],
-        )?;
+    tx.execute(
+        "INSERT INTO schemas (id, name, version, description, schema_json, created_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        sql_args![
+            &id,
+            &input.name,
+            input.version,
+            &input.description,
+            &schema_json,
+            &actor_id,
+            &now
+        ],
+    )
+    .await?;
+    tx.commit().await?;
 
-        Ok((
-            SchemaView {
-                id,
-                name: input.name,
-                version: input.version,
-                description: input.description,
-                schema: input.schema,
-                created_at: now,
-            },
-            true,
-        ))
-    })
+    Ok((
+        SchemaView {
+            id,
+            name: input.name,
+            version: input.version,
+            description: input.description,
+            schema: input.schema,
+            created_at: now,
+        },
+        true,
+    ))
 }
 
 /// Extracts and validates structured data blocks from message `text` (and optional explicit `schema`).
@@ -309,8 +312,8 @@ pub fn create_schema(
 ///
 /// If `explicit_schema` is provided (e.g. CLI `--schema sandbox@1`), the entire `text` is
 /// parsed as JSON and validated against that schema (returning one block).
-pub fn parse_and_validate_blocks_tx(
-    conn: &Connection,
+pub async fn parse_and_validate_blocks_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     text: &str,
     explicit_schema: Option<&str>,
 ) -> BoardResult<Vec<ParsedBlock>> {
@@ -333,7 +336,7 @@ pub fn parse_and_validate_blocks_tx(
             )
         })?;
         let canonical_id = format!("{schema_name}@{schema_version}");
-        let schema_view = get_schema_tx(conn, &canonical_id)?.ok_or_else(|| {
+        let schema_view = get_schema_tx(conn, &canonical_id).await?.ok_or_else(|| {
             BoardError::new(
                 ErrorCode::SchemaNotFound,
                 format!("schema '{canonical_id}' is not registered"),
@@ -420,68 +423,66 @@ fn extract_fenced_blocks(text: &str) -> Vec<(String, String)> {
     blocks
 }
 
-pub fn store_message_blocks_tx(
-    conn: &Connection,
+pub async fn store_message_blocks_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     message_id: &str,
     blocks: &[ParsedBlock],
 ) -> BoardResult<()> {
     conn.execute(
         "DELETE FROM message_blocks WHERE message_id = ?1",
-        params![message_id],
-    )?;
+        sql_args![message_id],
+    )
+    .await?;
     for (idx, b) in blocks.iter().enumerate() {
         let data_json = serde_json::to_string(&b.data)
             .map_err(|e| BoardError::internal(format!("failed to serialize block data: {e}")))?;
         conn.execute(
             "INSERT INTO message_blocks (board_id, message_id, idx, schema_name, schema_version, data_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+            sql_args![
                 board_id,
                 message_id,
                 idx as i64,
-                b.schema,
+                &b.schema,
                 b.version,
-                data_json
+                &data_json
             ],
-        )?;
+        )
+        .await?;
     }
     Ok(())
 }
 
-pub fn load_message_blocks_tx(
-    conn: &Connection,
+pub async fn load_message_blocks_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_id: &str,
 ) -> BoardResult<Vec<ParsedBlock>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT schema_name, schema_version, data_json
-         FROM message_blocks
-         WHERE message_id = ?1
-         ORDER BY idx ASC",
-    )?;
-    let rows = stmt.query_map(params![message_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (schema, version, data_json) = row?;
+    let rows = conn
+        .fetch_all(
+            "SELECT schema_name, schema_version, data_json
+             FROM message_blocks
+             WHERE message_id = ?1
+             ORDER BY idx ASC",
+            sql_args![message_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let data_json = r.get_str(2)?;
         let data: Value = serde_json::from_str(&data_json)
             .map_err(|e| BoardError::internal(format!("corrupted block JSON: {e}")))?;
         out.push(ParsedBlock {
-            schema,
-            version,
+            schema: r.get_str(0)?,
+            version: r.get_i64(1)?,
             data,
         });
     }
     Ok(out)
 }
 
-pub fn load_messages_blocks_batch_tx(
-    conn: &Connection,
+pub async fn load_messages_blocks_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_ids: &[&str],
 ) -> BoardResult<HashMap<String, Vec<ParsedBlock>>> {
     let mut out: HashMap<String, Vec<ParsedBlock>> = HashMap::new();
@@ -496,22 +497,16 @@ pub fn load_messages_blocks_batch_tx(
              ORDER BY message_id ASC, idx ASC",
             sql_placeholders(chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (mid, schema, version, data_json) = row?;
+        let args: Vec<SqlArg<'_>> = chunk.iter().copied().map(SqlArg::from).collect();
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in rows {
+            let mid = r.get_str(0)?;
+            let data_json = r.get_str(3)?;
             let data: Value = serde_json::from_str(&data_json)
                 .map_err(|e| BoardError::internal(format!("corrupted block JSON: {e}")))?;
             out.entry(mid).or_default().push(ParsedBlock {
-                schema,
-                version,
+                schema: r.get_str(1)?,
+                version: r.get_i64(2)?,
                 data,
             });
         }
@@ -519,11 +514,15 @@ pub fn load_messages_blocks_batch_tx(
     Ok(out)
 }
 
-pub fn delete_message_blocks_tx(conn: &Connection, message_id: &str) -> BoardResult<()> {
+pub async fn delete_message_blocks_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    message_id: &str,
+) -> BoardResult<()> {
     conn.execute(
         "DELETE FROM message_blocks WHERE message_id = ?1",
-        params![message_id],
-    )?;
+        sql_args![message_id],
+    )
+    .await?;
     Ok(())
 }
 
@@ -531,30 +530,30 @@ pub fn delete_message_blocks_tx(conn: &Connection, message_id: &str) -> BoardRes
 mod tests {
     use super::*;
 
-    #[test]
-    fn extracts_and_validates_builtin_and_custom_blocks() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn extracts_and_validates_builtin_and_custom_blocks() {
+        let db = Database::open_in_memory().await.unwrap();
         let md = "Deployed:\n\n```board-block git-commit@1\n{\"sha\":\"a1b2c3d\",\"message\":\"fix bug\"}\n```\nDone!";
-        let blocks = db
-            .with_tx(|tx| parse_and_validate_blocks_tx(tx, md, None))
+        let mut tx = db.begin_tx().await.unwrap();
+        let blocks = parse_and_validate_blocks_tx(&mut tx, md, None)
+            .await
             .unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].schema, "git-commit");
         assert_eq!(blocks[0].version, 1);
         assert_eq!(blocks[0].data["sha"], "a1b2c3d");
 
-        // Invalid payload fails with invalid_block
         let bad = "```board:vercel-deployment@1\n{\"id\":\"d1\",\"url\":\"https://x\",\"state\":\"bogus\"}\n```";
-        let err = db
-            .with_tx(|tx| parse_and_validate_blocks_tx(tx, bad, None))
+        let err = parse_and_validate_blocks_tx(&mut tx, bad, None)
+            .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidBlock);
 
-        // Unknown schema fails with schema_not_found
         let missing = "```board-block unknown@1\n{\"a\":1}\n```";
-        let err = db
-            .with_tx(|tx| parse_and_validate_blocks_tx(tx, missing, None))
+        let err = parse_and_validate_blocks_tx(&mut tx, missing, None)
+            .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::SchemaNotFound);
+        tx.commit().await.unwrap();
     }
 }

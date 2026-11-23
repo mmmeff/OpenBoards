@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actors::{self, CallerContext};
 use crate::attachments;
-use crate::db::{sql_placeholders, Database};
+use crate::db::{
+    sql_placeholders, sql_placeholders_from, Database, DbRow, DbTx, Queryable, SqlArg,
+};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventType};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
@@ -17,6 +19,7 @@ use crate::labels;
 use crate::mentions::{self, MentionResolution};
 use crate::schedules;
 use crate::schemas;
+use crate::sql_args;
 use crate::sync;
 use crate::tasks::{self, TaskView};
 use crate::validate::{validate_channel_path, validate_text_length};
@@ -209,9 +212,7 @@ pub fn normalize_emoji(raw: &str) -> BoardResult<String> {
     let normalized = if let Some(m) = mapped {
         m.to_string()
     } else {
-        stripped
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_")
+        stripped.to_ascii_lowercase().replace(['-', ' '], "_")
     };
 
     if normalized.is_empty()
@@ -246,42 +247,64 @@ pub struct StoredMessageRow {
     pub created_at: String,
 }
 
-fn next_msg_seq_tx(conn: &Connection, board_id: &str) -> BoardResult<i64> {
-    let seq: i64 = conn.query_row(
-        "SELECT next_msg_seq FROM boards WHERE id = ?1",
-        params![board_id],
-        |r| r.get(0),
-    )?;
-    conn.execute(
-        "UPDATE boards SET next_msg_seq = ?1 WHERE id = ?2",
-        params![seq + 1, board_id],
-    )?;
-    Ok(seq)
+pub async fn next_msg_seq_tx(tx: &mut DbTx, board_id: &str) -> BoardResult<i64> {
+    let row = tx
+        .fetch_one(
+            "UPDATE boards
+             SET next_msg_seq = next_msg_seq + 1
+             WHERE id = ?1
+             RETURNING next_msg_seq - 1",
+            sql_args![board_id],
+        )
+        .await?;
+    row.get_i64(0)
 }
 
-fn current_board_cursor_tx(conn: &Connection, board_id: &str) -> BoardResult<String> {
-    events::current_event_cursor_tx(conn, board_id)
+async fn current_board_cursor_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+) -> BoardResult<String> {
+    events::current_event_cursor_tx(conn, board_id).await
 }
 
-pub fn load_stored_message_tx(
-    conn: &Connection,
+pub async fn load_stored_message_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     message_id: &str,
 ) -> BoardResult<Option<StoredMessageRow>> {
-    let mut stmt = conn.prepare_cached(
+    let row = conn
+        .fetch_optional(
+            "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
+                    by_profile, from_source, no_sync, revision, deleted_at, created_at
+             FROM messages
+             WHERE board_id = ?1 AND id = ?2",
+            sql_args![board_id, message_id],
+        )
+        .await?;
+    row.as_ref().map(map_stored_row).transpose()
+}
+
+/// Loads a message row with `FOR UPDATE` on PostgreSQL to serialize CAS mutations
+/// (label CAS, edit revision CAS, delete revision CAS).
+pub async fn load_stored_message_for_update_tx(
+    tx: &mut DbTx,
+    board_id: &str,
+    message_id: &str,
+) -> BoardResult<Option<StoredMessageRow>> {
+    let sql = format!(
         "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                 by_profile, from_source, no_sync, revision, deleted_at, created_at
          FROM messages
-         WHERE board_id = ?1 AND id = ?2",
-    )?;
-    stmt.query_row(params![board_id, message_id], map_stored_row)
-        .optional()
-        .map_err(Into::into)
+         WHERE board_id = ?1 AND id = ?2{}",
+        tx.lock_row_suffix()
+    );
+    let row = tx.fetch_optional(&sql, sql_args![board_id, message_id]).await?;
+    row.as_ref().map(map_stored_row).transpose()
 }
 
 /// Maintains the `threads` summary index atomically whenever a root message or reply is inserted.
-pub fn record_thread_message_tx(
-    conn: &Connection,
+pub async fn record_thread_message_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     channel: &str,
     msg_id: &str,
@@ -289,28 +312,30 @@ pub fn record_thread_message_tx(
     re_root_id: Option<&str>,
 ) -> BoardResult<()> {
     if let Some(root_id) = re_root_id {
-        let mut stmt = conn.prepare_cached(
+        conn.execute(
             "UPDATE threads
              SET last_seq = ?1,
                  last_id = ?2,
                  last_reply_id = ?2,
                  reply_count = reply_count + 1
              WHERE root_id = ?3",
-        )?;
-        stmt.execute(params![seq, msg_id, root_id])?;
+            sql_args![seq, msg_id, root_id],
+        )
+        .await?;
     } else {
-        let mut stmt = conn.prepare_cached(
+        conn.execute(
             "INSERT INTO threads (
                 root_id, board_id, channel, root_seq, last_seq, last_id, last_reply_id, reply_count
              ) VALUES (?1, ?2, ?3, ?4, ?4, ?1, NULL, 0)",
-        )?;
-        stmt.execute(params![msg_id, board_id, channel, seq])?;
+            sql_args![msg_id, board_id, channel, seq],
+        )
+        .await?;
     }
     Ok(())
 }
 
-fn load_stored_messages_batch_tx(
-    conn: &Connection,
+async fn load_stored_messages_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     message_ids: &[&str],
 ) -> BoardResult<HashMap<String, StoredMessageRow>> {
@@ -323,44 +348,49 @@ fn load_stored_messages_batch_tx(
             "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                     by_profile, from_source, no_sync, revision, deleted_at, created_at
              FROM messages
-             WHERE board_id = ? AND id IN ({})",
-            sql_placeholders(chunk.len())
+             WHERE board_id = ?1 AND id IN ({})",
+            sql_placeholders_from(2, chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut bind: Vec<&str> = Vec::with_capacity(chunk.len() + 1);
-        bind.push(board_id);
-        bind.extend_from_slice(chunk);
-        let rows = stmt.query_map(params_from_iter(bind), map_stored_row)?;
-        for row in rows {
-            let r = row?;
-            out.insert(r.id.clone(), r);
+        let mut args: Vec<SqlArg<'_>> = Vec::with_capacity(chunk.len() + 1);
+        args.push(SqlArg::from(board_id));
+        for &id in chunk {
+            args.push(SqlArg::from(id));
+        }
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in &rows {
+            let stored = map_stored_row(r)?;
+            out.insert(stored.id.clone(), stored);
         }
     }
     Ok(out)
 }
 
-fn map_stored_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessageRow> {
+fn map_stored_row(r: &DbRow) -> BoardResult<StoredMessageRow> {
     Ok(StoredMessageRow {
-        id: r.get(0)?,
-        board_id: r.get(1)?,
-        seq: r.get(2)?,
-        channel: r.get(3)?,
-        re: r.get(4)?,
-        reply_to: r.get(5)?,
-        text: r.get(6)?,
-        by_actor: r.get(7)?,
-        by_principal: r.get(8)?,
-        by_profile: r.get(9)?,
-        from_source: r.get(10)?,
-        no_sync: r.get::<_, i64>(11)? != 0,
-        revision: r.get(12)?,
-        deleted_at: r.get(13)?,
-        created_at: r.get(14)?,
+        id: r.get_str(0)?,
+        board_id: r.get_str(1)?,
+        seq: r.get_i64(2)?,
+        channel: r.get_str(3)?,
+        re: r.get_opt_str(4)?,
+        reply_to: r.get_opt_str(5)?,
+        text: r.get_str(6)?,
+        by_actor: r.get_str(7)?,
+        by_principal: r.get_str(8)?,
+        by_profile: r.get_opt_str(9)?,
+        from_source: r.get_opt_str(10)?,
+        no_sync: r.get_i64(11)? != 0,
+        revision: r.get_i64(12)?,
+        deleted_at: r.get_opt_str(13)?,
+        created_at: r.get_str(14)?,
     })
 }
 
-pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> BoardResult<MessageView> {
-    let handle = actors::resolve_actor_view(conn, &row.by_actor)?
+pub async fn hydrate_message_view_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    row: &StoredMessageRow,
+) -> BoardResult<MessageView> {
+    let handle = actors::resolve_actor_view(conn, &row.by_actor)
+        .await?
         .map(|a| a.handle)
         .unwrap_or_else(|| row.by_actor.clone());
 
@@ -370,15 +400,15 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
         (BTreeMap::new(), BTreeMap::new(), Vec::new(), Vec::new())
     } else {
         (
-            labels::load_message_labels_tx(conn, &row.id)?,
-            load_reactions_tx(conn, &row.id)?,
-            attachments::load_message_attachments_tx(conn, &row.id)?,
-            schemas::load_message_blocks_tx(conn, &row.id)?,
+            labels::load_message_labels_tx(conn, &row.id).await?,
+            load_reactions_tx(conn, &row.id).await?,
+            attachments::load_message_attachments_tx(conn, &row.id).await?,
+            schemas::load_message_blocks_tx(conn, &row.id).await?,
         )
     };
 
     let task = if row.re.is_none() {
-        tasks::load_task_view_tx(conn, &row.id)?
+        tasks::load_task_view_tx(conn, &row.id).await?
     } else {
         None
     };
@@ -412,41 +442,47 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
     })
 }
 
-pub fn load_mention_ids_tx(conn: &Connection, message_id: &str) -> BoardResult<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT actor_id FROM message_mentions WHERE message_id = ?1 ORDER BY actor_id ASC",
-    )?;
-    let rows = stmt.query_map(params![message_id], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+pub async fn load_mention_ids_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    message_id: &str,
+) -> BoardResult<Vec<String>> {
+    let rows = conn
+        .fetch_all(
+            "SELECT actor_id FROM message_mentions WHERE message_id = ?1 ORDER BY actor_id ASC",
+            sql_args![message_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(r.get_str(0)?);
     }
     Ok(out)
 }
 
 /// Builds an immutable `MessageSnapshot` (including root thread labels and mentions) for filtering
 /// and event-log before/after evaluation.
-pub fn build_message_snapshot_tx(
-    conn: &Connection,
+pub async fn build_message_snapshot_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     row: &StoredMessageRow,
 ) -> BoardResult<MessageSnapshot> {
-    let handle = actors::resolve_actor_view(conn, &row.by_actor)?
+    let handle = actors::resolve_actor_view(conn, &row.by_actor)
+        .await?
         .map(|a| a.handle)
         .unwrap_or_else(|| row.by_actor.clone());
     let deleted = row.deleted_at.is_some();
     let msg_labels = if deleted {
         BTreeMap::new()
     } else {
-        labels::load_message_labels_tx(conn, &row.id)?
+        labels::load_message_labels_tx(conn, &row.id).await?
     };
     let root_labels = match &row.re {
-        Some(root_id) => Some(labels::load_message_labels_tx(conn, root_id)?),
+        Some(root_id) => Some(labels::load_message_labels_tx(conn, root_id).await?),
         None => None,
     };
     let mention_ids = if deleted {
         Vec::new()
     } else {
-        load_mention_ids_tx(conn, &row.id)?
+        load_mention_ids_tx(conn, &row.id).await?
     };
     Ok(MessageSnapshot {
         id: row.id.clone(),
@@ -468,23 +504,25 @@ pub fn build_message_snapshot_tx(
     })
 }
 
-fn load_reactions_tx(conn: &Connection, message_id: &str) -> BoardResult<BTreeMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT emoji, actor_id FROM message_reactions WHERE message_id = ?1 ORDER BY emoji ASC, actor_id ASC",
-    )?;
-    let rows = stmt.query_map(params![message_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+async fn load_reactions_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    message_id: &str,
+) -> BoardResult<BTreeMap<String, Vec<String>>> {
+    let rows = conn
+        .fetch_all(
+            "SELECT emoji, actor_id FROM message_reactions WHERE message_id = ?1 ORDER BY emoji ASC, actor_id ASC",
+            sql_args![message_id],
+        )
+        .await?;
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in rows {
-        let (emoji, actor_id) = row?;
-        map.entry(emoji).or_default().push(actor_id);
+    for r in rows {
+        map.entry(r.get_str(0)?).or_default().push(r.get_str(1)?);
     }
     Ok(map)
 }
 
-fn load_reactions_batch_tx(
-    conn: &Connection,
+async fn load_reactions_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_ids: &[&str],
 ) -> BoardResult<HashMap<String, BTreeMap<String, Vec<String>>>> {
     let mut out: HashMap<String, BTreeMap<String, Vec<String>>> = HashMap::new();
@@ -499,21 +537,14 @@ fn load_reactions_batch_tx(
              ORDER BY message_id ASC, emoji ASC, actor_id ASC",
             sql_placeholders(chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (mid, emoji, actor_id) = row?;
-            out.entry(mid)
+        let args: Vec<SqlArg<'_>> = chunk.iter().copied().map(SqlArg::from).collect();
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in rows {
+            out.entry(r.get_str(0)?)
                 .or_default()
-                .entry(emoji)
+                .entry(r.get_str(1)?)
                 .or_default()
-                .push(actor_id);
+                .push(r.get_str(2)?);
         }
     }
     Ok(out)
@@ -521,18 +552,16 @@ fn load_reactions_batch_tx(
 
 /// Batch-hydrates a slice of `StoredMessageRow`s using bulk `IN (...)` queries instead of
 /// per-row N+1 lookups. Preserves input ordering and exact `MessageView` semantics.
-pub fn hydrate_message_views_batch_tx(
-    conn: &Connection,
+pub async fn hydrate_message_views_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     rows: &[StoredMessageRow],
 ) -> BoardResult<Vec<MessageView>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    let handles = actors::resolve_actor_handles_batch_tx(
-        conn,
-        rows.iter().map(|r| r.by_actor.as_str()),
-    )?;
+    let author_ids: Vec<&str> = rows.iter().map(|r| r.by_actor.as_str()).collect();
+    let handles = actors::resolve_actor_handles_batch_tx(conn, &author_ids).await?;
 
     let active_ids: Vec<&str> = rows
         .iter()
@@ -545,11 +574,12 @@ pub fn hydrate_message_views_batch_tx(
         .map(|r| r.id.as_str())
         .collect();
 
-    let mut labels_map = labels::load_messages_labels_batch_tx(conn, &active_ids)?;
-    let mut reactions_map = load_reactions_batch_tx(conn, &active_ids)?;
-    let mut attachments_map = attachments::load_messages_attachments_batch_tx(conn, &active_ids)?;
-    let mut blocks_map = schemas::load_messages_blocks_batch_tx(conn, &active_ids)?;
-    let mut tasks_map = tasks::load_task_views_batch_tx(conn, &root_ids)?;
+    let mut labels_map = labels::load_messages_labels_batch_tx(conn, &active_ids).await?;
+    let mut reactions_map = load_reactions_batch_tx(conn, &active_ids).await?;
+    let mut attachments_map =
+        attachments::load_messages_attachments_batch_tx(conn, &active_ids).await?;
+    let mut blocks_map = schemas::load_messages_blocks_batch_tx(conn, &active_ids).await?;
+    let mut tasks_map = tasks::load_task_views_batch_tx(conn, &root_ids).await?;
 
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
@@ -604,8 +634,8 @@ pub fn hydrate_message_views_batch_tx(
     Ok(views)
 }
 
-fn visible_actors_for_caller_tx(
-    conn: &Connection,
+async fn visible_actors_for_caller_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     board_grants: &[grants::Grant],
     caller: &CallerContext,
@@ -615,10 +645,11 @@ fn visible_actors_for_caller_tx(
     actors::list_board_actors(conn, board_id, has_wildcard_read, |ch| {
         grants::caller_permissions_on_channel(board_grants, caller, ch).can_read()
     })
+    .await
 }
 
-fn check_idempotency_tx(
-    conn: &Connection,
+async fn check_idempotency_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     caller_actor: &str,
     key: &str,
@@ -626,27 +657,24 @@ fn check_idempotency_tx(
     expected_channel: &str,
     expected_root: Option<&str>,
 ) -> BoardResult<Option<MessageView>> {
-    let row: Option<(String, String, Option<String>, String)> = conn
-        .query_row(
+    let row = conn
+        .fetch_optional(
             "SELECT scope_kind, channel, thread_root, message_id
              FROM idempotency_keys
              WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
-            params![board_id, caller_actor, key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            sql_args![board_id, caller_actor, key],
         )
-        .optional()?;
+        .await?;
 
-    let Some((scope, ch, root, msg_id)) = row else {
-        // Also reject keys already used for a task batch (`task_batches`) -> 409 duplicate_id
-        let used_in_batch: bool = conn
-            .query_row(
+    let Some(r) = row else {
+        let used_in_batch = conn
+            .fetch_optional(
                 "SELECT 1 FROM task_batches
                  WHERE board_id = ?1 AND caller_actor = ?2 AND idempotency_key = ?3",
-                params![board_id, caller_actor, key],
-                |_| Ok(true),
+                sql_args![board_id, caller_actor, key],
             )
-            .optional()?
-            .unwrap_or(false);
+            .await?
+            .is_some();
         if used_in_batch {
             return Err(BoardError::new(
                 ErrorCode::DuplicateId,
@@ -656,6 +684,11 @@ fn check_idempotency_tx(
         return Ok(None);
     };
 
+    let scope = r.get_str(0)?;
+    let ch = r.get_str(1)?;
+    let root = r.get_opt_str(2)?;
+    let msg_id = r.get_str(3)?;
+
     if scope != expected_scope || ch != expected_channel || root.as_deref() != expected_root {
         return Err(BoardError::new(
             ErrorCode::DuplicateId,
@@ -663,10 +696,10 @@ fn check_idempotency_tx(
         ));
     }
 
-    let stored = load_stored_message_tx(conn, board_id, &msg_id)?.ok_or_else(|| {
-        BoardError::internal("idempotency key points to missing message")
-    })?;
-    Ok(Some(hydrate_message_view_tx(conn, &stored)?))
+    let stored = load_stored_message_tx(conn, board_id, &msg_id)
+        .await?
+        .ok_or_else(|| BoardError::internal("idempotency key points to missing message"))?;
+    Ok(Some(hydrate_message_view_tx(conn, &stored).await?))
 }
 
 struct IdempotencyRecord<'a> {
@@ -680,11 +713,14 @@ struct IdempotencyRecord<'a> {
     now: &'a str,
 }
 
-fn store_idempotency_tx(conn: &Connection, rec: IdempotencyRecord<'_>) -> BoardResult<()> {
+async fn store_idempotency_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    rec: IdempotencyRecord<'_>,
+) -> BoardResult<()> {
     conn.execute(
         "INSERT INTO idempotency_keys (board_id, caller_actor, key, scope_kind, channel, thread_root, message_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
+        sql_args![
             rec.board_id,
             rec.caller_actor,
             rec.key,
@@ -694,25 +730,30 @@ fn store_idempotency_tx(conn: &Connection, rec: IdempotencyRecord<'_>) -> BoardR
             rec.message_id,
             rec.now
         ],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-fn store_mentions_tx(
-    conn: &Connection,
+async fn store_mentions_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     message_id: &str,
     actor_ids: &[String],
 ) -> BoardResult<()> {
     conn.execute(
         "DELETE FROM message_mentions WHERE message_id = ?1",
-        params![message_id],
-    )?;
+        sql_args![message_id],
+    )
+    .await?;
     for aid in actor_ids {
         conn.execute(
-            "INSERT OR IGNORE INTO message_mentions (board_id, message_id, actor_id) VALUES (?1, ?2, ?3)",
-            params![board_id, message_id, aid],
-        )?;
+            "INSERT INTO message_mentions (board_id, message_id, actor_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (message_id, actor_id) DO NOTHING",
+            sql_args![board_id, message_id, aid],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -721,19 +762,22 @@ fn store_mentions_tx(
 ///
 /// - Implicitly creates the channel if it doesn't exist (requires `read` + `post`).
 /// - Posting to an existing channel requires only `post` (blind intake).
-pub fn post_message(
+pub async fn post_message(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
     input: PostMessageInput,
 ) -> BoardResult<PostedMessageResult> {
-    db.with_tx(|tx| post_message_in_tx(tx, board_id, caller, input))
+    let mut tx = db.begin_tx().await?;
+    let res = post_message_in_tx(&mut tx, board_id, caller, input).await?;
+    tx.commit().await?;
+    Ok(res)
 }
 
-/// Transaction-scoped version of `post_message` so callers (e.g., `tasks::create_task` and
-/// `tasks::create_many_tasks`) can atomically compose message creation with other writes.
-pub fn post_message_in_tx(
-    tx: &Connection,
+/// Transaction-scoped version of `post_message` so callers (e.g., `tasks::create_task`,
+/// `tasks::create_many_tasks`, and atomic scheduler) can compose message creation with other writes.
+pub async fn post_message_in_tx(
+    tx: &mut DbTx,
     board_id: &str,
     caller: &CallerContext,
     input: PostMessageInput,
@@ -749,17 +793,16 @@ pub fn post_message_in_tx(
         labels::validate_user_labels(&input.labels)?;
     }
 
-    let board_grants = grants::load_grants_tx(tx, board_id)?;
+    let board_grants = grants::load_grants_tx(tx, board_id).await?;
     let perms = grants::caller_permissions_on_channel(&board_grants, caller, &input.channel);
 
-    let channel_exists: bool = tx
-        .query_row(
+    let channel_exists = tx
+        .fetch_optional(
             "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
-            params![board_id, input.channel],
-            |_| Ok(true),
+            sql_args![board_id, &input.channel],
         )
-        .optional()?
-        .unwrap_or(false);
+        .await?
+        .is_some();
 
     if channel_exists {
         if !perms.can_post_new_thread() {
@@ -783,6 +826,8 @@ pub fn post_message_in_tx(
 
     let actor_id = caller.actor_id();
     if let Some(idem_key) = &input.id {
+        tx.advisory_xact_lock("idem", &format!("{board_id}:{actor_id}:{idem_key}"))
+            .await?;
         if let Some(existing) = check_idempotency_tx(
             tx,
             board_id,
@@ -791,7 +836,9 @@ pub fn post_message_in_tx(
             "post",
             &input.channel,
             None,
-        )? {
+        )
+        .await?
+        {
             return Ok(PostedMessageResult {
                 message: existing,
                 mentions: Vec::new(),
@@ -802,23 +849,26 @@ pub fn post_message_in_tx(
     }
 
     let parsed_blocks =
-        schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
+        schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref()).await?;
 
     let now = Utc::now().to_rfc3339();
     if !channel_exists {
         tx.execute(
-            "INSERT INTO channels (board_id, path, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![board_id, input.channel, actor_id, now],
-        )?;
+            "INSERT INTO channels (board_id, path, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (board_id, path) DO NOTHING",
+            sql_args![board_id, &input.channel, &actor_id, &now],
+        )
+        .await?;
     }
 
-    actors::record_actor_write_tx(tx, board_id, &input.channel, caller)?;
+    actors::record_actor_write_tx(tx, board_id, &input.channel, caller).await?;
 
-    let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
+    let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller).await?;
     let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
 
     let msg_id = new_message_id();
-    let seq = next_msg_seq_tx(tx, board_id)?;
+    let seq = next_msg_seq_tx(tx, board_id).await?;
     let by_principal = caller.principal_id();
     let by_profile = caller.profile.as_ref().map(|p| p.name_lower.clone());
 
@@ -828,22 +878,23 @@ pub fn post_message_in_tx(
             by_actor, by_principal, by_profile, from_source, no_sync,
             revision, deleted_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, NULL, ?9, 1, NULL, ?10, ?10)",
-        params![
-            msg_id,
+        sql_args![
+            &msg_id,
             board_id,
             seq,
-            input.channel,
-            resolved_mentions.text,
-            actor_id,
-            by_principal,
-            by_profile,
+            &input.channel,
+            &resolved_mentions.text,
+            &actor_id,
+            &by_principal,
+            &by_profile,
             i64::from(input.no_sync),
-            now
+            &now
         ],
-    )?;
-    record_thread_message_tx(tx, board_id, &input.channel, &msg_id, seq, None)?;
+    )
+    .await?;
+    record_thread_message_tx(tx, board_id, &input.channel, &msg_id, seq, None).await?;
 
-    store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+    store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids).await?;
     if !input.attachments.is_empty() {
         attachments::validate_and_link_attachments_tx(
             tx,
@@ -852,13 +903,14 @@ pub fn post_message_in_tx(
             caller,
             &msg_id,
             &input.attachments,
-        )?;
+        )
+        .await?;
     }
     if !input.labels.is_empty() {
-        labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
+        labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels).await?;
     }
     if !parsed_blocks.is_empty() {
-        schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
+        schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks).await?;
     }
 
     if let Some(idem_key) = &input.id {
@@ -874,13 +926,15 @@ pub fn post_message_in_tx(
                 message_id: &msg_id,
                 now: &now,
             },
-        )?;
+        )
+        .await?;
     }
 
-    let stored = load_stored_message_tx(tx, board_id, &msg_id)?
+    let stored = load_stored_message_tx(tx, board_id, &msg_id)
+        .await?
         .expect("inserted message must exist");
-    let snap = build_message_snapshot_tx(tx, &stored)?;
-    let view = hydrate_message_view_tx(tx, &stored)?;
+    let snap = build_message_snapshot_tx(tx, &stored).await?;
+    let view = hydrate_message_view_tx(tx, &stored).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -894,8 +948,9 @@ pub fn post_message_in_tx(
             after_snapshot: Some(&snap),
             after_message: Some(&view),
         },
-    )?;
-    let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "post", None)?;
+    )
+    .await?;
+    let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "post", None).await?;
     Ok(PostedMessageResult {
         message: view,
         mentions: resolved_mentions.mentions,
@@ -907,8 +962,22 @@ pub fn post_message_in_tx(
 /// Replies in a thread identified by `target_message_id` (root or any reply).
 ///
 /// Requires `read` + `post` in the thread's channel.
-pub fn reply_message(
+pub async fn reply_message(
     db: &Database,
+    board_id: &str,
+    target_message_id: &str,
+    caller: &CallerContext,
+    input: ReplyMessageInput,
+) -> BoardResult<PostedMessageResult> {
+    let mut tx = db.begin_tx().await?;
+    let res = reply_message_in_tx(&mut tx, board_id, target_message_id, caller, input).await?;
+    tx.commit().await?;
+    Ok(res)
+}
+
+/// Transaction-scoped version of `reply_message` (enables single-tx atomic scheduler firing).
+pub async fn reply_message_in_tx(
+    tx: &mut DbTx,
     board_id: &str,
     target_message_id: &str,
     caller: &CallerContext,
@@ -924,186 +993,204 @@ pub fn reply_message(
         labels::validate_user_labels(&input.labels)?;
     }
 
-    db.with_tx(|tx| {
-        let target = load_stored_message_tx(tx, board_id, target_message_id)?.ok_or_else(|| {
+    let target = load_stored_message_tx(tx, board_id, target_message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{target_message_id}' not found"),
             )
         })?;
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &target.channel);
-        if !perms.can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{target_message_id}' not found"),
-            ));
-        }
-        if !perms.can_reply() {
-            return Err(BoardError::forbidden(format!(
-                "replying in '{}' requires 'read' and 'post' permissions",
-                target.channel
-            )));
-        }
-        if !input.labels.is_empty() && !perms.can_label() {
-            return Err(BoardError::forbidden(format!(
-                "setting labels in '{}' requires 'label' permission",
-                target.channel
-            )));
-        }
+    let board_grants = grants::load_grants_tx(tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &target.channel);
+    if !perms.can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{target_message_id}' not found"),
+        ));
+    }
+    if !perms.can_reply() {
+        return Err(BoardError::forbidden(format!(
+            "replying in '{}' requires 'read' and 'post' permissions",
+            target.channel
+        )));
+    }
+    if !input.labels.is_empty() && !perms.can_label() {
+        return Err(BoardError::forbidden(format!(
+            "setting labels in '{}' requires 'label' permission",
+            target.channel
+        )));
+    }
 
-        let root_id = target.re.clone().unwrap_or_else(|| target.id.clone());
-        let reply_to = if target.re.is_some() {
-            Some(target.id.clone())
-        } else {
-            None
-        };
+    let root_id = target.re.clone().unwrap_or_else(|| target.id.clone());
+    let reply_to = if target.re.is_some() {
+        Some(target.id.clone())
+    } else {
+        None
+    };
 
-        let actor_id = caller.actor_id();
-        if let Some(idem_key) = &input.id {
-            if let Some(existing) = check_idempotency_tx(
-                tx,
-                board_id,
-                &actor_id,
-                idem_key,
-                "reply",
-                &target.channel,
-                Some(&root_id),
-            )? {
-                return Ok(PostedMessageResult {
-                    message: existing,
-                    mentions: Vec::new(),
-                    replayed: true,
-                    event_seq: None,
-                });
-            }
+    let actor_id = caller.actor_id();
+    if let Some(idem_key) = &input.id {
+        tx.advisory_xact_lock("idem", &format!("{board_id}:{actor_id}:{idem_key}"))
+            .await?;
+        if let Some(existing) = check_idempotency_tx(
+            tx,
+            board_id,
+            &actor_id,
+            idem_key,
+            "reply",
+            &target.channel,
+            Some(&root_id),
+        )
+        .await?
+        {
+            return Ok(PostedMessageResult {
+                message: existing,
+                mentions: Vec::new(),
+                replayed: true,
+                event_seq: None,
+            });
         }
+    }
 
-        // Concurrency guard: `after` must still be the thread's latest message
-        if let Some(expected_after) = &input.after {
-            let latest_id: String = tx.query_row(
+    // Lock thread root row on Postgres before checking `--after` and updating `threads` summary.
+    let lock_root_sql = format!(
+        "SELECT id FROM messages WHERE board_id = ?1 AND id = ?2{}",
+        tx.lock_row_suffix()
+    );
+    let _ = tx.fetch_one(&lock_root_sql, sql_args![board_id, &root_id]).await?;
+
+    // Concurrency guard: `after` must still be the thread's latest message
+    if let Some(expected_after) = &input.after {
+        let latest_id = tx
+            .fetch_one(
                 "SELECT id FROM messages
                  WHERE board_id = ?1 AND (id = ?2 OR re = ?2)
                  ORDER BY seq DESC LIMIT 1",
-                params![board_id, root_id],
-                |r| r.get(0),
-            )?;
-            if &latest_id != expected_after {
-                return Err(BoardError::new(
-                    ErrorCode::NewerMessage,
-                    format!(
-                        "thread '{root_id}' has a newer message ('{latest_id}') than '{expected_after}'"
-                    ),
-                ));
-            }
+                sql_args![board_id, &root_id],
+            )
+            .await?
+            .get_str(0)?;
+        if &latest_id != expected_after {
+            return Err(BoardError::new(
+                ErrorCode::NewerMessage,
+                format!(
+                    "thread '{root_id}' has a newer message ('{latest_id}') than '{expected_after}'"
+                ),
+            ));
         }
+    }
 
-        let parsed_blocks =
-            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
+    let parsed_blocks =
+        schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref()).await?;
 
-        let now = Utc::now().to_rfc3339();
-        actors::record_actor_write_tx(tx, board_id, &target.channel, caller)?;
+    let now = Utc::now().to_rfc3339();
+    actors::record_actor_write_tx(tx, board_id, &target.channel, caller).await?;
 
-        let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
-        let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
+    let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller).await?;
+    let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
 
-        let msg_id = new_message_id();
-        let seq = next_msg_seq_tx(tx, board_id)?;
-        let by_principal = caller.principal_id();
-        let by_profile = caller.profile.as_ref().map(|p| p.name_lower.clone());
+    let msg_id = new_message_id();
+    let seq = next_msg_seq_tx(tx, board_id).await?;
+    let by_principal = caller.principal_id();
+    let by_profile = caller.profile.as_ref().map(|p| p.name_lower.clone());
 
-        tx.execute(
-            "INSERT INTO messages (
-                id, board_id, seq, channel, re, reply_to, text,
-                by_actor, by_principal, by_profile, from_source, no_sync,
-                revision, deleted_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 1, NULL, ?12, ?12)",
-            params![
-                msg_id,
-                board_id,
-                seq,
-                target.channel,
-                root_id,
-                reply_to,
-                resolved_mentions.text,
-                actor_id,
-                by_principal,
-                by_profile,
-                i64::from(input.no_sync),
-                now
-            ],
-        )?;
-        record_thread_message_tx(tx, board_id, &target.channel, &msg_id, seq, Some(&root_id))?;
+    tx.execute(
+        "INSERT INTO messages (
+            id, board_id, seq, channel, re, reply_to, text,
+            by_actor, by_principal, by_profile, from_source, no_sync,
+            revision, deleted_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 1, NULL, ?12, ?12)",
+        sql_args![
+            &msg_id,
+            board_id,
+            seq,
+            &target.channel,
+            &root_id,
+            &reply_to,
+            &resolved_mentions.text,
+            &actor_id,
+            &by_principal,
+            &by_profile,
+            i64::from(input.no_sync),
+            &now
+        ],
+    )
+    .await?;
+    record_thread_message_tx(tx, board_id, &target.channel, &msg_id, seq, Some(&root_id)).await?;
 
-        store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
-        if !input.attachments.is_empty() {
-            attachments::validate_and_link_attachments_tx(
-                tx,
-                board_id,
-                &board_grants,
-                caller,
-                &msg_id,
-                &input.attachments,
-            )?;
-        }
-        if !input.labels.is_empty() {
-            labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
-        }
-        if !parsed_blocks.is_empty() {
-            schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks)?;
-        }
-
-        if let Some(idem_key) = &input.id {
-            store_idempotency_tx(
-                tx,
-                IdempotencyRecord {
-                    board_id,
-                    caller_actor: &actor_id,
-                    key: idem_key,
-                    scope: "reply",
-                    channel: &target.channel,
-                    thread_root: Some(&root_id),
-                    message_id: &msg_id,
-                    now: &now,
-                },
-            )?;
-        }
-
-        let stored = load_stored_message_tx(tx, board_id, &msg_id)?
-            .expect("inserted reply must exist");
-        let snap = build_message_snapshot_tx(tx, &stored)?;
-        let view = hydrate_message_view_tx(tx, &stored)?;
-        let ev = events::append_event_tx(
+    store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids).await?;
+    if !input.attachments.is_empty() {
+        attachments::validate_and_link_attachments_tx(
             tx,
-            EventAppend {
+            board_id,
+            &board_grants,
+            caller,
+            &msg_id,
+            &input.attachments,
+        )
+        .await?;
+    }
+    if !input.labels.is_empty() {
+        labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels).await?;
+    }
+    if !parsed_blocks.is_empty() {
+        schemas::store_message_blocks_tx(tx, board_id, &msg_id, &parsed_blocks).await?;
+    }
+
+    if let Some(idem_key) = &input.id {
+        store_idempotency_tx(
+            tx,
+            IdempotencyRecord {
                 board_id,
-                event_type: EventType::MessagePosted,
-                channel: Some(&target.channel),
-                message_id: Some(&msg_id),
-                actor_id: Some(&actor_id),
-                payload: serde_json::json!({
-                    "channel": target.channel,
-                    "re": root_id,
-                    "replyTo": reply_to
-                }),
-                before_snapshot: None,
-                after_snapshot: Some(&snap),
-                after_message: Some(&view),
+                caller_actor: &actor_id,
+                key: idem_key,
+                scope: "reply",
+                channel: &target.channel,
+                thread_root: Some(&root_id),
+                message_id: &msg_id,
+                now: &now,
             },
-        )?;
-        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "reply", None)?;
-        Ok(PostedMessageResult {
-            message: view,
-            mentions: resolved_mentions.mentions,
-            replayed: false,
-            event_seq: Some(ev.seq),
-        })
+        )
+        .await?;
+    }
+
+    let stored = load_stored_message_tx(tx, board_id, &msg_id)
+        .await?
+        .expect("inserted reply must exist");
+    let snap = build_message_snapshot_tx(tx, &stored).await?;
+    let view = hydrate_message_view_tx(tx, &stored).await?;
+    let ev = events::append_event_tx(
+        tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::MessagePosted,
+            channel: Some(&target.channel),
+            message_id: Some(&msg_id),
+            actor_id: Some(&actor_id),
+            payload: serde_json::json!({
+                "channel": target.channel,
+                "re": root_id,
+                "replyTo": reply_to
+            }),
+            before_snapshot: None,
+            after_snapshot: Some(&snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "reply", None).await?;
+    Ok(PostedMessageResult {
+        message: view,
+        mentions: resolved_mentions.mentions,
+        replayed: false,
+        event_seq: Some(ev.seq),
     })
 }
 
 /// Edits a message's text. Only the author (or bare principal for its profiles) can edit.
-pub fn edit_message(
+pub async fn edit_message(
     db: &Database,
     board_id: &str,
     message_id: &str,
@@ -1112,207 +1199,253 @@ pub fn edit_message(
 ) -> BoardResult<(MessageView, Vec<MentionResolution>, Vec<i64>)> {
     validate_text_length(&input.text)?;
 
-    db.with_tx(|tx| {
-        let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
+    let mut tx = db.begin_tx().await?;
+    let msg = load_stored_message_for_update_tx(&mut tx, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
-        let is_author = caller.owns_actor_item(&msg.by_actor);
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
+    let is_author = caller.owns_actor_item(&msg.by_actor);
 
-        // Blind-intake author with `post` can still edit their own message
-        if !(is_author && perms.can_post_new_thread()) {
-            if !perms.can_read() {
-                return Err(BoardError::new(
-                    ErrorCode::MessageNotFound,
-                    format!("message '{message_id}' not found"),
-                ));
-            }
-            return Err(BoardError::forbidden(
-                "only the message author can edit a message",
-            ));
-        }
-
-        if let Some(expected_rev) = input.revision {
-            if expected_rev != msg.revision {
-                return Err(BoardError::new(
-                    ErrorCode::RevisionConflict,
-                    format!(
-                        "message '{message_id}' is at revision {}, expected {expected_rev}",
-                        msg.revision
-                    ),
-                ));
-            }
-        }
-
-        if msg.deleted_at.is_some() {
+    if !(is_author && perms.can_post_new_thread()) {
+        if !perms.can_read() {
             return Err(BoardError::new(
-                ErrorCode::MessageDeleted,
-                format!("message '{message_id}' has been deleted"),
+                ErrorCode::MessageNotFound,
+                format!("message '{message_id}' not found"),
             ));
         }
+        return Err(BoardError::forbidden(
+            "only the message author can edit a message",
+        ));
+    }
 
-        if input.text.is_empty() && attachments::load_message_attachments_tx(tx, message_id)?.is_empty() {
-            return Err(BoardError::bad_request(
-                "edited text cannot be empty unless the message has attachments",
+    if let Some(expected_rev) = input.revision {
+        if expected_rev != msg.revision {
+            return Err(BoardError::new(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "message '{message_id}' is at revision {}, expected {expected_rev}",
+                    msg.revision
+                ),
             ));
         }
+    }
 
-        let before_snap = build_message_snapshot_tx(tx, &msg)?;
-        let parsed_blocks =
-            schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
-        let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
-        let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
-        let now = Utc::now().to_rfc3339();
-        let next_rev = msg.revision + 1;
+    if msg.deleted_at.is_some() {
+        return Err(BoardError::new(
+            ErrorCode::MessageDeleted,
+            format!("message '{message_id}' has been deleted"),
+        ));
+    }
 
-        tx.execute(
+    if input.text.is_empty()
+        && attachments::load_message_attachments_tx(&mut tx, message_id)
+            .await?
+            .is_empty()
+    {
+        return Err(BoardError::bad_request(
+            "edited text cannot be empty unless the message has attachments",
+        ));
+    }
+
+    let before_snap = build_message_snapshot_tx(&mut tx, &msg).await?;
+    let parsed_blocks =
+        schemas::parse_and_validate_blocks_tx(&mut tx, &input.text, input.schema.as_deref())
+            .await?;
+    let visible_actors =
+        visible_actors_for_caller_tx(&mut tx, board_id, &board_grants, caller).await?;
+    let resolved_mentions = mentions::resolve_mentions(&input.text, &visible_actors);
+    let now = Utc::now().to_rfc3339();
+    let next_rev = msg.revision + 1;
+
+    let updated_rows = tx
+        .execute(
             "UPDATE messages SET text = ?1, revision = ?2, updated_at = ?3
-             WHERE board_id = ?4 AND id = ?5",
-            params![resolved_mentions.text, next_rev, now, board_id, message_id],
-        )?;
-        store_mentions_tx(tx, board_id, message_id, &resolved_mentions.actor_ids)?;
-        schemas::store_message_blocks_tx(tx, board_id, message_id, &parsed_blocks)?;
-
-        let updated = load_stored_message_tx(tx, board_id, message_id)?.unwrap();
-        let after_snap = build_message_snapshot_tx(tx, &updated)?;
-        let view = hydrate_message_view_tx(tx, &updated)?;
-        let actor_id = caller.actor_id();
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
+             WHERE board_id = ?4 AND id = ?5 AND revision = ?6",
+            sql_args![
+                &resolved_mentions.text,
+                next_rev,
+                &now,
                 board_id,
-                event_type: EventType::MessageEdited,
-                channel: Some(&msg.channel),
-                message_id: Some(message_id),
-                actor_id: Some(&actor_id),
-                payload: serde_json::json!({ "revision": next_rev }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        let mut seqs = vec![ev.seq];
-        if msg.re.is_none() {
-            if let Some(task_seq) = tasks::on_root_edited_tx(tx, board_id, message_id, caller)? {
-                seqs.push(task_seq);
-            }
+                message_id,
+                msg.revision
+            ],
+        )
+        .await?;
+    if updated_rows == 0 {
+        return Err(BoardError::new(
+            ErrorCode::RevisionConflict,
+            format!("message '{message_id}' was concurrently modified"),
+        ));
+    }
+    store_mentions_tx(&mut tx, board_id, message_id, &resolved_mentions.actor_ids).await?;
+    schemas::store_message_blocks_tx(&mut tx, board_id, message_id, &parsed_blocks).await?;
+
+    let updated = load_stored_message_tx(&mut tx, board_id, message_id)
+        .await?
+        .unwrap();
+    let after_snap = build_message_snapshot_tx(&mut tx, &updated).await?;
+    let view = hydrate_message_view_tx(&mut tx, &updated).await?;
+    let actor_id = caller.actor_id();
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::MessageEdited,
+            channel: Some(&msg.channel),
+            message_id: Some(message_id),
+            actor_id: Some(&actor_id),
+            payload: serde_json::json!({ "revision": next_rev }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    let mut seqs = vec![ev.seq];
+    if msg.re.is_none() {
+        if let Some(task_seq) =
+            tasks::on_root_edited_tx(&mut tx, board_id, message_id, caller).await?
+        {
+            seqs.push(task_seq);
         }
-        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, message_id, "edit", None)?;
-        let final_view = hydrate_message_view_tx(tx, &updated)?;
-        Ok((final_view, resolved_mentions.mentions, seqs))
-    })
+    }
+    let _ = sync::enqueue_outbound_for_message_tx(&mut tx, board_id, message_id, "edit", None)
+        .await?;
+    let final_view = hydrate_message_view_tx(&mut tx, &updated).await?;
+    tx.commit().await?;
+    Ok((final_view, resolved_mentions.mentions, seqs))
 }
 
 /// Deletes (tombstones) a message.
 ///
 /// Allowed for author (or bare principal for its profiles) OR team owner with `manage` in channel.
 /// Repeat delete on an already-deleted message is an idempotent no-op.
-pub fn delete_message(
+pub async fn delete_message(
     db: &Database,
     board_id: &str,
     message_id: &str,
     caller: &CallerContext,
     input: DeleteMessageInput,
 ) -> BoardResult<Vec<i64>> {
-    db.with_tx(|tx| {
-        let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
+    let mut tx = db.begin_tx().await?;
+    let msg = load_stored_message_for_update_tx(&mut tx, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
-        let is_author = caller.owns_actor_item(&msg.by_actor);
-        let owner_can_moderate =
-            caller.principal.is_owner() && !caller.is_restricted() && perms.can_manage();
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
+    let is_author = caller.owns_actor_item(&msg.by_actor);
+    let owner_can_moderate =
+        caller.principal.is_owner() && !caller.is_restricted() && perms.can_manage();
 
-        if !(is_author && perms.can_post_new_thread()) && !owner_can_moderate {
-            if !perms.can_read() {
-                return Err(BoardError::new(
-                    ErrorCode::MessageNotFound,
-                    format!("message '{message_id}' not found"),
-                ));
-            }
-            return Err(BoardError::forbidden(
-                "only the message author or a team owner with 'manage' in the channel can delete this message",
+    if !(is_author && perms.can_post_new_thread()) && !owner_can_moderate {
+        if !perms.can_read() {
+            return Err(BoardError::new(
+                ErrorCode::MessageNotFound,
+                format!("message '{message_id}' not found"),
             ));
         }
+        return Err(BoardError::forbidden(
+            "only the message author or a team owner with 'manage' in the channel can delete this message",
+        ));
+    }
 
-        if let Some(expected_rev) = input.revision {
-            if expected_rev != msg.revision {
-                return Err(BoardError::new(
-                    ErrorCode::RevisionConflict,
-                    format!(
-                        "message '{message_id}' is at revision {}, expected {expected_rev}",
-                        msg.revision
-                    ),
-                ));
-            }
+    if let Some(expected_rev) = input.revision {
+        if expected_rev != msg.revision {
+            return Err(BoardError::new(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "message '{message_id}' is at revision {}, expected {expected_rev}",
+                    msg.revision
+                ),
+            ));
         }
+    }
 
-        if msg.deleted_at.is_some() {
-            return Ok(Vec::new());
-        }
+    if msg.deleted_at.is_some() {
+        tx.commit().await?;
+        return Ok(Vec::new());
+    }
 
-        let before_snap = build_message_snapshot_tx(tx, &msg)?;
-        let now = Utc::now().to_rfc3339();
-        let next_rev = msg.revision + 1;
-        tx.execute(
+    let before_snap = build_message_snapshot_tx(&mut tx, &msg).await?;
+    let now = Utc::now().to_rfc3339();
+    let next_rev = msg.revision + 1;
+    let updated_rows = tx
+        .execute(
             "UPDATE messages SET text = '', deleted_at = ?1, revision = ?2, updated_at = ?1
-             WHERE board_id = ?3 AND id = ?4",
-            params![now, next_rev, board_id, message_id],
-        )?;
-        tx.execute(
-            "DELETE FROM message_reactions WHERE message_id = ?1",
-            params![message_id],
-        )?;
-        tx.execute(
-            "DELETE FROM message_mentions WHERE message_id = ?1",
-            params![message_id],
-        )?;
-        labels::delete_message_labels_tx(tx, message_id)?;
-        schemas::delete_message_blocks_tx(tx, message_id)?;
+             WHERE board_id = ?3 AND id = ?4 AND revision = ?5",
+            sql_args![&now, next_rev, board_id, message_id, msg.revision],
+        )
+        .await?;
+    if updated_rows == 0 {
+        return Err(BoardError::new(
+            ErrorCode::RevisionConflict,
+            format!("message '{message_id}' was concurrently modified"),
+        ));
+    }
+    tx.execute(
+        "DELETE FROM message_reactions WHERE message_id = ?1",
+        sql_args![message_id],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM message_mentions WHERE message_id = ?1",
+        sql_args![message_id],
+    )
+    .await?;
+    labels::delete_message_labels_tx(&mut tx, message_id).await?;
+    schemas::delete_message_blocks_tx(&mut tx, message_id).await?;
 
-        let updated = load_stored_message_tx(tx, board_id, message_id)?.unwrap();
-        let after_snap = build_message_snapshot_tx(tx, &updated)?;
-        let view = hydrate_message_view_tx(tx, &updated)?;
-        let actor_id = caller.actor_id();
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::MessageDeleted,
-                channel: Some(&msg.channel),
-                message_id: Some(message_id),
-                actor_id: Some(&actor_id),
-                payload: serde_json::json!({ "revision": next_rev }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        let mut seqs = vec![ev.seq];
-        if msg.re.is_none() {
-            if let Some(task_seq) = tasks::on_root_deleted_tx(tx, board_id, message_id, &actor_id)?
-            {
-                seqs.push(task_seq);
-            }
+    let updated = load_stored_message_tx(&mut tx, board_id, message_id)
+        .await?
+        .unwrap();
+    let after_snap = build_message_snapshot_tx(&mut tx, &updated).await?;
+    let view = hydrate_message_view_tx(&mut tx, &updated).await?;
+    let actor_id = caller.actor_id();
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::MessageDeleted,
+            channel: Some(&msg.channel),
+            message_id: Some(message_id),
+            actor_id: Some(&actor_id),
+            payload: serde_json::json!({ "revision": next_rev }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    let mut seqs = vec![ev.seq];
+    if msg.re.is_none() {
+        if let Some(task_seq) =
+            tasks::on_root_deleted_tx(&mut tx, board_id, message_id, &actor_id).await?
+        {
+            seqs.push(task_seq);
         }
-        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, message_id, "delete", None)?;
+    }
+    let _ = sync::enqueue_outbound_for_message_tx(&mut tx, board_id, message_id, "delete", None)
+        .await?;
+    tx.commit().await?;
 
-        Ok(seqs)
-    })
+    Ok(seqs)
 }
 
 /// Adds or removes a normalized emoji reaction on a message.
-pub fn react_message(
+pub async fn react_message(
     db: &Database,
     board_id: &str,
     message_id: &str,
@@ -1321,210 +1454,227 @@ pub fn react_message(
 ) -> BoardResult<(String, Option<i64>)> {
     let emoji = normalize_emoji(&input.emoji)?;
 
-    db.with_tx(|tx| {
-        let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
+    let mut tx = db.begin_tx().await?;
+    let msg = load_stored_message_tx(&mut tx, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
-        if !perms.can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{message_id}' not found"),
-            ));
-        }
-        if !perms.can_react() {
-            return Err(BoardError::forbidden(format!(
-                "reacting in '{}' requires 'react' permission",
-                msg.channel
-            )));
-        }
-        if msg.deleted_at.is_some() {
-            return Err(BoardError::new(
-                ErrorCode::MessageDeleted,
-                format!("cannot react to deleted message '{message_id}'"),
-            ));
-        }
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
+    if !perms.can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{message_id}' not found"),
+        ));
+    }
+    if !perms.can_react() {
+        return Err(BoardError::forbidden(format!(
+            "reacting in '{}' requires 'react' permission",
+            msg.channel
+        )));
+    }
+    if msg.deleted_at.is_some() {
+        return Err(BoardError::new(
+            ErrorCode::MessageDeleted,
+            format!("cannot react to deleted message '{message_id}'"),
+        ));
+    }
 
-        let actor_id = caller.actor_id();
-        let changed = if input.remove {
-            let n = tx.execute(
+    let actor_id = caller.actor_id();
+    let changed = if input.remove {
+        let n = tx
+            .execute(
                 "DELETE FROM message_reactions WHERE message_id = ?1 AND actor_id = ?2 AND emoji = ?3",
-                params![message_id, actor_id, emoji],
-            )?;
-            n > 0
-        } else {
-            actors::record_actor_write_tx(tx, board_id, &msg.channel, caller)?;
-            let now = Utc::now().to_rfc3339();
-            let n = tx.execute(
-                "INSERT OR IGNORE INTO message_reactions (board_id, message_id, emoji, actor_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![board_id, message_id, emoji, actor_id, now],
-            )?;
-            n > 0
-        };
+                sql_args![message_id, &actor_id, &emoji],
+            )
+            .await?;
+        n > 0
+    } else {
+        actors::record_actor_write_tx(&mut tx, board_id, &msg.channel, caller).await?;
+        let now = Utc::now().to_rfc3339();
+        let n = tx
+            .execute(
+                "INSERT INTO message_reactions (board_id, message_id, emoji, actor_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (message_id, actor_id, emoji) DO NOTHING",
+                sql_args![board_id, message_id, &emoji, &actor_id, &now],
+            )
+            .await?;
+        n > 0
+    };
 
-        let event_seq = if changed {
-            let snap = build_message_snapshot_tx(tx, &msg)?;
-            let view = hydrate_message_view_tx(tx, &msg)?;
-            let ev_type = if input.remove {
-                EventType::ReactionRemoved
-            } else {
-                EventType::ReactionAdded
-            };
-            let ev = events::append_event_tx(
-                tx,
-                EventAppend {
-                    board_id,
-                    event_type: ev_type,
-                    channel: Some(&msg.channel),
-                    message_id: Some(message_id),
-                    actor_id: Some(&actor_id),
-                    payload: serde_json::json!({ "emoji": emoji }),
-                    before_snapshot: Some(&snap),
-                    after_snapshot: Some(&snap),
-                    after_message: Some(&view),
-                },
-            )?;
-            let kind = if input.remove { "unreact" } else { "react" };
-            let _ = sync::enqueue_outbound_for_message_tx(
-                tx,
-                board_id,
-                message_id,
-                kind,
-                Some(serde_json::json!({ "emoji": emoji })),
-            )?;
-            Some(ev.seq)
+    let event_seq = if changed {
+        let snap = build_message_snapshot_tx(&mut tx, &msg).await?;
+        let view = hydrate_message_view_tx(&mut tx, &msg).await?;
+        let ev_type = if input.remove {
+            EventType::ReactionRemoved
         } else {
-            None
+            EventType::ReactionAdded
         };
-        Ok((emoji, event_seq))
-    })
+        let ev = events::append_event_tx(
+            &mut tx,
+            EventAppend {
+                board_id,
+                event_type: ev_type,
+                channel: Some(&msg.channel),
+                message_id: Some(message_id),
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({ "emoji": emoji }),
+                before_snapshot: Some(&snap),
+                after_snapshot: Some(&snap),
+                after_message: Some(&view),
+            },
+        )
+        .await?;
+        let kind = if input.remove { "unreact" } else { "react" };
+        let _ = sync::enqueue_outbound_for_message_tx(
+            &mut tx,
+            board_id,
+            message_id,
+            kind,
+            Some(serde_json::json!({ "emoji": emoji })),
+        )
+        .await?;
+        Some(ev.seq)
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok((emoji, event_seq))
 }
 
-pub fn get_posted_by_idempotency_key(
+pub async fn get_posted_by_idempotency_key(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
     key: &str,
 ) -> BoardResult<MessageView> {
-    db.with_conn(|conn| {
-        let actor_id = caller.actor_id();
-        let msg_id: Option<String> = conn
-            .query_row(
-                "SELECT message_id FROM idempotency_keys
-                 WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
-                params![board_id, actor_id, key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(msg_id) = msg_id else {
-            return Err(BoardError::new(
-                ErrorCode::PostNotFound,
-                format!("no post found for idempotency key '{key}'"),
-            ));
-        };
-        let stored = load_stored_message_tx(conn, board_id, &msg_id)?.ok_or_else(|| {
+    let mut conn = db.read_conn();
+    let actor_id = caller.actor_id();
+    let row = conn
+        .fetch_optional(
+            "SELECT message_id FROM idempotency_keys
+             WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
+            sql_args![board_id, &actor_id, key],
+        )
+        .await?;
+    let Some(r) = row else {
+        return Err(BoardError::new(
+            ErrorCode::PostNotFound,
+            format!("no post found for idempotency key '{key}'"),
+        ));
+    };
+    let msg_id = r.get_str(0)?;
+    let stored = load_stored_message_tx(&mut conn, board_id, &msg_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::PostNotFound,
                 format!("no post found for idempotency key '{key}'"),
             )
         })?;
-        hydrate_message_view_tx(conn, &stored)
-    })
+    hydrate_message_view_tx(&mut conn, &stored).await
 }
 
-pub fn get_message(
+pub async fn get_message(
     db: &Database,
     board_id: &str,
     message_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<MessageView> {
-    db.with_conn(|conn| {
-        let stored = load_stored_message_tx(conn, board_id, message_id)?.ok_or_else(|| {
+    let mut conn = db.read_conn();
+    let stored = load_stored_message_tx(&mut conn, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if !grants::caller_permissions_on_channel(&board_grants, caller, &stored.channel).can_read()
-        {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{message_id}' not found"),
-            ));
-        }
-        hydrate_message_view_tx(conn, &stored)
-    })
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if !grants::caller_permissions_on_channel(&board_grants, caller, &stored.channel).can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{message_id}' not found"),
+        ));
+    }
+    hydrate_message_view_tx(&mut conn, &stored).await
 }
 
-pub fn get_thread(
+pub async fn get_thread(
     db: &Database,
     board_id: &str,
     any_message_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<ThreadView> {
-    db.with_conn(|conn| {
-        let target = load_stored_message_tx(conn, board_id, any_message_id)?.ok_or_else(|| {
+    let mut conn = db.read_conn();
+    let target = load_stored_message_tx(&mut conn, board_id, any_message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{any_message_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if !grants::caller_permissions_on_channel(&board_grants, caller, &target.channel).can_read()
-        {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{any_message_id}' not found"),
-            ));
-        }
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if !grants::caller_permissions_on_channel(&board_grants, caller, &target.channel).can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{any_message_id}' not found"),
+        ));
+    }
 
-        let root_id = target.re.unwrap_or(target.id);
-        let root_stored = load_stored_message_tx(conn, board_id, &root_id)?.ok_or_else(|| {
+    let root_id = target.re.unwrap_or(target.id);
+    let root_stored = load_stored_message_tx(&mut conn, board_id, &root_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("thread root '{root_id}' not found"),
             )
         })?;
 
-        let mut stmt = conn.prepare_cached(
+    let rows = conn
+        .fetch_all(
             "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                     by_profile, from_source, no_sync, revision, deleted_at, created_at
              FROM messages
              WHERE board_id = ?1 AND re = ?2
              ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![board_id, root_id], map_stored_row)?;
-        let mut all_rows = Vec::with_capacity(8);
-        all_rows.push(root_stored);
-        for row in rows {
-            all_rows.push(row?);
-        }
+            sql_args![board_id, &root_id],
+        )
+        .await?;
+    let mut all_rows = Vec::with_capacity(rows.len() + 1);
+    all_rows.push(root_stored);
+    for r in &rows {
+        all_rows.push(map_stored_row(r)?);
+    }
 
-        let mut hydrated = hydrate_message_views_batch_tx(conn, &all_rows)?;
-        let root_view = hydrated.remove(0);
-        let replies = hydrated;
+    let mut hydrated = hydrate_message_views_batch_tx(&mut conn, &all_rows).await?;
+    let root_view = hydrated.remove(0);
+    let replies = hydrated;
 
-        let cursor = current_board_cursor_tx(conn, board_id)?;
-        let pending_schedules = schedules::list_pending_thread_schedules_tx(conn, board_id, &root_id)?
+    let cursor = current_board_cursor_tx(&mut conn, board_id).await?;
+    let pending_schedules =
+        schedules::list_pending_thread_schedules_tx(&mut conn, board_id, &root_id)
+            .await?
             .into_iter()
             .map(|s| {
-                serde_json::to_value(s)
-                    .map_err(|e| BoardError::internal(format!("failed to serialize schedule: {e}")))
+                serde_json::to_value(s).map_err(|e| {
+                    BoardError::internal(format!("failed to serialize schedule: {e}"))
+                })
             })
             .collect::<BoardResult<Vec<Value>>>()?;
-        Ok(ThreadView {
-            message: root_view,
-            replies,
-            cursor,
-            schedules: pending_schedules,
-        })
+    Ok(ThreadView {
+        message: root_view,
+        replies,
+        cursor,
+        schedules: pending_schedules,
     })
 }
 
@@ -1570,8 +1720,8 @@ fn cached_can_read_channel(
 }
 
 /// Evaluates `filter` against `row` while skipping unnecessary DB queries for unused filter axes.
-fn row_matches_filter_tx(
-    conn: &Connection,
+async fn row_matches_filter_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     row: &StoredMessageRow,
     filter: &QueryFilter,
     ctx: &FilterContext,
@@ -1609,7 +1759,8 @@ fn row_matches_filter_tx(
         if let Some(h) = handle_cache.get(&row.by_actor) {
             h.clone()
         } else {
-            let h = actors::resolve_actor_view(conn, &row.by_actor)?
+            let h = actors::resolve_actor_view(conn, &row.by_actor)
+                .await?
                 .map(|a| a.handle)
                 .unwrap_or_else(|| row.by_actor.clone());
             handle_cache.insert(row.by_actor.clone(), h.clone());
@@ -1623,14 +1774,14 @@ fn row_matches_filter_tx(
         let own = if deleted {
             BTreeMap::new()
         } else {
-            labels::load_message_labels_tx(conn, &row.id)?
+            labels::load_message_labels_tx(conn, &row.id).await?
         };
         let root_l = match &row.re {
             Some(root_id) => {
                 if let Some(cached) = root_labels_cache.get(root_id) {
                     Some(cached.clone())
                 } else {
-                    let loaded = labels::load_message_labels_tx(conn, root_id)?;
+                    let loaded = labels::load_message_labels_tx(conn, root_id).await?;
                     root_labels_cache.insert(root_id.clone(), loaded.clone());
                     Some(loaded)
                 }
@@ -1648,7 +1799,7 @@ fn row_matches_filter_tx(
     };
 
     let mention_ids = if filter.mentions.is_some() && !deleted {
-        load_mention_ids_tx(conn, &row.id)?
+        load_mention_ids_tx(conn, &row.id).await?
     } else {
         Vec::new()
     };
@@ -1670,8 +1821,8 @@ fn row_matches_filter_tx(
     Ok(filter.matches_snapshot(&snap, ctx))
 }
 
-fn query_filtered_message_rows_tx(
-    conn: &Connection,
+async fn query_filtered_message_rows_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     filter: &QueryFilter,
     after_seq: Option<i64>,
@@ -1681,70 +1832,79 @@ fn query_filtered_message_rows_tx(
         "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                 by_profile, from_source, no_sync, revision, deleted_at, created_at
          FROM messages
-         WHERE board_id = ?",
+         WHERE board_id = ?1",
     );
-    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(board_id.to_string())];
+    let mut bind: Vec<SqlArg<'_>> = vec![SqlArg::from(board_id)];
 
     if let Some(re_id) = &filter.re {
-        sql.push_str(" AND (id = ? OR re = ?)");
-        bind.push(SqlValue::Text(re_id.clone()));
-        bind.push(SqlValue::Text(re_id.clone()));
+        let p = bind.len() + 1;
+        let _ = write!(&mut sql, " AND (id = ?{p} OR re = ?{p})");
+        bind.push(SqlArg::from(re_id.as_str()));
     } else {
         match channel_sql_filter(filter.channel.as_deref()) {
             ChannelSqlFilter::All => {}
             ChannelSqlFilter::Exact(ch) => {
-                sql.push_str(" AND channel = ?");
-                bind.push(SqlValue::Text(ch.to_string()));
+                let p = bind.len() + 1;
+                let _ = write!(&mut sql, " AND channel = ?{p}");
+                bind.push(SqlArg::from(ch));
             }
             ChannelSqlFilter::Subtree { exact, low, high } => {
-                sql.push_str(" AND (channel = ? OR (channel >= ? AND channel < ?))");
-                bind.push(SqlValue::Text(exact.to_string()));
-                bind.push(SqlValue::Text(low));
-                bind.push(SqlValue::Text(high));
+                let p1 = bind.len() + 1;
+                let p2 = p1 + 1;
+                let p3 = p2 + 1;
+                let _ = write!(
+                    &mut sql,
+                    " AND (channel = ?{p1} OR (channel >= ?{p2} AND channel < ?{p3}))"
+                );
+                bind.push(SqlArg::from(exact));
+                bind.push(SqlArg::from(low));
+                bind.push(SqlArg::from(high));
             }
         }
     }
 
     if let Some(a) = after_seq {
-        sql.push_str(" AND seq > ?");
-        bind.push(SqlValue::Integer(a));
+        let p = bind.len() + 1;
+        let _ = write!(&mut sql, " AND seq > ?{p}");
+        bind.push(SqlArg::from(a));
     }
     if let Some(b) = before_seq {
-        sql.push_str(" AND seq < ?");
-        bind.push(SqlValue::Integer(b));
+        let p = bind.len() + 1;
+        let _ = write!(&mut sql, " AND seq < ?{p}");
+        bind.push(SqlArg::from(b));
     }
     sql.push_str(" ORDER BY seq ASC");
 
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bind), map_stored_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    let rows = conn.fetch_all(&sql, &bind).await?;
+    rows.iter().map(map_stored_row).collect()
 }
 
-fn resolve_msg_seq_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) -> BoardResult<i64> {
+async fn resolve_msg_seq_cursor_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+    cursor: &str,
+) -> BoardResult<i64> {
     if cursor == "0" {
         return Ok(0);
     }
-    if let Some(row) = load_stored_message_tx(conn, board_id, cursor)? {
+    if let Some(row) = load_stored_message_tx(conn, board_id, cursor).await? {
         return Ok(row.seq);
     }
     if let Some(ev_seq) = events::parse_event_cursor_seq(cursor) {
-        // Resolve event cursor to the highest message seq posted at or before `ev_seq`
-        let msg_seq: Option<i64> = conn
-            .query_row(
+        let row = conn
+            .fetch_optional(
                 "SELECT m.seq
                  FROM events e
                  JOIN messages m ON m.id = e.message_id
                  WHERE e.board_id = ?1 AND e.seq <= ?2 AND e.event_type = 'message.posted'
                  ORDER BY e.seq DESC LIMIT 1",
-                params![board_id, ev_seq],
-                |r| r.get(0),
+                sql_args![board_id, ev_seq],
             )
-            .optional()?;
-        return Ok(msg_seq.unwrap_or(0));
+            .await?;
+        return match row {
+            Some(r) => r.get_i64(0),
+            None => Ok(0),
+        };
     }
     Err(BoardError::bad_request(format!(
         "invalid cursor or message ID '{cursor}'"
@@ -1761,7 +1921,7 @@ fn validate_limit(limit: Option<usize>) -> BoardResult<usize> {
     Ok(n)
 }
 
-pub fn list_messages(
+pub async fn list_messages(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -1775,75 +1935,78 @@ pub fn list_messages(
     query.filter.validate()?;
     let limit = validate_limit(query.limit)?;
 
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
-            if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
-                let cursor = current_board_cursor_tx(conn, board_id)?;
-                return Ok(MessagesPage {
-                    messages: Vec::new(),
-                    cursor,
-                });
-            }
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
+        if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
+            let cursor = current_board_cursor_tx(&mut conn, board_id).await?;
+            return Ok(MessagesPage {
+                messages: Vec::new(),
+                cursor,
+            });
         }
-        let visible_actors = if query.filter.mentions.is_some() {
-            visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?
-        } else {
-            Vec::new()
-        };
-        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
-        let after_seq = match &query.after {
-            Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
-            None => None,
-        };
-        let before_seq = match &query.before {
-            Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
-            None => None,
-        };
+    }
+    let visible_actors = if query.filter.mentions.is_some() {
+        visible_actors_for_caller_tx(&mut conn, board_id, &board_grants, caller).await?
+    } else {
+        Vec::new()
+    };
+    let filter_ctx =
+        FilterContext::build(&mut conn, caller, &visible_actors, &query.filter).await?;
+    let after_seq = match &query.after {
+        Some(c) => Some(resolve_msg_seq_cursor_tx(&mut conn, board_id, c).await?),
+        None => None,
+    };
+    let before_seq = match &query.before {
+        Some(c) => Some(resolve_msg_seq_cursor_tx(&mut conn, board_id, c).await?),
+        None => None,
+    };
 
-        let candidates = query_filtered_message_rows_tx(
-            conn,
-            board_id,
+    let candidates = query_filtered_message_rows_tx(
+        &mut conn,
+        board_id,
+        &query.filter,
+        after_seq,
+        before_seq,
+    )
+    .await?;
+    let mut perm_cache: HashMap<String, bool> = HashMap::new();
+    let mut handle_cache: HashMap<String, String> = HashMap::new();
+    let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let mut matched: Vec<StoredMessageRow> = Vec::new();
+
+    for r in candidates {
+        if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
+            continue;
+        }
+        if !row_matches_filter_tx(
+            &mut conn,
+            &r,
             &query.filter,
-            after_seq,
-            before_seq,
-        )?;
-        let mut perm_cache: HashMap<String, bool> = HashMap::new();
-        let mut handle_cache: HashMap<String, String> = HashMap::new();
-        let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
-        let mut matched: Vec<StoredMessageRow> = Vec::new();
-
-        for r in candidates {
-            if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
-                continue;
-            }
-            if !row_matches_filter_tx(
-                conn,
-                &r,
-                &query.filter,
-                &filter_ctx,
-                &mut handle_cache,
-                &mut root_labels_cache,
-            )? {
-                continue;
-            }
-            matched.push(r);
-            if after_seq.is_some() && matched.len() >= limit {
-                break;
-            }
+            &filter_ctx,
+            &mut handle_cache,
+            &mut root_labels_cache,
+        )
+        .await?
+        {
+            continue;
         }
+        matched.push(r);
+        if after_seq.is_some() && matched.len() >= limit {
+            break;
+        }
+    }
 
-        let page_rows: Vec<StoredMessageRow> = if after_seq.is_some() {
-            matched.into_iter().take(limit).collect()
-        } else {
-            let skip = matched.len().saturating_sub(limit);
-            matched.into_iter().skip(skip).collect()
-        };
+    let page_rows: Vec<StoredMessageRow> = if after_seq.is_some() {
+        matched.into_iter().take(limit).collect()
+    } else {
+        let skip = matched.len().saturating_sub(limit);
+        matched.into_iter().skip(skip).collect()
+    };
 
-        let messages = hydrate_message_views_batch_tx(conn, &page_rows)?;
-        let cursor = current_board_cursor_tx(conn, board_id)?;
-        Ok(MessagesPage { messages, cursor })
-    })
+    let messages = hydrate_message_views_batch_tx(&mut conn, &page_rows).await?;
+    let cursor = current_board_cursor_tx(&mut conn, board_id).await?;
+    Ok(MessagesPage { messages, cursor })
 }
 
 struct ThreadSummaryRow {
@@ -1860,8 +2023,8 @@ struct ThreadPageBounds {
     limit: usize,
 }
 
-fn list_threads_fast_tx(
-    conn: &Connection,
+async fn list_threads_fast_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     board_grants: &[grants::Grant],
     caller: &CallerContext,
@@ -1877,7 +2040,7 @@ fn list_threads_fast_tx(
     let exact_verified = match ch_sql {
         ChannelSqlFilter::Exact(ch) => {
             if !grants::caller_permissions_on_channel(board_grants, caller, ch).can_read() {
-                let cursor = current_board_cursor_tx(conn, board_id)?;
+                let cursor = current_board_cursor_tx(conn, board_id).await?;
                 return Ok(ThreadsPage {
                     threads: Vec::new(),
                     cursor,
@@ -1892,55 +2055,62 @@ fn list_threads_fast_tx(
     let mut sql = String::from(
         "SELECT root_id, channel, last_id, last_reply_id, reply_count
          FROM threads
-         WHERE board_id = ?",
+         WHERE board_id = ?1",
     );
-    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(board_id.to_string())];
+    let mut bind: Vec<SqlArg<'_>> = vec![SqlArg::from(board_id)];
 
     match ch_sql {
         ChannelSqlFilter::All => {}
         ChannelSqlFilter::Exact(ch) => {
-            sql.push_str(" AND channel = ?");
-            bind.push(SqlValue::Text(ch.to_string()));
+            let p = bind.len() + 1;
+            let _ = write!(&mut sql, " AND channel = ?{p}");
+            bind.push(SqlArg::from(ch));
         }
         ChannelSqlFilter::Subtree { exact, low, high } => {
-            sql.push_str(" AND (channel = ? OR (channel >= ? AND channel < ?))");
-            bind.push(SqlValue::Text(exact.to_string()));
-            bind.push(SqlValue::Text(low));
-            bind.push(SqlValue::Text(high));
+            let p1 = bind.len() + 1;
+            let p2 = p1 + 1;
+            let p3 = p2 + 1;
+            let _ = write!(
+                &mut sql,
+                " AND (channel = ?{p1} OR (channel >= ?{p2} AND channel < ?{p3}))"
+            );
+            bind.push(SqlArg::from(exact));
+            bind.push(SqlArg::from(low));
+            bind.push(SqlArg::from(high));
         }
     }
 
     let want_count = if after_seq.is_some() { limit } else { limit + 1 };
     if let Some(a) = after_seq {
-        sql.push_str(" AND last_seq > ? ORDER BY last_seq ASC");
-        bind.push(SqlValue::Integer(a));
+        let p = bind.len() + 1;
+        let _ = write!(&mut sql, " AND last_seq > ?{p} ORDER BY last_seq ASC");
+        bind.push(SqlArg::from(a));
     } else {
         if let Some(b) = before_seq {
-            sql.push_str(" AND last_seq < ?");
-            bind.push(SqlValue::Integer(b));
+            let p = bind.len() + 1;
+            let _ = write!(&mut sql, " AND last_seq < ?{p}");
+            bind.push(SqlArg::from(b));
         }
         sql.push_str(" ORDER BY last_seq DESC");
     }
     if exact_verified {
-        sql.push_str(" LIMIT ?");
-        bind.push(SqlValue::Integer(want_count as i64));
+        let p = bind.len() + 1;
+        let _ = write!(&mut sql, " LIMIT ?{p}");
+        bind.push(SqlArg::from(want_count as i64));
     }
 
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(bind), |r| {
-        Ok(ThreadSummaryRow {
-            root_id: r.get(0)?,
-            channel: r.get(1)?,
-            last_id: r.get(2)?,
-            last_reply_id: r.get(3)?,
-            reply_count: r.get::<_, i64>(4)? as usize,
-        })
-    })?;
+    let rows = conn.fetch_all(&sql, &bind).await?;
 
     let mut perm_cache: HashMap<String, bool> = HashMap::new();
     let mut selected: Vec<ThreadSummaryRow> = Vec::with_capacity(want_count);
-    for row in rows {
-        let t = row?;
+    for r in rows {
+        let t = ThreadSummaryRow {
+            root_id: r.get_str(0)?,
+            channel: r.get_str(1)?,
+            last_id: r.get_str(2)?,
+            last_reply_id: r.get_opt_str(3)?,
+            reply_count: r.get_i64(4)? as usize,
+        };
         if !exact_verified
             && !cached_can_read_channel(&mut perm_cache, board_grants, caller, &t.channel)
         {
@@ -1971,14 +2141,14 @@ fn list_threads_fast_tx(
         }
     }
 
-    let stored_map = load_stored_messages_batch_tx(conn, board_id, &needed_ids)?;
+    let stored_map = load_stored_messages_batch_tx(conn, board_id, &needed_ids).await?;
     let mut ordered_rows: Vec<StoredMessageRow> = Vec::with_capacity(needed_ids.len());
     for id in &needed_ids {
         if let Some(r) = stored_map.get(*id) {
             ordered_rows.push(r.clone());
         }
     }
-    let hydrated_list = hydrate_message_views_batch_tx(conn, &ordered_rows)?;
+    let hydrated_list = hydrate_message_views_batch_tx(conn, &ordered_rows).await?;
     let mut views_map: HashMap<String, MessageView> = hydrated_list
         .into_iter()
         .map(|v| (v.id.clone(), v))
@@ -1995,10 +2165,7 @@ fn list_threads_fast_tx(
         let Some(root_view) = views_map.remove(&t.root_id) else {
             continue;
         };
-        let last_view = t
-            .last_reply_id
-            .as_ref()
-            .and_then(|rid| views_map.remove(rid));
+        let last_view = t.last_reply_id.as_ref().and_then(|rid| views_map.remove(rid));
         threads.push(ThreadSummaryView {
             message: root_view,
             replies: t.reply_count,
@@ -2006,7 +2173,7 @@ fn list_threads_fast_tx(
         });
     }
 
-    let cursor = current_board_cursor_tx(conn, board_id)?;
+    let cursor = current_board_cursor_tx(conn, board_id).await?;
     Ok(ThreadsPage {
         threads,
         cursor,
@@ -2014,7 +2181,7 @@ fn list_threads_fast_tx(
     })
 }
 
-pub fn list_threads(
+pub async fn list_threads(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -2028,184 +2195,184 @@ pub fn list_threads(
     query.filter.validate()?;
     let limit = validate_limit(query.limit)?;
 
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let after_seq = match &query.after {
-            Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
-            None => None,
-        };
-        let before_seq = match &query.before {
-            Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
-            None => None,
-        };
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let after_seq = match &query.after {
+        Some(c) => Some(resolve_msg_seq_cursor_tx(&mut conn, board_id, c).await?),
+        None => None,
+    };
+    let before_seq = match &query.before {
+        Some(c) => Some(resolve_msg_seq_cursor_tx(&mut conn, board_id, c).await?),
+        None => None,
+    };
 
-        // Fast indexed path when only channel/cursor/limit filters are active.
-        if !query.filter.has_message_specific_filters() {
-            return list_threads_fast_tx(
-                conn,
-                board_id,
-                &board_grants,
-                caller,
-                query.filter.channel.as_deref(),
-                ThreadPageBounds {
-                    after_seq,
-                    before_seq,
-                    limit,
-                },
-            );
-        }
+    // Fast indexed path when only channel/cursor/limit filters are active.
+    if !query.filter.has_message_specific_filters() {
+        return list_threads_fast_tx(
+            &mut conn,
+            board_id,
+            &board_grants,
+            caller,
+            query.filter.channel.as_deref(),
+            ThreadPageBounds {
+                after_seq,
+                before_seq,
+                limit,
+            },
+        )
+        .await;
+    }
 
-        if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
-            if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
-                let cursor = current_board_cursor_tx(conn, board_id)?;
-                return Ok(ThreadsPage {
-                    threads: Vec::new(),
-                    cursor,
-                    older: None,
-                });
-            }
-        }
-
-        let visible_actors = if query.filter.mentions.is_some() {
-            visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?
-        } else {
-            Vec::new()
-        };
-        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
-        let candidates =
-            query_filtered_message_rows_tx(conn, board_id, &query.filter, None, None)?;
-
-        struct ThreadAcc {
-            root: Option<StoredMessageRow>,
-            replies: usize,
-            last: Option<StoredMessageRow>,
-            last_seq: i64,
-            last_id: String,
-            matched: bool,
-        }
-
-        let mut perm_cache: HashMap<String, bool> = HashMap::new();
-        let mut handle_cache: HashMap<String, String> = HashMap::new();
-        let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
-        let mut by_root: BTreeMap<String, ThreadAcc> = BTreeMap::new();
-
-        for r in candidates {
-            if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
-                continue;
-            }
-            if !query.filter.matches_channel(&r.channel) {
-                continue;
-            }
-            let root_id = r.re.clone().unwrap_or_else(|| r.id.clone());
-            if let Some(re_f) = &query.filter.re {
-                if &root_id != re_f {
-                    continue;
-                }
-            }
-
-            let already_matched = by_root.get(&root_id).is_some_and(|a| a.matched);
-            let is_match = if already_matched {
-                true
-            } else {
-                row_matches_filter_tx(
-                    conn,
-                    &r,
-                    &query.filter,
-                    &filter_ctx,
-                    &mut handle_cache,
-                    &mut root_labels_cache,
-                )?
-            };
-
-            let acc = by_root.entry(root_id).or_insert_with(|| ThreadAcc {
-                root: None,
-                replies: 0,
-                last: None,
-                last_seq: r.seq,
-                last_id: r.id.clone(),
-                matched: false,
-            });
-            if r.seq >= acc.last_seq {
-                acc.last_seq = r.seq;
-                acc.last_id = r.id.clone();
-            }
-            if r.re.is_none() {
-                acc.root = Some(r);
-            } else {
-                acc.replies += 1;
-                acc.last = Some(r);
-            }
-            if is_match {
-                acc.matched = true;
-            }
-        }
-
-        let mut summaries: Vec<ThreadAcc> = by_root
-            .into_values()
-            .filter(|a| a.matched && a.root.is_some())
-            .filter(|a| after_seq.is_none_or(|s| a.last_seq > s))
-            .filter(|a| before_seq.is_none_or(|s| a.last_seq < s))
-            .collect();
-
-        // Newest activity last
-        summaries.sort_by_key(|a| a.last_seq);
-
-        let (page_items, has_older) = if after_seq.is_some() {
-            let items: Vec<_> = summaries.into_iter().take(limit).collect();
-            (items, false)
-        } else {
-            let total = summaries.len();
-            let skip = total.saturating_sub(limit);
-            let items: Vec<_> = summaries.into_iter().skip(skip).collect();
-            (items, skip > 0)
-        };
-
-        let older = if has_older {
-            page_items.first().map(|a| a.last_id.clone())
-        } else {
-            None
-        };
-
-        let mut to_hydrate: Vec<StoredMessageRow> = Vec::with_capacity(page_items.len() * 2);
-        let mut page_meta: Vec<(String, Option<String>, usize)> =
-            Vec::with_capacity(page_items.len());
-        for a in page_items {
-            let root = a.root.unwrap();
-            let root_id = root.id.clone();
-            to_hydrate.push(root);
-            let last_id = a.last.map(|l| {
-                let lid = l.id.clone();
-                to_hydrate.push(l);
-                lid
-            });
-            page_meta.push((root_id, last_id, a.replies));
-        }
-
-        let hydrated = hydrate_message_views_batch_tx(conn, &to_hydrate)?;
-        let mut views_map: HashMap<String, MessageView> = hydrated
-            .into_iter()
-            .map(|v| (v.id.clone(), v))
-            .collect();
-
-        let mut threads = Vec::with_capacity(page_meta.len());
-        for (root_id, last_id, replies) in page_meta {
-            let Some(root_view) = views_map.remove(&root_id) else {
-                continue;
-            };
-            let last_view = last_id.and_then(|lid| views_map.remove(&lid));
-            threads.push(ThreadSummaryView {
-                message: root_view,
-                replies,
-                last: last_view,
+    if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
+        if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
+            let cursor = current_board_cursor_tx(&mut conn, board_id).await?;
+            return Ok(ThreadsPage {
+                threads: Vec::new(),
+                cursor,
+                older: None,
             });
         }
+    }
 
-        let cursor = current_board_cursor_tx(conn, board_id)?;
-        Ok(ThreadsPage {
-            threads,
-            cursor,
-            older,
-        })
+    let visible_actors = if query.filter.mentions.is_some() {
+        visible_actors_for_caller_tx(&mut conn, board_id, &board_grants, caller).await?
+    } else {
+        Vec::new()
+    };
+    let filter_ctx =
+        FilterContext::build(&mut conn, caller, &visible_actors, &query.filter).await?;
+    let candidates =
+        query_filtered_message_rows_tx(&mut conn, board_id, &query.filter, None, None).await?;
+
+    struct ThreadAcc {
+        root: Option<StoredMessageRow>,
+        replies: usize,
+        last: Option<StoredMessageRow>,
+        last_seq: i64,
+        last_id: String,
+        matched: bool,
+    }
+
+    let mut perm_cache: HashMap<String, bool> = HashMap::new();
+    let mut handle_cache: HashMap<String, String> = HashMap::new();
+    let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let mut by_root: BTreeMap<String, ThreadAcc> = BTreeMap::new();
+
+    for r in candidates {
+        if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
+            continue;
+        }
+        if !query.filter.matches_channel(&r.channel) {
+            continue;
+        }
+        let root_id = r.re.clone().unwrap_or_else(|| r.id.clone());
+        if let Some(re_f) = &query.filter.re {
+            if &root_id != re_f {
+                continue;
+            }
+        }
+
+        let already_matched = by_root.get(&root_id).is_some_and(|a| a.matched);
+        let is_match = if already_matched {
+            true
+        } else {
+            row_matches_filter_tx(
+                &mut conn,
+                &r,
+                &query.filter,
+                &filter_ctx,
+                &mut handle_cache,
+                &mut root_labels_cache,
+            )
+            .await?
+        };
+
+        let acc = by_root.entry(root_id).or_insert_with(|| ThreadAcc {
+            root: None,
+            replies: 0,
+            last: None,
+            last_seq: r.seq,
+            last_id: r.id.clone(),
+            matched: false,
+        });
+        if r.seq >= acc.last_seq {
+            acc.last_seq = r.seq;
+            acc.last_id = r.id.clone();
+        }
+        if r.re.is_none() {
+            acc.root = Some(r);
+        } else {
+            acc.replies += 1;
+            acc.last = Some(r);
+        }
+        if is_match {
+            acc.matched = true;
+        }
+    }
+
+    let mut summaries: Vec<ThreadAcc> = by_root
+        .into_values()
+        .filter(|a| a.matched && a.root.is_some())
+        .filter(|a| after_seq.is_none_or(|s| a.last_seq > s))
+        .filter(|a| before_seq.is_none_or(|s| a.last_seq < s))
+        .collect();
+
+    summaries.sort_by_key(|a| a.last_seq);
+
+    let (page_items, has_older) = if after_seq.is_some() {
+        let items: Vec<_> = summaries.into_iter().take(limit).collect();
+        (items, false)
+    } else {
+        let total = summaries.len();
+        let skip = total.saturating_sub(limit);
+        let items: Vec<_> = summaries.into_iter().skip(skip).collect();
+        (items, skip > 0)
+    };
+
+    let older = if has_older {
+        page_items.first().map(|a| a.last_id.clone())
+    } else {
+        None
+    };
+
+    let mut to_hydrate: Vec<StoredMessageRow> = Vec::with_capacity(page_items.len() * 2);
+    let mut page_meta: Vec<(String, Option<String>, usize)> = Vec::with_capacity(page_items.len());
+    for a in page_items {
+        let root = a.root.unwrap();
+        let root_id = root.id.clone();
+        to_hydrate.push(root);
+        let last_id = a.last.map(|l| {
+            let lid = l.id.clone();
+            to_hydrate.push(l);
+            lid
+        });
+        page_meta.push((root_id, last_id, a.replies));
+    }
+
+    let hydrated = hydrate_message_views_batch_tx(&mut conn, &to_hydrate).await?;
+    let mut views_map: HashMap<String, MessageView> = hydrated
+        .into_iter()
+        .map(|v| (v.id.clone(), v))
+        .collect();
+
+    let mut threads = Vec::with_capacity(page_meta.len());
+    for (root_id, last_id, replies) in page_meta {
+        let Some(root_view) = views_map.remove(&root_id) else {
+            continue;
+        };
+        let last_view = last_id.and_then(|lid| views_map.remove(&lid));
+        threads.push(ThreadSummaryView {
+            message: root_view,
+            replies,
+            last: last_view,
+        });
+    }
+
+    let cursor = current_board_cursor_tx(&mut conn, board_id).await?;
+    Ok(ThreadsPage {
+        threads,
+        cursor,
+        older,
     })
 }
 

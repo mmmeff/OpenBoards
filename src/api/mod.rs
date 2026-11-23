@@ -13,9 +13,10 @@ pub mod sync;
 pub mod tasks;
 pub mod watchers;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -30,6 +31,7 @@ use crate::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .merge(admin::routes())
         .merge(actors::routes())
         .merge(boards::routes())
@@ -49,6 +51,24 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let dialect = state.db.dialect().as_str();
+    match state.db.ping().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "dialect": dialect })),
+        ),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "dialect": dialect,
+                "error": err.message
+            })),
+        ),
+    }
 }
 
 fn header_str<'a>(parts: &'a Parts, name: &str) -> BoardResult<Option<&'a str>> {
@@ -84,7 +104,7 @@ impl FromRequestParts<AppState> for CallerContext {
                 BoardError::unauthorized("Authorization header must use Bearer scheme")
             })?;
 
-        let principal = authenticate_bearer_token(&state.db, raw_token)?;
+        let principal = authenticate_bearer_token(&state.db, raw_token).await?;
         state.rate_limiter.check(&principal.principal_id())?;
 
         let profile = parse_profile_headers(

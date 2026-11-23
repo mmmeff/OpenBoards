@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::actors::{self, CallerContext, ProfileOverlay};
 use crate::attachments;
-use crate::db::Database;
+use crate::db::{Database, DbRow, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::EventHub;
 use crate::grants;
@@ -14,6 +13,7 @@ use crate::id::new_schedule_id;
 use crate::labels;
 use crate::messages::{self, MessageAuthor, PostMessageInput, ReplyMessageInput};
 use crate::schemas;
+use crate::sql_args;
 use crate::validate::{validate_channel_path, validate_channel_pattern, validate_text_length};
 use crate::AppState;
 
@@ -193,40 +193,41 @@ pub fn parse_schedule_duration_secs(raw: &str, field: &str) -> BoardResult<i64> 
         .ok_or_else(|| BoardError::bad_request(format!("duration '{raw}' for '{field}' overflows")))
 }
 
-fn map_schedule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredScheduleRow> {
-    let status_str: String = r.get(20)?;
+fn map_schedule_row(r: &DbRow) -> BoardResult<StoredScheduleRow> {
+    let status_str = r.get_str(20)?;
     Ok(StoredScheduleRow {
-        id: r.get(0)?,
-        board_id: r.get(1)?,
-        channel: r.get(2)?,
-        re: r.get(3)?,
-        text: r.get(4)?,
-        labels_json: r.get(5)?,
-        attachments_json: r.get(6)?,
-        schema_id: r.get(7)?,
-        no_sync: r.get::<_, i64>(8)? != 0,
-        creator_actor: r.get(9)?,
-        creator_principal: r.get(10)?,
-        creator_profile: r.get(11)?,
-        creator_avatar: r.get(12)?,
-        every_secs: r.get(13)?,
-        max_times: r.get(14)?,
-        until_at: r.get(15)?,
-        next_run_at: r.get(16)?,
-        runs_completed: r.get(17)?,
-        last_run_at: r.get(18)?,
-        last_message_id: r.get(19)?,
+        id: r.get_str(0)?,
+        board_id: r.get_str(1)?,
+        channel: r.get_str(2)?,
+        re: r.get_opt_str(3)?,
+        text: r.get_str(4)?,
+        labels_json: r.get_str(5)?,
+        attachments_json: r.get_str(6)?,
+        schema_id: r.get_opt_str(7)?,
+        no_sync: r.get_i64(8)? != 0,
+        creator_actor: r.get_str(9)?,
+        creator_principal: r.get_str(10)?,
+        creator_profile: r.get_opt_str(11)?,
+        creator_avatar: r.get_opt_str(12)?,
+        every_secs: r.get_opt_i64(13)?,
+        max_times: r.get_opt_i64(14)?,
+        until_at: r.get_opt_str(15)?,
+        next_run_at: r.get_str(16)?,
+        runs_completed: r.get_i64(17)?,
+        last_run_at: r.get_opt_str(18)?,
+        last_message_id: r.get_opt_str(19)?,
         status: ScheduleStatus::parse(&status_str),
-        error_message: r.get(21)?,
-        created_at: r.get(22)?,
+        error_message: r.get_opt_str(21)?,
+        created_at: r.get_str(22)?,
     })
 }
 
-fn hydrate_schedule_view_tx(
-    conn: &Connection,
+async fn hydrate_schedule_view_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     row: &StoredScheduleRow,
 ) -> BoardResult<ScheduleView> {
-    let handle = actors::resolve_actor_view(conn, &row.creator_actor)?
+    let handle = actors::resolve_actor_view(conn, &row.creator_actor)
+        .await?
         .map(|a| a.handle)
         .unwrap_or_else(|| row.creator_actor.clone());
     let labels: BTreeMap<String, String> = serde_json::from_str(&row.labels_json)
@@ -262,43 +263,42 @@ fn hydrate_schedule_view_tx(
     })
 }
 
-fn load_schedule_row_tx(
-    conn: &Connection,
+async fn load_schedule_row_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     schedule_id: &str,
 ) -> BoardResult<Option<StoredScheduleRow>> {
-    conn.query_row(
-        "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
-                no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
-                every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
-                last_message_id, status, error_message, created_at
-         FROM schedules
-         WHERE board_id = ?1 AND id = ?2",
-        params![board_id, schedule_id],
-        map_schedule_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
+                    no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
+                    every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
+                    last_message_id, status, error_message, created_at
+             FROM schedules
+             WHERE board_id = ?1 AND id = ?2",
+            sql_args![board_id, schedule_id],
+        )
+        .await?;
+    row.as_ref().map(map_schedule_row).transpose()
 }
 
 /// Creates a persisted schedule (`sch_...`) for a deferred post or reply.
-pub fn create_schedule(
+pub async fn create_schedule(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
     input: CreateScheduleInput,
 ) -> BoardResult<ScheduleView> {
-    create_schedule_at(db, board_id, caller, input, Utc::now())
+    create_schedule_at(db, board_id, caller, input, Utc::now()).await
 }
 
-pub fn create_schedule_at(
+pub async fn create_schedule_at(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
     input: CreateScheduleInput,
     now: DateTime<Utc>,
 ) -> BoardResult<ScheduleView> {
-    // Exactly one target: `channel` OR `re`
     match (&input.channel, &input.re) {
         (Some(_), Some(_)) | (None, None) => {
             return Err(BoardError::bad_request(
@@ -324,7 +324,6 @@ pub fn create_schedule_at(
         labels::validate_user_labels(&input.labels)?;
     }
 
-    // Validate timing options
     if input.delay_in.is_some() && input.at.is_some() {
         return Err(BoardError::bad_request(
             "cannot combine 'in' and 'at' timing options",
@@ -395,146 +394,149 @@ pub fn create_schedule_at(
         BoardError::internal(format!("failed to serialize schedule attachments: {e}"))
     })?;
 
-    db.with_tx(|tx| {
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
+    let mut tx = db.begin_tx().await?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
 
-        // Resolve target channel + thread root & check permissions
-        let (channel, root_re): (String, Option<String>) = if let Some(ch) = &input.channel {
-            validate_channel_path(ch)?;
-            let perms = grants::caller_permissions_on_channel(&board_grants, caller, ch);
-            let channel_exists: bool = tx
-                .query_row(
-                    "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
-                    params![board_id, ch],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if channel_exists {
-                if !perms.can_post_new_thread() {
-                    return Err(BoardError::forbidden(format!(
-                        "scheduling a post in '{ch}' requires 'post' permission"
-                    )));
-                }
-            } else if !perms.can_create_channel() {
+    let (channel, root_re): (String, Option<String>) = if let Some(ch) = &input.channel {
+        validate_channel_path(ch)?;
+        let perms = grants::caller_permissions_on_channel(&board_grants, caller, ch);
+        let channel_exists = tx
+            .fetch_optional(
+                "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
+                sql_args![board_id, ch],
+            )
+            .await?
+            .is_some();
+        if channel_exists {
+            if !perms.can_post_new_thread() {
                 return Err(BoardError::forbidden(format!(
-                    "scheduling a post in new channel '{ch}' requires 'read' and 'post' permissions"
+                    "scheduling a post in '{ch}' requires 'post' permission"
                 )));
             }
-            if !input.labels.is_empty() && !perms.can_label() {
-                return Err(BoardError::forbidden(format!(
-                    "scheduling with labels in '{ch}' requires 'label' permission"
-                )));
-            }
-            (ch.clone(), None)
-        } else {
-            let target_id = input.re.as_deref().expect("checked above");
-            let target_msg =
-                messages::load_stored_message_tx(tx, board_id, target_id)?.ok_or_else(|| {
-                    BoardError::new(
-                        ErrorCode::MessageNotFound,
-                        format!("message '{target_id}' not found"),
-                    )
-                })?;
-            let perms =
-                grants::caller_permissions_on_channel(&board_grants, caller, &target_msg.channel);
-            if !perms.can_read() {
-                return Err(BoardError::new(
+        } else if !perms.can_create_channel() {
+            return Err(BoardError::forbidden(format!(
+                "scheduling a post in new channel '{ch}' requires 'read' and 'post' permissions"
+            )));
+        }
+        if !input.labels.is_empty() && !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "scheduling with labels in '{ch}' requires 'label' permission"
+            )));
+        }
+        (ch.clone(), None)
+    } else {
+        let target_id = input.re.as_deref().expect("checked above");
+        let target_msg = messages::load_stored_message_tx(&mut tx, board_id, target_id)
+            .await?
+            .ok_or_else(|| {
+                BoardError::new(
                     ErrorCode::MessageNotFound,
                     format!("message '{target_id}' not found"),
-                ));
-            }
-            if !perms.can_reply() {
-                return Err(BoardError::forbidden(format!(
-                    "scheduling a reply in '{}' requires 'read' and 'post' permissions",
-                    target_msg.channel
-                )));
-            }
-            if !input.labels.is_empty() && !perms.can_label() {
-                return Err(BoardError::forbidden(format!(
-                    "scheduling with labels in '{}' requires 'label' permission",
-                    target_msg.channel
-                )));
-            }
-            let root = target_msg.re.unwrap_or(target_msg.id);
-            (target_msg.channel, Some(root))
-        };
-
-        // Validate structured blocks/schema upfront
-        let _ = schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
-
-        // Validate attachments are ready and accessible to caller
-        for att_id in &input.attachments {
-            let att = attachments::load_attachment_tx(tx, board_id, att_id)?.ok_or_else(|| {
-                BoardError::not_found(format!("attachment '{att_id}' not found"))
+                )
             })?;
-            if att.status != "ready" {
-                return Err(BoardError::bad_request(format!(
-                    "attachment '{att_id}' is not ready"
-                )));
-            }
-            if !attachments::caller_can_access_attachment_tx(
-                tx,
-                board_id,
-                &board_grants,
-                caller,
-                &att,
-            )? {
-                return Err(BoardError::forbidden(format!(
-                    "caller cannot access attachment '{att_id}'"
-                )));
-            }
+        let perms =
+            grants::caller_permissions_on_channel(&board_grants, caller, &target_msg.channel);
+        if !perms.can_read() {
+            return Err(BoardError::new(
+                ErrorCode::MessageNotFound,
+                format!("message '{target_id}' not found"),
+            ));
         }
+        if !perms.can_reply() {
+            return Err(BoardError::forbidden(format!(
+                "scheduling a reply in '{}' requires 'read' and 'post' permissions",
+                target_msg.channel
+            )));
+        }
+        if !input.labels.is_empty() && !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "scheduling with labels in '{}' requires 'label' permission",
+                target_msg.channel
+            )));
+        }
+        let root = target_msg.re.unwrap_or(target_msg.id);
+        (target_msg.channel, Some(root))
+    };
 
-        // Preserve creator profile registration
-        actors::record_actor_write_tx(tx, board_id, &channel, caller)?;
+    let _ = schemas::parse_and_validate_blocks_tx(&mut tx, &input.text, input.schema.as_deref())
+        .await?;
 
-        let id = new_schedule_id();
-        let now_str = format_utc_ms(now);
-        let next_run_str = format_utc_ms(first_run);
-        let until_str = until_dt.map(format_utc_ms);
-        let creator_actor = caller.actor_id();
-        let creator_principal = caller.principal_id();
-        let creator_profile = caller.profile.as_ref().map(|p| p.name.clone());
-        let creator_avatar = caller.profile.as_ref().and_then(|p| p.avatar.clone());
+    for att_id in &input.attachments {
+        let att = attachments::load_attachment_tx(&mut tx, board_id, att_id)
+            .await?
+            .ok_or_else(|| BoardError::not_found(format!("attachment '{att_id}' not found")))?;
+        if att.status != "ready" {
+            return Err(BoardError::bad_request(format!(
+                "attachment '{att_id}' is not ready"
+            )));
+        }
+        if !attachments::caller_can_access_attachment_tx(
+            &mut tx,
+            board_id,
+            &board_grants,
+            caller,
+            &att,
+        )
+        .await?
+        {
+            return Err(BoardError::forbidden(format!(
+                "caller cannot access attachment '{att_id}'"
+            )));
+        }
+    }
 
-        tx.execute(
-            "INSERT INTO schedules (
-                id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
-                no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
-                every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
-                last_message_id, status, error_message, created_at, updated_at
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, 0, NULL,
-                NULL, 'pending', NULL, ?18, ?18
-             )",
-            params![
-                id,
-                board_id,
-                channel,
-                root_re,
-                input.text,
-                labels_json,
-                attachments_json,
-                input.schema,
-                i64::from(input.no_sync),
-                creator_actor,
-                creator_principal,
-                creator_profile,
-                creator_avatar,
-                every_secs,
-                input.times,
-                until_str,
-                next_run_str,
-                now_str,
-            ],
-        )?;
+    actors::record_actor_write_tx(&mut tx, board_id, &channel, caller).await?;
 
-        let row = load_schedule_row_tx(tx, board_id, &id)?.expect("inserted schedule exists");
-        hydrate_schedule_view_tx(tx, &row)
-    })
+    let id = new_schedule_id();
+    let now_str = format_utc_ms(now);
+    let next_run_str = format_utc_ms(first_run);
+    let until_str = until_dt.map(format_utc_ms);
+    let creator_actor = caller.actor_id();
+    let creator_principal = caller.principal_id();
+    let creator_profile = caller.profile.as_ref().map(|p| p.name.clone());
+    let creator_avatar = caller.profile.as_ref().and_then(|p| p.avatar.clone());
+
+    tx.execute(
+        "INSERT INTO schedules (
+            id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
+            no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
+            every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
+            last_message_id, status, error_message, created_at, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, 0, NULL,
+            NULL, 'pending', NULL, ?18, ?18
+         )",
+        sql_args![
+            &id,
+            board_id,
+            &channel,
+            &root_re,
+            &input.text,
+            &labels_json,
+            &attachments_json,
+            &input.schema,
+            i64::from(input.no_sync),
+            &creator_actor,
+            &creator_principal,
+            &creator_profile,
+            &creator_avatar,
+            every_secs,
+            input.times,
+            &until_str,
+            &next_run_str,
+            &now_str,
+        ],
+    )
+    .await?;
+
+    let row = load_schedule_row_tx(&mut tx, board_id, &id)
+        .await?
+        .expect("inserted schedule exists");
+    let view = hydrate_schedule_view_tx(&mut tx, &row).await?;
+    tx.commit().await?;
+    Ok(view)
 }
 
 fn matches_channel_filter(channel_filter: &str, channel: &str) -> bool {
@@ -576,7 +578,7 @@ fn matches_by_filter(by_filter: &str, caller: &CallerContext, view: &ScheduleVie
 
 /// Lists schedules on `board_id`, oldest first (`next_run_at ASC`).
 /// Pending-only by default unless `query.all == true`. Filtered to caller-readable channels.
-pub fn list_schedules(
+pub async fn list_schedules(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -592,19 +594,19 @@ pub fn list_schedules(
         }
     }
 
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
 
-        // If `re` names any reply in a thread, normalize to thread root
-        let normalized_re = match &query.re {
-            Some(msg_id) => match messages::load_stored_message_tx(conn, board_id, msg_id)? {
-                Some(m) => Some(m.re.unwrap_or(m.id)),
-                None => Some(msg_id.clone()),
-            },
-            None => None,
-        };
+    let normalized_re = match &query.re {
+        Some(msg_id) => match messages::load_stored_message_tx(&mut conn, board_id, msg_id).await? {
+            Some(m) => Some(m.re.unwrap_or(m.id)),
+            None => Some(msg_id.clone()),
+        },
+        None => None,
+    };
 
-        let mut stmt = conn.prepare(
+    let rows = conn
+        .fetch_all(
             "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
                     no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
                     every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
@@ -612,85 +614,85 @@ pub fn list_schedules(
              FROM schedules
              WHERE board_id = ?1
              ORDER BY next_run_at ASC, created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![board_id], map_schedule_row)?;
+            sql_args![board_id],
+        )
+        .await?;
 
-        let mut out = Vec::new();
-        for row_res in rows {
-            let row = row_res?;
-            if !query.all && row.status != ScheduleStatus::Pending {
-                continue;
-            }
-            if !grants::caller_permissions_on_channel(&board_grants, caller, &row.channel)
-                .can_read()
-            {
-                continue;
-            }
-            if let Some(ch_f) = &query.channel {
-                if !matches_channel_filter(ch_f, &row.channel) {
-                    continue;
-                }
-            }
-            if let Some(re_f) = &normalized_re {
-                if row.re.as_deref() != Some(re_f.as_str()) {
-                    continue;
-                }
-            }
-            let view = hydrate_schedule_view_tx(conn, &row)?;
-            if let Some(by_f) = &query.by {
-                if !matches_by_filter(by_f, caller, &view) {
-                    continue;
-                }
-            }
-            out.push(view);
-        }
-        Ok(out)
-    })
-}
-
-/// Lists pending schedules attached to thread `root_id` (used to populate `ThreadView.schedules`).
-pub fn list_pending_thread_schedules_tx(
-    conn: &Connection,
-    board_id: &str,
-    root_id: &str,
-) -> BoardResult<Vec<ScheduleView>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
-                no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
-                every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
-                last_message_id, status, error_message, created_at
-         FROM schedules
-         WHERE board_id = ?1 AND re = ?2 AND status = 'pending'
-         ORDER BY next_run_at ASC, created_at ASC",
-    )?;
-    let rows = stmt.query_map(params![board_id, root_id], map_schedule_row)?;
     let mut out = Vec::new();
-    for row_res in rows {
-        let row = row_res?;
-        out.push(hydrate_schedule_view_tx(conn, &row)?);
+    for r in &rows {
+        let row = map_schedule_row(r)?;
+        if !query.all && row.status != ScheduleStatus::Pending {
+            continue;
+        }
+        if !grants::caller_permissions_on_channel(&board_grants, caller, &row.channel).can_read() {
+            continue;
+        }
+        if let Some(ch_f) = &query.channel {
+            if !matches_channel_filter(ch_f, &row.channel) {
+                continue;
+            }
+        }
+        if let Some(re_f) = &normalized_re {
+            if row.re.as_deref() != Some(re_f.as_str()) {
+                continue;
+            }
+        }
+        let view = hydrate_schedule_view_tx(&mut conn, &row).await?;
+        if let Some(by_f) = &query.by {
+            if !matches_by_filter(by_f, caller, &view) {
+                continue;
+            }
+        }
+        out.push(view);
     }
     Ok(out)
 }
 
-pub fn get_schedule(
+/// Lists pending schedules attached to thread `root_id` (used to populate `ThreadView.schedules`).
+pub async fn list_pending_thread_schedules_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    board_id: &str,
+    root_id: &str,
+) -> BoardResult<Vec<ScheduleView>> {
+    let rows = conn
+        .fetch_all(
+            "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
+                    no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
+                    every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
+                    last_message_id, status, error_message, created_at
+             FROM schedules
+             WHERE board_id = ?1 AND re = ?2 AND status = 'pending'
+             ORDER BY next_run_at ASC, created_at ASC",
+            sql_args![board_id, root_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let row = map_schedule_row(r)?;
+        out.push(hydrate_schedule_view_tx(conn, &row).await?);
+    }
+    Ok(out)
+}
+
+pub async fn get_schedule(
     db: &Database,
     board_id: &str,
     schedule_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<ScheduleView> {
-    db.with_conn(|conn| {
-        let row = load_schedule_row_tx(conn, board_id, schedule_id)?
-            .ok_or_else(|| BoardError::not_found(format!("schedule '{schedule_id}' not found")))?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let can_read =
-            grants::caller_permissions_on_channel(&board_grants, caller, &row.channel).can_read();
-        if !can_read && !caller.owns_actor_item(&row.creator_actor) {
-            return Err(BoardError::not_found(format!(
-                "schedule '{schedule_id}' not found"
-            )));
-        }
-        hydrate_schedule_view_tx(conn, &row)
-    })
+    let mut conn = db.read_conn();
+    let row = load_schedule_row_tx(&mut conn, board_id, schedule_id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("schedule '{schedule_id}' not found")))?;
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let can_read =
+        grants::caller_permissions_on_channel(&board_grants, caller, &row.channel).can_read();
+    if !can_read && !caller.owns_actor_item(&row.creator_actor) {
+        return Err(BoardError::not_found(format!(
+            "schedule '{schedule_id}' not found"
+        )));
+    }
+    hydrate_schedule_view_tx(&mut conn, &row).await
 }
 
 /// Cancels a schedule.
@@ -700,52 +702,55 @@ pub fn get_schedule(
 /// - A team `Owner` (unrestricted) who holds `manage` in the schedule's channel.
 ///
 /// Returns `(ScheduleView, canceled)` where `canceled` is `false` if already done or canceled.
-pub fn cancel_schedule(
+pub async fn cancel_schedule(
     db: &Database,
     board_id: &str,
     schedule_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<(ScheduleView, bool)> {
-    db.with_tx(|tx| {
-        let mut row = load_schedule_row_tx(tx, board_id, schedule_id)?
-            .ok_or_else(|| BoardError::not_found(format!("schedule '{schedule_id}' not found")))?;
+    let mut tx = db.begin_tx().await?;
+    let mut row = load_schedule_row_tx(&mut tx, board_id, schedule_id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("schedule '{schedule_id}' not found")))?;
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &row.channel);
-        let is_creator = caller.owns_actor_item(&row.creator_actor);
-        let owner_can_cancel =
-            caller.principal.is_owner() && !caller.is_restricted() && perms.can_manage();
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &row.channel);
+    let is_creator = caller.owns_actor_item(&row.creator_actor);
+    let owner_can_cancel =
+        caller.principal.is_owner() && !caller.is_restricted() && perms.can_manage();
 
-        if !is_creator && !owner_can_cancel {
-            if !perms.can_read() {
-                return Err(BoardError::not_found(format!(
-                    "schedule '{schedule_id}' not found"
-                )));
-            }
-            return Err(BoardError::forbidden(
-                "only the schedule creator or a team owner with 'manage' in the channel can cancel this schedule",
-            ));
+    if !is_creator && !owner_can_cancel {
+        if !perms.can_read() {
+            return Err(BoardError::not_found(format!(
+                "schedule '{schedule_id}' not found"
+            )));
         }
+        return Err(BoardError::forbidden(
+            "only the schedule creator or a team owner with 'manage' in the channel can cancel this schedule",
+        ));
+    }
 
-        if row.status != ScheduleStatus::Pending {
-            let view = hydrate_schedule_view_tx(tx, &row)?;
-            return Ok((view, false));
-        }
+    if row.status != ScheduleStatus::Pending {
+        let view = hydrate_schedule_view_tx(&mut tx, &row).await?;
+        tx.commit().await?;
+        return Ok((view, false));
+    }
 
-        let now_str = format_utc_ms(Utc::now());
-        tx.execute(
-            "UPDATE schedules SET status = 'canceled', updated_at = ?1 WHERE board_id = ?2 AND id = ?3",
-            params![now_str, board_id, schedule_id],
-        )?;
-        row.status = ScheduleStatus::Canceled;
-        let view = hydrate_schedule_view_tx(tx, &row)?;
-        Ok((view, true))
-    })
+    let now_str = format_utc_ms(Utc::now());
+    tx.execute(
+        "UPDATE schedules SET status = 'canceled', updated_at = ?1 WHERE board_id = ?2 AND id = ?3",
+        sql_args![&now_str, board_id, schedule_id],
+    )
+    .await?;
+    row.status = ScheduleStatus::Canceled;
+    let view = hydrate_schedule_view_tx(&mut tx, &row).await?;
+    tx.commit().await?;
+    Ok((view, true))
 }
 
 /// Fires all pending schedules whose `next_run_at <= now` using `state.db` and `state.events`.
-pub fn fire_due_schedules(state: &AppState) -> BoardResult<FireSummary> {
-    let summary = fire_due_schedules_at(&state.db, &state.events, Utc::now())?;
+pub async fn fire_due_schedules(state: &AppState) -> BoardResult<FireSummary> {
+    let summary = fire_due_schedules_at(&state.db, &state.events, Utc::now()).await?;
     if summary.fired > 0 {
         state.sync_wake.notify_one();
     }
@@ -753,45 +758,46 @@ pub fn fire_due_schedules(state: &AppState) -> BoardResult<FireSummary> {
 }
 
 /// Deterministic helper for firing due schedules at a caller-supplied timestamp `now`.
-pub fn fire_due_schedules_at(
+pub async fn fire_due_schedules_at(
     db: &Database,
     events: &EventHub,
     now: DateTime<Utc>,
 ) -> BoardResult<FireSummary> {
     let now_str = format_utc_ms(now);
 
-    let due: Vec<StoredScheduleRow> = db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
-                    no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
-                    every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
-                    last_message_id, status, error_message, created_at
-             FROM schedules
-             WHERE status = 'pending' AND next_run_at <= ?1
-             ORDER BY next_run_at ASC, created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![now_str], map_schedule_row)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    })?;
+    let due: Vec<StoredScheduleRow> = {
+        let mut conn = db.read_conn();
+        let rows = conn
+            .fetch_all(
+                "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
+                        no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
+                        every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,
+                        last_message_id, status, error_message, created_at
+                 FROM schedules
+                 WHERE status = 'pending' AND next_run_at <= ?1
+                 ORDER BY next_run_at ASC, created_at ASC",
+                sql_args![&now_str],
+            )
+            .await?;
+        rows.iter()
+            .map(map_schedule_row)
+            .collect::<BoardResult<Vec<_>>>()?
+    };
 
     let mut summary = FireSummary::default();
 
     for sched in due {
-        // Re-check status in case a concurrent caller canceled it
-        let still_pending = db.with_conn(|conn| {
-            Ok(load_schedule_row_tx(conn, &sched.board_id, &sched.id)?
-                .is_some_and(|r| r.status == ScheduleStatus::Pending))
-        })?;
+        let still_pending = {
+            let mut conn = db.read_conn();
+            load_schedule_row_tx(&mut conn, &sched.board_id, &sched.id)
+                .await?
+                .is_some_and(|r| r.status == ScheduleStatus::Pending)
+        };
         if !still_pending {
             continue;
         }
 
-        // Reconstruct active creator principal + profile
-        let creator_ctx = match reconstruct_creator_context(db, &sched)? {
+        let creator_ctx = match reconstruct_creator_context(db, &sched).await? {
             Some(ctx) => ctx,
             None => {
                 mark_schedule_failed(
@@ -800,17 +806,18 @@ pub fn fire_due_schedules_at(
                     &sched.id,
                     "creator principal was revoked or removed",
                     &now_str,
-                )?;
+                )
+                .await?;
                 summary.failed += 1;
                 continue;
             }
         };
 
-        // Re-check current board-level access before attempting write
-        let has_board_access = db.with_conn(|conn| {
-            let board_grants = grants::load_grants_tx(conn, &sched.board_id)?;
-            Ok(grants::caller_has_any_board_access(&board_grants, &creator_ctx))
-        })?;
+        let has_board_access = {
+            let mut conn = db.read_conn();
+            let board_grants = grants::load_grants_tx(&mut conn, &sched.board_id).await?;
+            grants::caller_has_any_board_access(&board_grants, &creator_ctx)
+        };
         if !has_board_access {
             mark_schedule_failed(
                 db,
@@ -818,7 +825,8 @@ pub fn fire_due_schedules_at(
                 &sched.id,
                 "creator no longer has access to board",
                 &now_str,
-            )?;
+            )
+            .await?;
             summary.failed += 1;
             continue;
         }
@@ -829,35 +837,41 @@ pub fn fire_due_schedules_at(
             serde_json::from_str(&sched.attachments_json).unwrap_or_default();
 
         let post_result = match &sched.re {
-            None => messages::post_message(
-                db,
-                &sched.board_id,
-                &creator_ctx,
-                PostMessageInput {
-                    channel: sched.channel.clone(),
-                    text: sched.text.clone(),
-                    id: None,
-                    attachments,
-                    labels,
-                    schema: sched.schema_id.clone(),
-                    no_sync: sched.no_sync,
-                },
-            ),
-            Some(root_id) => messages::reply_message(
-                db,
-                &sched.board_id,
-                root_id,
-                &creator_ctx,
-                ReplyMessageInput {
-                    text: sched.text.clone(),
-                    id: None,
-                    after: None,
-                    attachments,
-                    labels,
-                    schema: sched.schema_id.clone(),
-                    no_sync: sched.no_sync,
-                },
-            ),
+            None => {
+                messages::post_message(
+                    db,
+                    &sched.board_id,
+                    &creator_ctx,
+                    PostMessageInput {
+                        channel: sched.channel.clone(),
+                        text: sched.text.clone(),
+                        id: None,
+                        attachments,
+                        labels,
+                        schema: sched.schema_id.clone(),
+                        no_sync: sched.no_sync,
+                    },
+                )
+                .await
+            }
+            Some(root_id) => {
+                messages::reply_message(
+                    db,
+                    &sched.board_id,
+                    root_id,
+                    &creator_ctx,
+                    ReplyMessageInput {
+                        text: sched.text.clone(),
+                        id: None,
+                        after: None,
+                        attachments,
+                        labels,
+                        schema: sched.schema_id.clone(),
+                        no_sync: sched.no_sync,
+                    },
+                )
+                .await
+            }
         };
 
         match post_result {
@@ -869,34 +883,35 @@ pub fn fire_due_schedules_at(
                 let next_runs = sched.runs_completed + 1;
                 let (next_status, next_run_at) = compute_next_state(&sched, next_runs, now)?;
 
-                db.with_tx(|tx| {
-                    tx.execute(
-                        "UPDATE schedules
-                         SET runs_completed = ?1,
-                             last_run_at = ?2,
-                             last_message_id = ?3,
-                             next_run_at = ?4,
-                             status = ?5,
-                             updated_at = ?2
-                         WHERE board_id = ?6 AND id = ?7 AND status = 'pending'",
-                        params![
-                            next_runs,
-                            now_str,
-                            posted.message.id,
-                            next_run_at,
-                            next_status.as_str(),
-                            sched.board_id,
-                            sched.id,
-                        ],
-                    )?;
-                    Ok(())
-                })?;
+                let mut tx = db.begin_tx().await?;
+                tx.execute(
+                    "UPDATE schedules
+                     SET runs_completed = ?1,
+                         last_run_at = ?2,
+                         last_message_id = ?3,
+                         next_run_at = ?4,
+                         status = ?5,
+                         updated_at = ?2
+                     WHERE board_id = ?6 AND id = ?7 AND status = 'pending'",
+                    sql_args![
+                        next_runs,
+                        &now_str,
+                        &posted.message.id,
+                        &next_run_at,
+                        next_status.as_str(),
+                        &sched.board_id,
+                        &sched.id,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
 
                 summary.fired += 1;
                 summary.posted_message_ids.push(posted.message.id);
             }
             Err(err) => {
-                mark_schedule_failed(db, &sched.board_id, &sched.id, &err.message, &now_str)?;
+                mark_schedule_failed(db, &sched.board_id, &sched.id, &err.message, &now_str)
+                    .await?;
                 summary.failed += 1;
             }
         }
@@ -905,14 +920,14 @@ pub fn fire_due_schedules_at(
     Ok(summary)
 }
 
-fn reconstruct_creator_context(
+async fn reconstruct_creator_context(
     db: &Database,
     sched: &StoredScheduleRow,
 ) -> BoardResult<Option<CallerContext>> {
-    let principal = db.with_conn(|conn| {
-        actors::resolve_active_principal_tx(conn, &sched.creator_principal)
-    })?;
-    let Some(principal) = principal else {
+    let mut conn = db.read_conn();
+    let Some(principal) =
+        actors::resolve_active_principal_tx(&mut conn, &sched.creator_principal).await?
+    else {
         return Ok(None);
     };
     let profile = sched.creator_profile.as_ref().map(|name| ProfileOverlay {
@@ -957,22 +972,22 @@ fn compute_next_state(
     Ok((ScheduleStatus::Pending, format_utc_ms(candidate)))
 }
 
-fn mark_schedule_failed(
+async fn mark_schedule_failed(
     db: &Database,
     board_id: &str,
     schedule_id: &str,
     reason: &str,
     now_str: &str,
 ) -> BoardResult<()> {
-    db.with_tx(|tx| {
-        tx.execute(
-            "UPDATE schedules
-             SET status = 'failed', error_message = ?1, updated_at = ?2
-             WHERE board_id = ?3 AND id = ?4 AND status = 'pending'",
-            params![reason, now_str, board_id, schedule_id],
-        )?;
-        Ok(())
-    })
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "UPDATE schedules
+         SET status = 'failed', error_message = ?1, updated_at = ?2
+         WHERE board_id = ?3 AND id = ?4 AND status = 'pending'",
+        sql_args![reason, now_str, board_id, schedule_id],
+    )
+    .await?;
+    tx.commit().await
 }
 
 /// Spawns the background tokio scheduler loop ticking once per second.
@@ -982,7 +997,7 @@ pub fn spawn_scheduler_loop(state: AppState) -> tokio::task::JoinHandle<()> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(err) = fire_due_schedules(&state) {
+            if let Err(err) = fire_due_schedules(&state).await {
                 tracing::warn!("scheduler tick error: {err}");
             }
         }

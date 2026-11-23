@@ -2,18 +2,18 @@ use std::collections::BTreeMap;
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::actors::{CallerContext, Principal};
-use crate::db::Database;
+use crate::db::{Database, DbRow, DbTx, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventType};
 use crate::grants;
 use crate::id::{new_message_id, prefixed_id};
 use crate::labels;
 use crate::messages::{self, MessageView, StoredMessageRow, ThreadView};
+use crate::sql_args;
 use crate::validate::{validate_channel_path, validate_slug};
 use crate::watchers::hmac_sha256_hex;
 use crate::AppState;
@@ -344,78 +344,76 @@ fn caller_project_id_opt(caller: &CallerContext) -> Option<&str> {
     }
 }
 
-fn map_source_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSyncSource> {
-    let platform_str: String = r.get(7)?;
-    let dir_str: String = r.get(8)?;
-    let mappings_json: String = r.get(9)?;
+fn map_source_row(r: &DbRow) -> BoardResult<StoredSyncSource> {
+    let platform_str = r.get_str(7)?;
+    let dir_str = r.get_str(8)?;
+    let mappings_json = r.get_str(9)?;
     let platform = SyncPlatform::parse(&platform_str).unwrap_or(SyncPlatform::Custom);
     let direction = SyncDirection::parse(&dir_str).unwrap_or(platform.default_direction());
     let mappings: BTreeMap<String, MappingTarget> =
         serde_json::from_str(&mappings_json).unwrap_or_default();
     Ok(StoredSyncSource {
-        id: r.get(0)?,
-        board_id: r.get(1)?,
-        key: r.get(2)?,
-        project_id: r.get(3)?,
-        project_name: r.get(4)?,
-        environment: r.get(5)?,
-        owner_principal: r.get(6)?,
+        id: r.get_str(0)?,
+        board_id: r.get_str(1)?,
+        key: r.get_str(2)?,
+        project_id: r.get_str(3)?,
+        project_name: r.get_str(4)?,
+        environment: r.get_str(5)?,
+        owner_principal: r.get_str(6)?,
         platform,
         direction,
         mappings,
-        webhook_secret: r.get(10)?,
-        outbound_url: r.get(11)?,
-        outbound_token: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
+        webhook_secret: r.get_opt_str(10)?,
+        outbound_url: r.get_opt_str(11)?,
+        outbound_token: r.get_opt_str(12)?,
+        created_at: r.get_str(13)?,
+        updated_at: r.get_str(14)?,
     })
 }
 
-fn load_sources_for_board_tx(
-    conn: &Connection,
+async fn load_sources_for_board_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
 ) -> BoardResult<Vec<StoredSyncSource>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
-                platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
-                created_at, updated_at
-         FROM sync_sources
-         WHERE board_id = ?1
-         ORDER BY created_at ASC",
-    )?;
-    let rows = stmt.query_map(params![board_id], map_source_row)?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
+    let rows = conn
+        .fetch_all(
+            "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
+                    platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
+                    created_at, updated_at
+             FROM sync_sources
+             WHERE board_id = ?1
+             ORDER BY created_at ASC",
+            sql_args![board_id],
+        )
+        .await?;
+    rows.iter().map(map_source_row).collect()
 }
 
-fn load_source_by_id_tx(
-    conn: &Connection,
+async fn load_source_by_id_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     source_id: &str,
 ) -> BoardResult<Option<StoredSyncSource>> {
-    conn.query_row(
-        "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
-                platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
-                created_at, updated_at
-         FROM sync_sources
-         WHERE id = ?1",
-        params![source_id],
-        map_source_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
+                    platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
+                    created_at, updated_at
+             FROM sync_sources
+             WHERE id = ?1",
+            sql_args![source_id],
+        )
+        .await?;
+    row.as_ref().map(map_source_row).transpose()
 }
 
 /// Resolves `<key>` (preferring caller's project, or unique key on board) or `<project>/<key>`.
-fn resolve_source_by_key_tx(
-    conn: &Connection,
+async fn resolve_source_by_key_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     key_spec: &str,
     caller: Option<&CallerContext>,
 ) -> BoardResult<Option<StoredSyncSource>> {
-    let sources = load_sources_for_board_tx(conn, board_id)?;
+    let sources = load_sources_for_board_tx(conn, board_id).await?;
     if let Some((proj_part, k_part)) = key_spec.split_once('/') {
         return Ok(sources.into_iter().find(|s| {
             (s.project_name.eq_ignore_ascii_case(proj_part) || s.project_id == proj_part)
@@ -456,7 +454,7 @@ fn require_sync_allowed(caller: &CallerContext) -> BoardResult<()> {
 }
 
 /// Registers or updates a sync source with per-project key namespacing and production precedence.
-pub fn register_source(
+pub async fn register_source(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -481,349 +479,347 @@ pub fn register_source(
         .unwrap_or_else(|| input.platform.default_direction());
     let (project_id, project_name, env) = caller_project_info(caller);
 
-    db.with_tx(|tx| {
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        // Must have `sync` on all mapped channels (or `*` if no mappings yet)
-        if input.mappings.is_empty() {
-            if !caller.is_unrestricted_owner()
-                && !grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_sync()
-            {
-                return Err(BoardError::forbidden(
-                    "registering a sync source requires 'sync' permission",
-                ));
-            }
-        } else {
-            for target in input.mappings.values() {
-                for ch in target.all_board_channels() {
-                    let perms = grants::caller_permissions_on_channel(&board_grants, caller, ch);
-                    if !caller.is_unrestricted_owner() && !perms.can_sync() {
-                        return Err(BoardError::forbidden(format!(
-                            "syncing channel '{ch}' requires 'sync' permission in '{ch}'"
-                        )));
-                    }
+    let mut tx = db.begin_tx().await?;
+    tx.advisory_xact_lock("sync_src", &format!("{board_id}:{project_id}:{key}"))
+        .await?;
+
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    if input.mappings.is_empty() {
+        if !caller.is_unrestricted_owner()
+            && !grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_sync()
+        {
+            return Err(BoardError::forbidden(
+                "registering a sync source requires 'sync' permission",
+            ));
+        }
+    } else {
+        for target in input.mappings.values() {
+            for ch in target.all_board_channels() {
+                let perms = grants::caller_permissions_on_channel(&board_grants, caller, ch);
+                if !caller.is_unrestricted_owner() && !perms.can_sync() {
+                    return Err(BoardError::forbidden(format!(
+                        "syncing channel '{ch}' requires 'sync' permission in '{ch}'"
+                    )));
                 }
             }
         }
+    }
 
-        let existing: Option<StoredSyncSource> = tx
-            .query_row(
-                "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
-                        platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
-                        created_at, updated_at
-                 FROM sync_sources
-                 WHERE board_id = ?1 AND project_id = ?2 AND key = ?3",
-                params![board_id, project_id, key],
-                map_source_row,
-            )
-            .optional()?;
+    let existing = tx
+        .fetch_optional(
+            "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
+                    platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
+                    created_at, updated_at
+             FROM sync_sources
+             WHERE board_id = ?1 AND project_id = ?2 AND key = ?3",
+            sql_args![board_id, &project_id, &key],
+        )
+        .await?
+        .as_ref()
+        .map(map_source_row)
+        .transpose()?;
 
-        let now = format_utc_ms(Utc::now());
-        let mappings_json = serde_json::to_string(&input.mappings)
-            .map_err(|e| BoardError::internal(format!("failed serializing mappings: {e}")))?;
+    let now = format_utc_ms(Utc::now());
+    let mappings_json = serde_json::to_string(&input.mappings)
+        .map_err(|e| BoardError::internal(format!("failed serializing mappings: {e}")))?;
+    let caller_principal = caller.principal_id();
 
-        if let Some(ex) = existing {
-            // Production supersedes preview/dev; non-production cannot overwrite production or another non-prod
-            if ex.environment == "production" && env != "production" {
-                return Err(BoardError::conflict(format!(
-                    "production deployment owns sync key '{key}'; non-production environment '{env}' cannot supersede it"
-                )));
-            }
-            if ex.environment != "production" && env != "production" && ex.environment != env {
-                return Err(BoardError::conflict(format!(
-                    "environment '{}' already owns sync key '{key}'; only production may supersede it",
-                    ex.environment
-                )));
-            }
-
-            tx.execute(
-                "UPDATE sync_sources
-                 SET environment = ?1, owner_principal = ?2, platform = ?3, direction = ?4,
-                     mappings_json = ?5, webhook_secret = COALESCE(?6, webhook_secret),
-                     outbound_url = COALESCE(?7, outbound_url),
-                     outbound_token = COALESCE(?8, outbound_token), updated_at = ?9
-                 WHERE id = ?10",
-                params![
-                    env,
-                    caller.principal_id(),
-                    input.platform.as_str(),
-                    direction.as_str(),
-                    mappings_json,
-                    input.webhook_secret,
-                    input.outbound_url,
-                    input.outbound_token,
-                    now,
-                    ex.id
-                ],
-            )?;
-            let updated = load_source_by_id_tx(tx, &ex.id)?.unwrap();
-            return Ok((updated.to_view(caller_project_id_opt(caller)), false));
+    if let Some(ex) = existing {
+        if ex.environment == "production" && env != "production" {
+            return Err(BoardError::conflict(format!(
+                "production deployment owns sync key '{key}'; non-production environment '{env}' cannot supersede it"
+            )));
+        }
+        if ex.environment != "production" && env != "production" && ex.environment != env {
+            return Err(BoardError::conflict(format!(
+                "environment '{}' already owns sync key '{key}'; only production may supersede it",
+                ex.environment
+            )));
         }
 
-        let id = prefixed_id("syn");
         tx.execute(
-            "INSERT INTO sync_sources (
-                id, board_id, key, project_id, project_name, environment, owner_principal,
-                platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
-            params![
-                id,
-                board_id,
-                key,
-                project_id,
-                project_name,
-                env,
-                caller.principal_id(),
+            "UPDATE sync_sources
+             SET environment = ?1, owner_principal = ?2, platform = ?3, direction = ?4,
+                 mappings_json = ?5, webhook_secret = COALESCE(?6, webhook_secret),
+                 outbound_url = COALESCE(?7, outbound_url),
+                 outbound_token = COALESCE(?8, outbound_token), updated_at = ?9
+             WHERE id = ?10",
+            sql_args![
+                &env,
+                &caller_principal,
                 input.platform.as_str(),
                 direction.as_str(),
-                mappings_json,
-                input.webhook_secret,
-                input.outbound_url,
-                input.outbound_token,
-                now
+                &mappings_json,
+                &input.webhook_secret,
+                &input.outbound_url,
+                &input.outbound_token,
+                &now,
+                &ex.id
             ],
-        )?;
-        let created = load_source_by_id_tx(tx, &id)?.unwrap();
-        Ok((created.to_view(caller_project_id_opt(caller)), true))
-    })
+        )
+        .await?;
+        let updated = load_source_by_id_tx(&mut tx, &ex.id).await?.unwrap();
+        tx.commit().await?;
+        return Ok((updated.to_view(caller_project_id_opt(caller)), false));
+    }
+
+    let id = prefixed_id("syn");
+    tx.execute(
+        "INSERT INTO sync_sources (
+            id, board_id, key, project_id, project_name, environment, owner_principal,
+            platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
+            created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        sql_args![
+            &id,
+            board_id,
+            &key,
+            &project_id,
+            &project_name,
+            &env,
+            &caller_principal,
+            input.platform.as_str(),
+            direction.as_str(),
+            &mappings_json,
+            &input.webhook_secret,
+            &input.outbound_url,
+            &input.outbound_token,
+            &now
+        ],
+    )
+    .await?;
+    let created = load_source_by_id_tx(&mut tx, &id).await?.unwrap();
+    tx.commit().await?;
+    Ok((created.to_view(caller_project_id_opt(caller)), true))
 }
 
-pub fn list_sources(
+pub async fn list_sources(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<Vec<SyncSourceView>> {
     require_sync_allowed(caller)?;
     let pid = caller_project_id_opt(caller);
-    db.with_conn(|conn| {
-        let sources = load_sources_for_board_tx(conn, board_id)?;
-        Ok(sources.into_iter().map(|s| s.to_view(pid)).collect())
-    })
+    let mut conn = db.read_conn();
+    let sources = load_sources_for_board_tx(&mut conn, board_id).await?;
+    Ok(sources.into_iter().map(|s| s.to_view(pid)).collect())
 }
 
-pub fn delete_source(
+pub async fn delete_source(
     db: &Database,
     board_id: &str,
     key_spec: &str,
     caller: &CallerContext,
 ) -> BoardResult<String> {
     require_sync_allowed(caller)?;
-    db.with_tx(|tx| {
-        let src = resolve_source_by_key_tx(tx, board_id, key_spec, Some(caller))?
-            .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let is_owner_principal = src.owner_principal == caller.principal_id();
-        let has_manage_star = caller.is_unrestricted_owner()
-            || grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage();
-        if !is_owner_principal && !has_manage_star {
-            return Err(BoardError::forbidden(
-                "deleting another project's sync source requires 'manage' at '*'",
-            ));
-        }
-        tx.execute("DELETE FROM sync_sources WHERE id = ?1", params![src.id])?;
-        Ok(src.key)
-    })
+    let mut tx = db.begin_tx().await?;
+    let src = resolve_source_by_key_tx(&mut tx, board_id, key_spec, Some(caller))
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let is_owner_principal = src.owner_principal == caller.principal_id();
+    let has_manage_star = caller.is_unrestricted_owner()
+        || grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage();
+    if !is_owner_principal && !has_manage_star {
+        return Err(BoardError::forbidden(
+            "deleting another project's sync source requires 'manage' at '*'",
+        ));
+    }
+    tx.execute("DELETE FROM sync_sources WHERE id = ?1", sql_args![&src.id])
+        .await?;
+    tx.commit().await?;
+    Ok(src.key)
 }
 
 /// Returns raw inbound webhook inbox for `key_spec` (newest first). Requires `*` `sync`.
-pub fn get_inbox(
+pub async fn get_inbox(
     db: &Database,
     board_id: &str,
     key_spec: &str,
     caller: &CallerContext,
 ) -> BoardResult<Vec<SyncInboxItem>> {
     require_sync_allowed(caller)?;
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let can_sync_all = grants::caller_permissions_at_pattern(&board_grants, caller, "*")
-            .can_sync()
-            && !board_grants.iter().any(|g| {
-                g.can.keys().any(|pat| {
-                    !grants::caller_permissions_at_pattern(&board_grants, caller, pat).can_sync()
-                })
-            });
-        if !can_sync_all {
-            return Err(BoardError::forbidden(
-                "reading sync inbox requires 'sync' permission in every channel ('*')",
-            ));
-        }
-        let src = resolve_source_by_key_tx(conn, board_id, key_spec, Some(caller))?
-            .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let can_sync_all = grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_sync()
+        && !board_grants.iter().any(|g| {
+            g.can.keys().any(|pat| {
+                !grants::caller_permissions_at_pattern(&board_grants, caller, pat).can_sync()
+            })
+        });
+    if !can_sync_all {
+        return Err(BoardError::forbidden(
+            "reading sync inbox requires 'sync' permission in every channel ('*')",
+        ));
+    }
+    let src = resolve_source_by_key_tx(&mut conn, board_id, key_spec, Some(caller))
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
 
-        let mut stmt = conn.prepare(
+    let rows = conn
+        .fetch_all(
             "SELECT id, event_type, headers_json, body_json, received_at
              FROM sync_inbox
              WHERE board_id = ?1 AND source_id = ?2
              ORDER BY id DESC",
-        )?;
-        let rows = stmt.query_map(params![board_id, src.id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, event_type, h_json, b_json, received_at) = row?;
-            out.push(SyncInboxItem {
-                id,
-                event_type,
-                headers: serde_json::from_str(&h_json).unwrap_or(Value::Null),
-                body: serde_json::from_str(&b_json).unwrap_or(Value::Null),
-                received_at,
-            });
-        }
-        Ok(out)
-    })
+            sql_args![board_id, &src.id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let h_json = r.get_str(2)?;
+        let b_json = r.get_str(3)?;
+        out.push(SyncInboxItem {
+            id: r.get_i64(0)?,
+            event_type: r.get_str(1)?,
+            headers: serde_json::from_str(&h_json).unwrap_or(Value::Null),
+            body: serde_json::from_str(&b_json).unwrap_or(Value::Null),
+            received_at: r.get_str(4)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Returns sync links and recent deliveries for `key_spec` (`sources <key> read`). Requires `*` `manage`.
-pub fn get_source_records(
+pub async fn get_source_records(
     db: &Database,
     board_id: &str,
     key_spec: &str,
     caller: &CallerContext,
 ) -> BoardResult<(SyncSourceView, Vec<ThreadSyncLinkView>, Vec<SyncDeliveryView>)> {
     require_sync_allowed(caller)?;
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let can_manage_all = caller.is_unrestricted_owner()
-            || (grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage()
-                && !board_grants.iter().any(|g| {
-                    g.can.keys().any(|pat| {
-                        !grants::caller_permissions_at_pattern(&board_grants, caller, pat)
-                            .can_manage()
-                    })
-                }));
-        if !can_manage_all {
-            return Err(BoardError::forbidden(
-                "reading sync source records requires 'manage' permission in every channel ('*')",
-            ));
-        }
-        let src = resolve_source_by_key_tx(conn, board_id, key_spec, Some(caller))?
-            .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let can_manage_all = caller.is_unrestricted_owner()
+        || (grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage()
+            && !board_grants.iter().any(|g| {
+                g.can.keys().any(|pat| {
+                    !grants::caller_permissions_at_pattern(&board_grants, caller, pat).can_manage()
+                })
+            }));
+    if !can_manage_all {
+        return Err(BoardError::forbidden(
+            "reading sync source records requires 'manage' permission in every channel ('*')",
+        ));
+    }
+    let src = resolve_source_by_key_tx(&mut conn, board_id, key_spec, Some(caller))
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?;
 
-        let mut stmt = conn.prepare(
+    let link_rows = conn
+        .fetch_all(
             "SELECT id, thread_root_id, channel, platform, platform_channel, platform_thread_id,
                     platform_url, direction, created_at
              FROM thread_sync_links
              WHERE board_id = ?1 AND source_id = ?2
              ORDER BY created_at DESC",
-        )?;
-        let links: Vec<ThreadSyncLinkView> = stmt
-            .query_map(params![board_id, src.id], |r| {
-                let p_str: String = r.get(3)?;
-                let d_str: String = r.get(7)?;
-                Ok(ThreadSyncLinkView {
-                    id: r.get(0)?,
-                    thread_root_id: r.get(1)?,
-                    channel: r.get(2)?,
-                    source_key: src.key.clone(),
-                    platform: SyncPlatform::parse(&p_str).unwrap_or(src.platform),
-                    platform_channel: r.get(4)?,
-                    platform_thread_id: r.get(5)?,
-                    platform_url: r.get(6)?,
-                    direction: SyncDirection::parse(&d_str).unwrap_or(src.direction),
-                    created_at: r.get(8)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            sql_args![board_id, &src.id],
+        )
+        .await?;
+    let mut links = Vec::with_capacity(link_rows.len());
+    for r in link_rows {
+        let p_str = r.get_str(3)?;
+        let d_str = r.get_str(7)?;
+        links.push(ThreadSyncLinkView {
+            id: r.get_str(0)?,
+            thread_root_id: r.get_str(1)?,
+            channel: r.get_str(2)?,
+            source_key: src.key.clone(),
+            platform: SyncPlatform::parse(&p_str).unwrap_or(src.platform),
+            platform_channel: r.get_str(4)?,
+            platform_thread_id: r.get_str(5)?,
+            platform_url: r.get_opt_str(6)?,
+            direction: SyncDirection::parse(&d_str).unwrap_or(src.direction),
+            created_at: r.get_str(8)?,
+        });
+    }
 
-        let mut d_stmt = conn.prepare(
+    let deliv_rows = conn
+        .fetch_all(
             "SELECT id, message_id, kind, status, attempts, last_http_status, last_error, updated_at
              FROM sync_deliveries
              WHERE board_id = ?1 AND source_id = ?2
              ORDER BY created_at DESC
              LIMIT 100",
-        )?;
-        let deliveries: Vec<SyncDeliveryView> = d_stmt
-            .query_map(params![board_id, src.id], |r| {
-                Ok(SyncDeliveryView {
-                    id: r.get(0)?,
-                    message_id: r.get(1)?,
-                    kind: r.get(2)?,
-                    status: r.get(3)?,
-                    attempts: r.get(4)?,
-                    last_http_status: r.get(5)?,
-                    last_error: r.get(6)?,
-                    updated_at: r.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            sql_args![board_id, &src.id],
+        )
+        .await?;
+    let mut deliveries = Vec::with_capacity(deliv_rows.len());
+    for r in deliv_rows {
+        deliveries.push(SyncDeliveryView {
+            id: r.get_str(0)?,
+            message_id: r.get_str(1)?,
+            kind: r.get_str(2)?,
+            status: r.get_str(3)?,
+            attempts: r.get_i64(4)?,
+            last_http_status: r.get_opt_i64(5)?,
+            last_error: r.get_opt_str(6)?,
+            updated_at: r.get_str(7)?,
+        });
+    }
 
-        Ok((src.to_view(caller_project_id_opt(caller)), links, deliveries))
-    })
+    Ok((src.to_view(caller_project_id_opt(caller)), links, deliveries))
 }
 
 /// Lists sync links for a thread (`GET .../threads/{id}/sync`).
-pub fn list_thread_links(
+pub async fn list_thread_links(
     db: &Database,
     board_id: &str,
     message_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<Vec<ThreadSyncLinkView>> {
-    db.with_conn(|conn| {
-        let msg = messages::load_stored_message_tx(conn, board_id, message_id)?.ok_or_else(|| {
+    let mut conn = db.read_conn();
+    let msg = messages::load_stored_message_tx(&mut conn, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if !grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel).can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{message_id}' not found"),
-            ));
-        }
-        let root_id = msg.re.unwrap_or(msg.id);
-        let caller_pid = caller_project_id_opt(caller);
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if !grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel).can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{message_id}' not found"),
+        ));
+    }
+    let root_id = msg.re.unwrap_or(msg.id);
+    let caller_pid = caller_project_id_opt(caller);
 
-        let mut stmt = conn.prepare(
+    let rows = conn
+        .fetch_all(
             "SELECT l.id, l.thread_root_id, l.channel, l.source_id, l.platform,
                     l.platform_channel, l.platform_thread_id, l.platform_url, l.direction, l.created_at
              FROM thread_sync_links l
              WHERE l.board_id = ?1 AND l.thread_root_id = ?2
              ORDER BY l.created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![board_id, root_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, String>(9)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (id, root, ch, src_id, plat, pch, pth, purl, dir, created_at) = r?;
-            let src_key = load_source_by_id_tx(conn, &src_id)?
-                .map(|s| s.qualified_key_for(caller_pid))
-                .unwrap_or(src_id);
-            out.push(ThreadSyncLinkView {
-                id,
-                thread_root_id: root,
-                channel: ch,
-                source_key: src_key,
-                platform: SyncPlatform::parse(&plat).unwrap_or(SyncPlatform::Custom),
-                platform_channel: pch,
-                platform_thread_id: pth,
-                platform_url: purl,
-                direction: SyncDirection::parse(&dir).unwrap_or(SyncDirection::Bidirectional),
-                created_at,
-            });
-        }
-        Ok(out)
-    })
+            sql_args![board_id, &root_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let src_id = r.get_str(3)?;
+        let plat = r.get_str(4)?;
+        let dir = r.get_str(8)?;
+        let src_key = load_source_by_id_tx(&mut conn, &src_id)
+            .await?
+            .map(|s| s.qualified_key_for(caller_pid))
+            .unwrap_or(src_id);
+        out.push(ThreadSyncLinkView {
+            id: r.get_str(0)?,
+            thread_root_id: r.get_str(1)?,
+            channel: r.get_str(2)?,
+            source_key: src_key,
+            platform: SyncPlatform::parse(&plat).unwrap_or(SyncPlatform::Custom),
+            platform_channel: r.get_str(5)?,
+            platform_thread_id: r.get_str(6)?,
+            platform_url: r.get_opt_str(7)?,
+            direction: SyncDirection::parse(&dir).unwrap_or(SyncDirection::Bidirectional),
+            created_at: r.get_str(9)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Parses a target string like `slack:#incidents`, `slack:C0123:1727000.001`, `github:acme/www:123`,
@@ -854,7 +850,7 @@ fn parse_sync_target(target: &str) -> BoardResult<(String, String, String)> {
 
 /// Links an existing board thread to a platform target (`POST .../threads/{id}/sync`)
 /// and queues backfill of non-`noSync` messages (unless root has `noSync: true`).
-pub fn link_thread(
+pub async fn link_thread(
     db: &Database,
     board_id: &str,
     message_id: &str,
@@ -864,158 +860,169 @@ pub fn link_thread(
     require_sync_allowed(caller)?;
     let (source_key, platform_channel, platform_thread_id) = parse_sync_target(&input.target)?;
 
-    db.with_tx(|tx| {
-        let msg = messages::load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
+    let mut tx = db.begin_tx().await?;
+    let msg = messages::load_stored_message_tx(&mut tx, board_id, message_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
-        if !perms.can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("message '{message_id}' not found"),
-            ));
-        }
-        if !perms.can_sync() {
-            return Err(BoardError::forbidden(format!(
-                "syncing a thread in '{}' requires 'sync' permission",
-                msg.channel
-            )));
-        }
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
+    if !perms.can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("message '{message_id}' not found"),
+        ));
+    }
+    if !perms.can_sync() {
+        return Err(BoardError::forbidden(format!(
+            "syncing a thread in '{}' requires 'sync' permission",
+            msg.channel
+        )));
+    }
 
-        let root_id = msg.re.clone().unwrap_or_else(|| msg.id.clone());
-        let root_msg = messages::load_stored_message_tx(tx, board_id, &root_id)?.unwrap();
-        let src = resolve_source_by_key_tx(tx, board_id, &source_key, Some(caller))?
-            .ok_or_else(|| {
-                BoardError::not_found(format!("sync source '{source_key}' not found"))
-            })?;
+    let root_id = msg.re.clone().unwrap_or_else(|| msg.id.clone());
+    let root_msg = messages::load_stored_message_tx(&mut tx, board_id, &root_id)
+        .await?
+        .unwrap();
+    let src = resolve_source_by_key_tx(&mut tx, board_id, &source_key, Some(caller))
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("sync source '{source_key}' not found")))?;
 
-        // Check `409 already_synced`: 1 platform thread -> at most 1 board thread
-        let existing_root: Option<String> = tx
-            .query_row(
-                "SELECT thread_root_id FROM thread_sync_links
-                 WHERE board_id = ?1 AND source_id = ?2 AND platform_channel = ?3 AND platform_thread_id = ?4",
-                params![board_id, src.id, platform_channel, platform_thread_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(other_root) = existing_root {
-            if other_root != root_id {
-                return Err(BoardError::new(
-                    ErrorCode::AlreadySynced,
-                    format!(
-                        "platform thread '{platform_channel}:{platform_thread_id}' is already linked to another board thread"
-                    ),
-                ));
-            }
+    tx.advisory_xact_lock(
+        "sync_link",
+        &format!("{board_id}:{}:{platform_channel}:{platform_thread_id}", src.id),
+    )
+    .await?;
+
+    let existing_root = tx
+        .fetch_optional(
+            "SELECT thread_root_id FROM thread_sync_links
+             WHERE board_id = ?1 AND source_id = ?2 AND platform_channel = ?3 AND platform_thread_id = ?4",
+            sql_args![board_id, &src.id, &platform_channel, &platform_thread_id],
+        )
+        .await?
+        .map(|r| r.get_str(0))
+        .transpose()?;
+    if let Some(other_root) = existing_root {
+        if other_root != root_id {
             return Err(BoardError::new(
                 ErrorCode::AlreadySynced,
                 format!(
-                    "thread '{root_id}' is already linked to '{platform_channel}:{platform_thread_id}'"
+                    "platform thread '{platform_channel}:{platform_thread_id}' is already linked to another board thread"
                 ),
             ));
         }
+        return Err(BoardError::new(
+            ErrorCode::AlreadySynced,
+            format!(
+                "thread '{root_id}' is already linked to '{platform_channel}:{platform_thread_id}'"
+            ),
+        ));
+    }
 
-        let link_id = prefixed_id("lnk");
-        let now = format_utc_ms(Utc::now());
-        tx.execute(
-            "INSERT INTO thread_sync_links (
-                id, board_id, thread_root_id, channel, source_id, platform,
-                platform_channel, platform_thread_id, platform_url, direction, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                link_id,
-                board_id,
-                root_id,
-                root_msg.channel,
-                src.id,
-                src.platform.as_str(),
-                platform_channel,
-                platform_thread_id,
-                input.platform_url,
-                src.direction.as_str(),
-                now
-            ],
-        )?;
+    let link_id = prefixed_id("lnk");
+    let now = format_utc_ms(Utc::now());
+    tx.execute(
+        "INSERT INTO thread_sync_links (
+            id, board_id, thread_root_id, channel, source_id, platform,
+            platform_channel, platform_thread_id, platform_url, direction, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        sql_args![
+            &link_id,
+            board_id,
+            &root_id,
+            &root_msg.channel,
+            &src.id,
+            src.platform.as_str(),
+            &platform_channel,
+            &platform_thread_id,
+            &input.platform_url,
+            src.direction.as_str(),
+            &now
+        ],
+    )
+    .await?;
 
-        // Emit `thread.synced`
-        let snap = messages::build_message_snapshot_tx(tx, &root_msg)?;
-        let root_view = messages::hydrate_message_view_tx(tx, &root_msg)?;
-        let actor_id = caller.actor_id();
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::ThreadSynced,
-                channel: Some(&root_msg.channel),
-                message_id: Some(&root_id),
-                actor_id: Some(&actor_id),
-                payload: json!({
-                    "sourceKey": src.key,
-                    "platform": src.platform.as_str(),
-                    "platformChannel": platform_channel,
-                    "platformThreadId": platform_thread_id,
-                    "platformUrl": input.platform_url
-                }),
-                before_snapshot: Some(&snap),
-                after_snapshot: Some(&snap),
-                after_message: Some(&root_view),
-            },
-        )?;
+    let snap = messages::build_message_snapshot_tx(&mut tx, &root_msg).await?;
+    let root_view = messages::hydrate_message_view_tx(&mut tx, &root_msg).await?;
+    let actor_id = caller.actor_id();
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::ThreadSynced,
+            channel: Some(&root_msg.channel),
+            message_id: Some(&root_id),
+            actor_id: Some(&actor_id),
+            payload: json!({
+                "sourceKey": src.key,
+                "platform": src.platform.as_str(),
+                "platformChannel": platform_channel,
+                "platformThreadId": platform_thread_id,
+                "platformUrl": input.platform_url
+            }),
+            before_snapshot: Some(&snap),
+            after_snapshot: Some(&snap),
+            after_message: Some(&root_view),
+        },
+    )
+    .await?;
 
-        // Queue backfill of root + existing non-`noSync` replies if outbound enabled and root is NOT `noSync`
-        if src.direction.allows_outbound() && !root_msg.no_sync {
-            let mut stmt = tx.prepare(
+    if src.direction.allows_outbound() && !root_msg.no_sync {
+        let id_rows = tx
+            .fetch_all(
                 "SELECT id FROM messages
                  WHERE board_id = ?1 AND (id = ?2 OR re = ?2) AND deleted_at IS NULL
                  ORDER BY seq ASC",
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(params![board_id, root_id], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for mid in ids {
-                if let Some(m) = messages::load_stored_message_tx(tx, board_id, &mid)? {
-                    if m.no_sync || m.from_source.as_deref() == Some(src.key.as_str()) {
-                        continue;
-                    }
-                    let kind = if m.re.is_none() { "post" } else { "reply" };
-                    insert_delivery_for_link_tx(
-                        tx,
-                        board_id,
-                        &src,
-                        &link_id,
-                        &platform_channel,
-                        &platform_thread_id,
-                        &m,
-                        kind,
-                        None,
-                    )?;
+                sql_args![board_id, &root_id],
+            )
+            .await?;
+        for r in id_rows {
+            let mid = r.get_str(0)?;
+            if let Some(m) = messages::load_stored_message_tx(&mut tx, board_id, &mid).await? {
+                if m.no_sync || m.from_source.as_deref() == Some(src.key.as_str()) {
+                    continue;
                 }
+                let kind = if m.re.is_none() { "post" } else { "reply" };
+                insert_delivery_for_link_tx(
+                    &mut tx,
+                    board_id,
+                    &src,
+                    &link_id,
+                    &platform_channel,
+                    &platform_thread_id,
+                    &m,
+                    kind,
+                    None,
+                )
+                .await?;
             }
         }
+    }
 
-        let view = ThreadSyncLinkView {
-            id: link_id,
-            thread_root_id: root_id,
-            channel: root_msg.channel,
-            source_key: src.qualified_key_for(caller_project_id_opt(caller)),
-            platform: src.platform,
-            platform_channel,
-            platform_thread_id,
-            platform_url: input.platform_url,
-            direction: src.direction,
-            created_at: now,
-        };
-        Ok((view, vec![ev.seq]))
-    })
+    tx.commit().await?;
+    let view = ThreadSyncLinkView {
+        id: link_id,
+        thread_root_id: root_id,
+        channel: root_msg.channel,
+        source_key: src.qualified_key_for(caller_project_id_opt(caller)),
+        platform: src.platform,
+        platform_channel,
+        platform_thread_id,
+        platform_url: input.platform_url,
+        direction: src.direction,
+        created_at: now,
+    };
+    Ok((view, vec![ev.seq]))
 }
 
 /// Finds the board thread linked to an external URL (`GET .../sync/linked?url=...`),
 /// visibility-filtered to caller's readable channels.
-pub fn find_linked_thread(
+pub async fn find_linked_thread(
     db: &Database,
     board_id: &str,
     url: &str,
@@ -1025,48 +1032,49 @@ pub fn find_linked_thread(
     if trimmed.is_empty() {
         return Err(BoardError::bad_request("missing 'url' query parameter"));
     }
-    let root_id: String = db.with_conn(|conn| {
-        let link: Option<(String, String)> = conn
-            .query_row(
+    let root_id: String = {
+        let mut conn = db.read_conn();
+        let link = conn
+            .fetch_optional(
                 "SELECT thread_root_id, channel FROM thread_sync_links
                  WHERE board_id = ?1 AND platform_url = ?2
                  LIMIT 1",
-                params![board_id, trimmed],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                sql_args![board_id, trimmed],
             )
-            .optional()?;
+            .await?;
         let found = match link {
-            Some(l) => Some(l),
+            Some(r) => Some((r.get_str(0)?, r.get_str(1)?)),
             None => conn
-                .query_row(
+                .fetch_optional(
                     "SELECT COALESCE(m.re, m.id), m.channel
                      FROM message_sync_map ms
                      JOIN messages m ON m.id = ms.message_id
                      WHERE ms.board_id = ?1 AND ms.platform_url = ?2
                      LIMIT 1",
-                    params![board_id, trimmed],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    sql_args![board_id, trimmed],
                 )
-                .optional()?,
+                .await?
+                .map(|r| Ok::<_, BoardError>((r.get_str(0)?, r.get_str(1)?)))
+                .transpose()?,
         };
         let (root_id, channel) = found.ok_or_else(|| {
             BoardError::not_found(format!("no synced thread found for URL '{trimmed}'"))
         })?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
+        let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
         if !grants::caller_permissions_on_channel(&board_grants, caller, &channel).can_read() {
             return Err(BoardError::not_found(format!(
                 "no synced thread found for URL '{trimmed}'"
             )));
         }
-        Ok(root_id)
-    })?;
+        root_id
+    };
 
-    messages::get_thread(db, board_id, &root_id, caller)
+    messages::get_thread(db, board_id, &root_id, caller).await
 }
 
 /// Forwards typing indicator (`status <= 50 chars`) to all linked outbound sync sources.
 pub async fn send_typing(
-    db: &Database,
+    state: &AppState,
     board_id: &str,
     message_id: &str,
     caller: &CallerContext,
@@ -1089,54 +1097,53 @@ pub async fn send_typing(
         pth: String,
     }
 
-    let targets: Vec<TypingTarget> =
-        db.with_conn(|conn| {
-            let msg =
-                messages::load_stored_message_tx(conn, board_id, message_id)?.ok_or_else(|| {
-                    BoardError::new(
-                        ErrorCode::MessageNotFound,
-                        format!("message '{message_id}' not found"),
-                    )
-                })?;
-            let board_grants = grants::load_grants_tx(conn, board_id)?;
-            let perms =
-                grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
-            if !perms.can_read() {
-                return Err(BoardError::new(
+    let targets: Vec<TypingTarget> = {
+        let mut conn = state.db.read_conn();
+        let msg = messages::load_stored_message_tx(&mut conn, board_id, message_id)
+            .await?
+            .ok_or_else(|| {
+                BoardError::new(
                     ErrorCode::MessageNotFound,
                     format!("message '{message_id}' not found"),
-                ));
-            }
-            if !perms.can_post_new_thread() && !perms.can_sync() {
-                return Err(BoardError::forbidden(
-                    "typing indicator requires 'post' or 'sync' permission",
-                ));
-            }
-            let root_id = msg.re.unwrap_or(msg.id);
-            let mut stmt = conn.prepare(
+                )
+            })?;
+        let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &msg.channel);
+        if !perms.can_read() {
+            return Err(BoardError::new(
+                ErrorCode::MessageNotFound,
+                format!("message '{message_id}' not found"),
+            ));
+        }
+        if !perms.can_post_new_thread() && !perms.can_sync() {
+            return Err(BoardError::forbidden(
+                "typing indicator requires 'post' or 'sync' permission",
+            ));
+        }
+        let root_id = msg.re.unwrap_or(msg.id);
+        let rows = conn
+            .fetch_all(
                 "SELECT s.key, s.platform, s.outbound_url, s.outbound_token, l.platform_channel, l.platform_thread_id
                  FROM thread_sync_links l
                  JOIN sync_sources s ON s.id = l.source_id
                  WHERE l.board_id = ?1 AND l.thread_root_id = ?2",
-            )?;
-            let rows = stmt.query_map(params![board_id, root_id], |r| {
-                Ok(TypingTarget {
-                    key: r.get(0)?,
-                    platform: r.get(1)?,
-                    outbound_url: r.get(2)?,
-                    outbound_token: r.get(3)?,
-                    pch: r.get(4)?,
-                    pth: r.get(5)?,
-                })
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
-        })?;
+                sql_args![board_id, &root_id],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(TypingTarget {
+                key: r.get_str(0)?,
+                platform: r.get_str(1)?,
+                outbound_url: r.get_opt_str(2)?,
+                outbound_token: r.get_opt_str(3)?,
+                pch: r.get_str(4)?,
+                pth: r.get_str(5)?,
+            });
+        }
+        out
+    };
 
-    let http = reqwest::Client::new();
     let mut notified = Vec::new();
     for t in targets {
         let label = format!("{}:{}:{}", t.key, t.pch, t.pth);
@@ -1149,7 +1156,7 @@ pub async fn send_typing(
                 "status": input.status,
                 "actor": caller.handle()
             });
-            let mut req = http.post(&url).json(&payload);
+            let mut req = state.http.post(&url).json(&payload);
             if let Some(tok) = t.outbound_token {
                 req = req.header("authorization", format!("Bearer {tok}"));
             }
@@ -1169,14 +1176,14 @@ pub async fn send_typing(
 /// - NEVER syncs labels (labels are board-only)
 /// - NEVER echoes back to the originating `from_source`
 /// - Only delivers to `bidirectional` / `outbound` sources (skips `inbound`-only like GitHub default)
-pub fn enqueue_outbound_for_message_tx(
-    tx: &Connection,
+pub async fn enqueue_outbound_for_message_tx(
+    tx: &mut DbTx,
     board_id: &str,
     message_id: &str,
     kind: &str,
     extra: Option<Value>,
 ) -> BoardResult<bool> {
-    let Some(msg) = messages::load_stored_message_tx(tx, board_id, message_id)? else {
+    let Some(msg) = messages::load_stored_message_tx(tx, board_id, message_id).await? else {
         return Ok(false);
     };
     if msg.no_sync {
@@ -1185,7 +1192,7 @@ pub fn enqueue_outbound_for_message_tx(
 
     let root_id = msg.re.clone().unwrap_or_else(|| msg.id.clone());
     if msg.re.is_some() {
-        if let Some(root) = messages::load_stored_message_tx(tx, board_id, &root_id)? {
+        if let Some(root) = messages::load_stored_message_tx(tx, board_id, &root_id).await? {
             if root.no_sync {
                 return Ok(false);
             }
@@ -1194,9 +1201,8 @@ pub fn enqueue_outbound_for_message_tx(
 
     let mut queued_any = false;
 
-    // For new root threads (`kind == "post"`), auto-link to any bidirectional/outbound source mapping this channel
     if kind == "post" && msg.re.is_none() {
-        let sources = load_sources_for_board_tx(tx, board_id)?;
+        let sources = load_sources_for_board_tx(tx, board_id).await?;
         for src in sources {
             if !src.direction.allows_outbound() {
                 continue;
@@ -1210,16 +1216,14 @@ pub fn enqueue_outbound_for_message_tx(
                     .iter()
                     .any(|&bc| bc == msg.channel)
                 {
-                    // Avoid duplicate link for same (root, source, platform_ch)
-                    let exists: bool = tx
-                        .query_row(
+                    let exists = tx
+                        .fetch_optional(
                             "SELECT 1 FROM thread_sync_links
                              WHERE board_id = ?1 AND thread_root_id = ?2 AND source_id = ?3 AND platform_channel = ?4",
-                            params![board_id, root_id, src.id, platform_ch],
-                            |_| Ok(true),
+                            sql_args![board_id, &root_id, &src.id, platform_ch],
                         )
-                        .optional()?
-                        .unwrap_or(false);
+                        .await?
+                        .is_some();
                     if !exists {
                         let link_id = prefixed_id("lnk");
                         let pth = prefixed_id("pth");
@@ -1229,49 +1233,52 @@ pub fn enqueue_outbound_for_message_tx(
                                 id, board_id, thread_root_id, channel, source_id, platform,
                                 platform_channel, platform_thread_id, platform_url, direction, created_at
                              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
-                            params![
-                                link_id,
+                            sql_args![
+                                &link_id,
                                 board_id,
-                                root_id,
-                                msg.channel,
-                                src.id,
+                                &root_id,
+                                &msg.channel,
+                                &src.id,
                                 src.platform.as_str(),
                                 platform_ch,
-                                pth,
+                                &pth,
                                 src.direction.as_str(),
-                                now
+                                &now
                             ],
-                        )?;
+                        )
+                        .await?;
                     }
                 }
             }
         }
     }
 
-    // Load all links attached to `root_id`
-    let mut stmt = tx.prepare(
-        "SELECT id, source_id, platform_channel, platform_thread_id, direction
-         FROM thread_sync_links
-         WHERE board_id = ?1 AND thread_root_id = ?2",
-    )?;
-    let links: Vec<(String, String, String, String, String)> = stmt
-        .query_map(params![board_id, root_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let link_rows = tx
+        .fetch_all(
+            "SELECT id, source_id, platform_channel, platform_thread_id, direction
+             FROM thread_sync_links
+             WHERE board_id = ?1 AND thread_root_id = ?2",
+            sql_args![board_id, &root_id],
+        )
+        .await?;
 
-    for (link_id, src_id, pch, pth, dir_str) in links {
+    for r in link_rows {
+        let link_id = r.get_str(0)?;
+        let src_id = r.get_str(1)?;
+        let pch = r.get_str(2)?;
+        let pth = r.get_str(3)?;
+        let dir_str = r.get_str(4)?;
+
         let dir = SyncDirection::parse(&dir_str).unwrap_or(SyncDirection::Inbound);
         if !dir.allows_outbound() {
             continue;
         }
-        let Some(src) = load_source_by_id_tx(tx, &src_id)? else {
+        let Some(src) = load_source_by_id_tx(tx, &src_id).await? else {
             continue;
         };
         if !src.direction.allows_outbound() {
             continue;
         }
-        // Echo suppression: never send a message back to the source it came from
         if msg.from_source.as_deref() == Some(src.key.as_str()) {
             continue;
         }
@@ -1285,7 +1292,8 @@ pub fn enqueue_outbound_for_message_tx(
             &msg,
             kind,
             extra.clone(),
-        )?;
+        )
+        .await?;
         queued_any = true;
     }
 
@@ -1293,8 +1301,8 @@ pub fn enqueue_outbound_for_message_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_delivery_for_link_tx(
-    tx: &Connection,
+async fn insert_delivery_for_link_tx(
+    tx: &mut DbTx,
     board_id: &str,
     src: &StoredSyncSource,
     link_id: &str,
@@ -1304,8 +1312,7 @@ fn insert_delivery_for_link_tx(
     kind: &str,
     extra: Option<Value>,
 ) -> BoardResult<()> {
-    let view = messages::hydrate_message_view_tx(tx, msg)?;
-    // NEVER include labels in outbound payloads (board-only invariant)
+    let view = messages::hydrate_message_view_tx(tx, msg).await?;
     let mut payload = match src.platform {
         SyncPlatform::Slack => json!({
             "kind": kind,
@@ -1365,17 +1372,18 @@ fn insert_delivery_for_link_tx(
             id, board_id, source_id, link_id, message_id, kind, payload_json,
             status, attempts, last_http_status, last_error, next_attempt_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, NULL, NULL, ?8, ?8, ?8)",
-        params![
-            id,
+        sql_args![
+            &id,
             board_id,
-            src.id,
+            &src.id,
             link_id,
-            msg.id,
+            &msg.id,
             kind,
-            payload_json,
-            now
+            &payload_json,
+            &now
         ],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -1391,61 +1399,61 @@ pub async fn process_pending_deliveries_at(
 ) -> BoardResult<DeliveryTickSummary> {
     let now_str = format_utc_ms(now);
     #[allow(clippy::type_complexity)]
-    let due: Vec<(String, String, String, String, String, String, String, i64)> =
-        state.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+    let due: Vec<(String, String, String, String, String, String, String, i64)> = {
+        let mut conn = state.db.read_conn();
+        let rows = conn
+            .fetch_all(
                 "SELECT id, board_id, source_id, link_id, message_id, kind, payload_json, attempts
                  FROM sync_deliveries
                  WHERE status IN ('pending', 'retrying') AND next_attempt_at <= ?1
                  ORDER BY created_at ASC
                  LIMIT 100",
-            )?;
-            let rows = stmt.query_map(params![now_str], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
-        })?;
+                sql_args![&now_str],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push((
+                r.get_str(0)?,
+                r.get_str(1)?,
+                r.get_str(2)?,
+                r.get_str(3)?,
+                r.get_str(4)?,
+                r.get_str(5)?,
+                r.get_str(6)?,
+                r.get_i64(7)?,
+            ));
+        }
+        out
+    };
 
-    let http = reqwest::Client::new();
     let mut summary = DeliveryTickSummary::default();
 
     for (deliv_id, board_id, source_id, link_id, message_id, kind, payload_json, prev_attempts) in
         due
     {
-        let source = state
-            .db
-            .with_conn(|conn| load_source_by_id_tx(conn, &source_id))?;
+        let source = {
+            let mut conn = state.db.read_conn();
+            load_source_by_id_tx(&mut conn, &source_id).await?
+        };
         let Some(src) = source else {
             continue;
         };
         let Some(outbound_url) = src.outbound_url.as_deref() else {
-            // No outbound URL configured -> mark delivered locally
-            state.db.with_tx(|tx| {
-                tx.execute(
-                    "UPDATE sync_deliveries SET status = 'delivered', attempts = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![prev_attempts + 1, now_str, deliv_id],
-                )?;
-                Ok(())
-            })?;
+            let mut tx = state.db.begin_tx().await?;
+            tx.execute(
+                "UPDATE sync_deliveries SET status = 'delivered', attempts = ?1, updated_at = ?2 WHERE id = ?3",
+                sql_args![prev_attempts + 1, &now_str, &deliv_id],
+            )
+            .await?;
+            tx.commit().await?;
             summary.delivered += 1;
             continue;
         };
 
         let attempt = prev_attempts + 1;
-        let mut req = http
+        let mut req = state
+            .http
             .post(outbound_url)
             .header("content-type", "application/json")
             .header("x-board-delivery-id", &deliv_id)
@@ -1477,160 +1485,170 @@ pub async fn process_pending_deliveries_at(
         };
 
         if ok {
-            let emitted_seqs = state.db.with_tx(|tx| {
-                tx.execute(
-                    "UPDATE sync_deliveries
-                     SET status = 'delivered', attempts = ?1, last_http_status = ?2,
-                         last_error = NULL, updated_at = ?3
-                     WHERE id = ?4",
-                    params![attempt, status_code, now_str, deliv_id],
-                )?;
+            let mut tx = state.db.begin_tx().await?;
+            tx.execute(
+                "UPDATE sync_deliveries
+                 SET status = 'delivered', attempts = ?1, last_http_status = ?2,
+                     last_error = NULL, updated_at = ?3
+                 WHERE id = ?4",
+                sql_args![attempt, status_code, &now_str, &deliv_id],
+            )
+            .await?;
 
-                if let Some(body) = &resp_json {
-                    if let Some(p_tid) = body["platformThreadId"].as_str() {
-                        let _ = tx.execute(
+            if let Some(body) = &resp_json {
+                if let Some(p_tid) = body["platformThreadId"].as_str() {
+                    let _ = tx
+                        .execute(
                             "UPDATE thread_sync_links
                              SET platform_thread_id = ?1,
                                  platform_url = COALESCE(?2, platform_url)
                              WHERE id = ?3",
-                            params![p_tid, body["platformUrl"].as_str(), link_id],
-                        );
-                    }
-                    if let Some(p_mid) = body["platformMessageId"].as_str() {
-                        let _ = tx.execute(
-                            "INSERT OR IGNORE INTO message_sync_map (
+                            sql_args![p_tid, body["platformUrl"].as_str(), &link_id],
+                        )
+                        .await;
+                }
+                if let Some(p_mid) = body["platformMessageId"].as_str() {
+                    let _ = tx
+                        .execute(
+                            "INSERT INTO message_sync_map (
                                 board_id, source_id, message_id, platform_message_id, platform_url, created_at
-                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![
-                                board_id,
-                                source_id,
-                                message_id,
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                             ON CONFLICT DO NOTHING",
+                            sql_args![
+                                &board_id,
+                                &source_id,
+                                &message_id,
                                 p_mid,
                                 body["platformUrl"].as_str(),
-                                now_str
+                                &now_str
                             ],
-                        );
-                    }
+                        )
+                        .await;
                 }
+            }
 
-                let mut seqs = Vec::new();
-                if let Some(stored) = messages::load_stored_message_tx(tx, &board_id, &message_id)?
-                {
-                    let snap = messages::build_message_snapshot_tx(tx, &stored)?;
-                    let view = messages::hydrate_message_view_tx(tx, &stored)?;
-                    let ev = events::append_event_tx(
-                        tx,
+            let mut seqs = Vec::new();
+            if let Some(stored) =
+                messages::load_stored_message_tx(&mut tx, &board_id, &message_id).await?
+            {
+                let snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+                let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+                let ev = events::append_event_tx(
+                    &mut tx,
+                    EventAppend {
+                        board_id: &board_id,
+                        event_type: EventType::MessageSynced,
+                        channel: Some(&stored.channel),
+                        message_id: Some(&message_id),
+                        actor_id: Some(&src.owner_principal),
+                        payload: json!({
+                            "sourceKey": src.key,
+                            "platform": src.platform.as_str(),
+                            "kind": kind
+                        }),
+                        before_snapshot: Some(&snap),
+                        after_snapshot: Some(&snap),
+                        after_message: Some(&view),
+                    },
+                )
+                .await?;
+                seqs.push(ev.seq);
+
+                if !view.attachments.is_empty() && matches!(kind.as_str(), "post" | "reply") {
+                    let ev_files = events::append_event_tx(
+                        &mut tx,
                         EventAppend {
                             board_id: &board_id,
-                            event_type: EventType::MessageSynced,
+                            event_type: EventType::MessageFilesSynced,
                             channel: Some(&stored.channel),
                             message_id: Some(&message_id),
                             actor_id: Some(&src.owner_principal),
                             payload: json!({
                                 "sourceKey": src.key,
-                                "platform": src.platform.as_str(),
-                                "kind": kind
+                                "count": view.attachments.len()
                             }),
                             before_snapshot: Some(&snap),
                             after_snapshot: Some(&snap),
                             after_message: Some(&view),
                         },
-                    )?;
-                    seqs.push(ev.seq);
-
-                    if !view.attachments.is_empty() && matches!(kind.as_str(), "post" | "reply") {
-                        let ev_files = events::append_event_tx(
-                            tx,
-                            EventAppend {
-                                board_id: &board_id,
-                                event_type: EventType::MessageFilesSynced,
-                                channel: Some(&stored.channel),
-                                message_id: Some(&message_id),
-                                actor_id: Some(&src.owner_principal),
-                                payload: json!({
-                                    "sourceKey": src.key,
-                                    "count": view.attachments.len()
-                                }),
-                                before_snapshot: Some(&snap),
-                                after_snapshot: Some(&snap),
-                                after_message: Some(&view),
-                            },
-                        )?;
-                        seqs.push(ev_files.seq);
-                    }
+                    )
+                    .await?;
+                    seqs.push(ev_files.seq);
                 }
-                Ok(seqs)
-            })?;
-            for seq in emitted_seqs {
+            }
+            tx.commit().await?;
+            for seq in seqs {
                 state.events.notify(&board_id, seq);
             }
             summary.delivered += 1;
         } else {
             let is_best_effort = matches!(kind.as_str(), "edit" | "delete" | "react" | "unreact");
             if is_best_effort {
-                state.db.with_tx(|tx| {
-                    tx.execute(
-                        "UPDATE sync_deliveries
-                         SET status = 'failed', attempts = ?1, last_http_status = ?2,
-                             last_error = ?3, updated_at = ?4
-                         WHERE id = ?5",
-                        params![attempt, status_code, err_msg, now_str, deliv_id],
-                    )?;
-                    Ok(())
-                })?;
+                let mut tx = state.db.begin_tx().await?;
+                tx.execute(
+                    "UPDATE sync_deliveries
+                     SET status = 'failed', attempts = ?1, last_http_status = ?2,
+                         last_error = ?3, updated_at = ?4
+                     WHERE id = ?5",
+                    sql_args![attempt, status_code, &err_msg, &now_str, &deliv_id],
+                )
+                .await?;
+                tx.commit().await?;
                 summary.failed += 1;
             } else if attempt < MAX_SYNC_RETRIES {
                 let backoff_secs = 1i64 << (attempt - 1).min(5);
                 let next_at = format_utc_ms(now + Duration::seconds(backoff_secs));
-                state.db.with_tx(|tx| {
-                    tx.execute(
-                        "UPDATE sync_deliveries
-                         SET status = 'retrying', attempts = ?1, last_http_status = ?2,
-                             last_error = ?3, next_attempt_at = ?4, updated_at = ?5
-                         WHERE id = ?6",
-                        params![attempt, status_code, err_msg, next_at, now_str, deliv_id],
-                    )?;
-                    Ok(())
-                })?;
+                let mut tx = state.db.begin_tx().await?;
+                tx.execute(
+                    "UPDATE sync_deliveries
+                     SET status = 'retrying', attempts = ?1, last_http_status = ?2,
+                         last_error = ?3, next_attempt_at = ?4, updated_at = ?5
+                     WHERE id = ?6",
+                    sql_args![attempt, status_code, &err_msg, &next_at, &now_str, &deliv_id],
+                )
+                .await?;
+                tx.commit().await?;
                 summary.retried += 1;
             } else {
-                // Attempt 5 failed -> mark failed and emit `message.sync_failed` (non-blocking)
-                let emitted_seq = state.db.with_tx(|tx| {
-                    tx.execute(
-                        "UPDATE sync_deliveries
-                         SET status = 'failed', attempts = ?1, last_http_status = ?2,
-                             last_error = ?3, updated_at = ?4
-                         WHERE id = ?5",
-                        params![attempt, status_code, err_msg, now_str, deliv_id],
-                    )?;
-                    if let Some(stored) =
-                        messages::load_stored_message_tx(tx, &board_id, &message_id)?
-                    {
-                        let snap = messages::build_message_snapshot_tx(tx, &stored)?;
-                        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-                        let ev = events::append_event_tx(
-                            tx,
-                            EventAppend {
-                                board_id: &board_id,
-                                event_type: EventType::MessageSyncFailed,
-                                channel: Some(&stored.channel),
-                                message_id: Some(&message_id),
-                                actor_id: Some(&src.owner_principal),
-                                payload: json!({
-                                    "sourceKey": src.key,
-                                    "platform": src.platform.as_str(),
-                                    "attempts": attempt,
-                                    "error": err_msg
-                                }),
-                                before_snapshot: Some(&snap),
-                                after_snapshot: Some(&snap),
-                                after_message: Some(&view),
-                            },
-                        )?;
-                        return Ok(Some(ev.seq));
-                    }
-                    Ok(None)
-                })?;
+                let mut tx = state.db.begin_tx().await?;
+                tx.execute(
+                    "UPDATE sync_deliveries
+                     SET status = 'failed', attempts = ?1, last_http_status = ?2,
+                         last_error = ?3, updated_at = ?4
+                     WHERE id = ?5",
+                    sql_args![attempt, status_code, &err_msg, &now_str, &deliv_id],
+                )
+                .await?;
+                let emitted_seq = if let Some(stored) =
+                    messages::load_stored_message_tx(&mut tx, &board_id, &message_id).await?
+                {
+                    let snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+                    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+                    let ev = events::append_event_tx(
+                        &mut tx,
+                        EventAppend {
+                            board_id: &board_id,
+                            event_type: EventType::MessageSyncFailed,
+                            channel: Some(&stored.channel),
+                            message_id: Some(&message_id),
+                            actor_id: Some(&src.owner_principal),
+                            payload: json!({
+                                "sourceKey": src.key,
+                                "platform": src.platform.as_str(),
+                                "attempts": attempt,
+                                "error": err_msg
+                            }),
+                            before_snapshot: Some(&snap),
+                            after_snapshot: Some(&snap),
+                            after_message: Some(&view),
+                        },
+                    )
+                    .await?;
+                    Some(ev.seq)
+                } else {
+                    None
+                };
+                tx.commit().await?;
                 if let Some(seq) = emitted_seq {
                     state.events.notify(&board_id, seq);
                 }
@@ -1660,68 +1678,70 @@ pub fn spawn_sync_worker(state: AppState) -> tokio::task::JoinHandle<()> {
 
 // --- Inbound Webhook Processing (Slack, Linear, GitHub, Custom) ---
 
-pub fn handle_inbound_webhook(
+pub async fn handle_inbound_webhook(
     state: &AppState,
     board_id_opt: Option<&str>,
     key_spec: &str,
     headers: &HeaderMap,
     raw_body: &[u8],
 ) -> BoardResult<Value> {
-    // Resolve target sync source across the named board (or globally by unique key)
-    let src: StoredSyncSource = state.db.with_conn(|conn| {
+    let src: StoredSyncSource = {
+        let mut conn = state.db.read_conn();
         if let Some(bid) = board_id_opt {
-            resolve_source_by_key_tx(conn, bid, key_spec, None)?.ok_or_else(|| {
-                BoardError::not_found(format!("sync source '{key_spec}' not found"))
-            })
+            resolve_source_by_key_tx(&mut conn, bid, key_spec, None)
+                .await?
+                .ok_or_else(|| BoardError::not_found(format!("sync source '{key_spec}' not found")))?
         } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
-                        platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
-                        created_at, updated_at
-                 FROM sync_sources
-                 WHERE key = ?1
-                 ORDER BY CASE WHEN environment = 'production' THEN 0 ELSE 1 END, created_at ASC
-                 LIMIT 1",
-            )?;
-            stmt.query_row(params![key_spec], map_source_row)
-                .optional()?
+            let row = conn
+                .fetch_optional(
+                    "SELECT id, board_id, key, project_id, project_name, environment, owner_principal,
+                            platform, direction, mappings_json, webhook_secret, outbound_url, outbound_token,
+                            created_at, updated_at
+                     FROM sync_sources
+                     WHERE key = ?1
+                     ORDER BY CASE WHEN environment = 'production' THEN 0 ELSE 1 END, created_at ASC
+                     LIMIT 1",
+                    sql_args![key_spec],
+                )
+                .await?
                 .ok_or_else(|| {
                     BoardError::not_found(format!("sync source '{key_spec}' not found"))
-                })
+                })?;
+            map_source_row(&row)?
         }
-    })?;
+    };
 
-    // Verify platform signature if webhook_secret is configured
     verify_webhook_signature(&src, headers, raw_body)?;
 
     let body: Value = serde_json::from_slice(raw_body)
         .map_err(|e| BoardError::bad_request(format!("invalid webhook JSON body: {e}")))?;
 
-    // Slack URL verification challenge responds immediately
     if src.platform == SyncPlatform::Slack && body["type"].as_str() == Some("url_verification") {
         let challenge = body["challenge"].as_str().unwrap_or("");
         return Ok(json!({ "challenge": challenge }));
     }
 
-    // Record raw webhook into bounded `sync_inbox`
     let event_label = detect_inbound_event_label(src.platform, headers, &body);
     let headers_val = headers_to_safe_json(headers);
+    let headers_str = headers_val.to_string();
+    let body_str = body.to_string();
     let now_str = format_utc_ms(Utc::now());
 
-    state.db.with_tx(|tx| {
+    {
+        let mut tx = state.db.begin_tx().await?;
         tx.execute(
             "INSERT INTO sync_inbox (board_id, source_id, event_type, headers_json, body_json, received_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                src.board_id,
-                src.id,
-                event_label,
-                headers_val.to_string(),
-                body.to_string(),
-                now_str
+            sql_args![
+                &src.board_id,
+                &src.id,
+                &event_label,
+                &headers_str,
+                &body_str,
+                &now_str
             ],
-        )?;
-        // Enforce bounded ring buffer per source
+        )
+        .await?;
         tx.execute(
             "DELETE FROM sync_inbox
              WHERE board_id = ?1 AND source_id = ?2
@@ -1730,21 +1750,29 @@ pub fn handle_inbound_webhook(
                    WHERE board_id = ?1 AND source_id = ?2
                    ORDER BY id DESC LIMIT ?3
                )",
-            params![src.board_id, src.id, MAX_INBOX_PER_SOURCE],
-        )?;
-        Ok(())
-    })?;
+            sql_args![&src.board_id, &src.id, MAX_INBOX_PER_SOURCE],
+        )
+        .await?;
+        tx.commit().await?;
+    }
 
     if !src.direction.allows_inbound() {
         return Ok(json!({ "ok": true, "ignored": true, "reason": "outbound_only" }));
     }
 
-    let (result, emitted_seqs) = state.db.with_tx(|tx| match src.platform {
-        SyncPlatform::Slack => process_slack_inbound_tx(tx, &src, &body),
-        SyncPlatform::Linear => process_linear_inbound_tx(tx, &src, &body),
-        SyncPlatform::Github => process_github_inbound_tx(tx, &src, headers, &body),
-        SyncPlatform::Custom => process_custom_inbound_tx(tx, &src, &body),
-    })?;
+    let (result, emitted_seqs) = {
+        let mut tx = state.db.begin_tx().await?;
+        let res = match src.platform {
+            SyncPlatform::Slack => process_slack_inbound_tx(&mut tx, &src, &body).await?,
+            SyncPlatform::Linear => process_linear_inbound_tx(&mut tx, &src, &body).await?,
+            SyncPlatform::Github => {
+                process_github_inbound_tx(&mut tx, &src, headers, &body).await?
+            }
+            SyncPlatform::Custom => process_custom_inbound_tx(&mut tx, &src, &body).await?,
+        };
+        tx.commit().await?;
+        res
+    };
 
     for seq in emitted_seqs {
         state.events.notify(&src.board_id, seq);
@@ -1872,8 +1900,8 @@ fn headers_to_safe_json(headers: &HeaderMap) -> Value {
 /// and inserts a synced board message (root or reply), setting `from_source = src.key` so it
 /// never echoes back to `src`.
 #[allow(clippy::too_many_arguments)]
-fn insert_synced_message_tx(
-    tx: &Connection,
+async fn insert_synced_message_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     board_channel: &str,
     thread_root: Option<&str>,
@@ -1893,23 +1921,14 @@ fn insert_synced_message_tx(
     );
     let actor_id = format!("{}+{}", src.owner_principal, profile_key);
 
-    // Ensure board channel exists
-    let ch_exists: bool = tx
-        .query_row(
-            "SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2",
-            params![src.board_id, board_channel],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if !ch_exists {
-        tx.execute(
-            "INSERT INTO channels (board_id, path, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![src.board_id, board_channel, actor_id, now],
-        )?;
-    }
+    tx.execute(
+        "INSERT INTO channels (board_id, path, created_by, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (board_id, path) DO NOTHING",
+        sql_args![&src.board_id, board_channel, &actor_id, &now],
+    )
+    .await?;
 
-    // Register synced platform user profile & channel activity
     tx.execute(
         "INSERT INTO profiles (principal_id, name_lower, name, avatar, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -1917,31 +1936,25 @@ fn insert_synced_message_tx(
            name = excluded.name,
            avatar = COALESCE(excluded.avatar, profiles.avatar),
            updated_at = excluded.updated_at",
-        params![
-            src.owner_principal,
-            profile_key,
+        sql_args![
+            &src.owner_principal,
+            &profile_key,
             platform_user_name,
             platform_user_avatar,
-            now
+            &now
         ],
-    )?;
+    )
+    .await?;
     tx.execute(
         "INSERT INTO actor_activity (board_id, channel, actor_id, first_seen_at, last_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?4)
          ON CONFLICT(board_id, channel, actor_id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-        params![src.board_id, board_channel, actor_id, now],
-    )?;
+        sql_args![&src.board_id, board_channel, &actor_id, &now],
+    )
+    .await?;
 
     let msg_id = new_message_id();
-    let seq: i64 = tx.query_row(
-        "SELECT next_msg_seq FROM boards WHERE id = ?1",
-        params![src.board_id],
-        |r| r.get(0),
-    )?;
-    tx.execute(
-        "UPDATE boards SET next_msg_seq = ?1 WHERE id = ?2",
-        params![seq + 1, src.board_id],
-    )?;
+    let seq = messages::next_msg_seq_tx(tx, &src.board_id).await?;
 
     tx.execute(
         "INSERT INTO messages (
@@ -1949,52 +1962,51 @@ fn insert_synced_message_tx(
             by_actor, by_principal, by_profile, from_source, no_sync,
             revision, deleted_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, 0, 1, NULL, ?11, ?11)",
-        params![
-            msg_id,
-            src.board_id,
+        sql_args![
+            &msg_id,
+            &src.board_id,
             seq,
             board_channel,
             thread_root,
             text,
-            actor_id,
-            src.owner_principal,
-            profile_key,
-            src.key,
-            now
+            &actor_id,
+            &src.owner_principal,
+            &profile_key,
+            &src.key,
+            &now
         ],
-    )?;
-    messages::record_thread_message_tx(
-        tx,
-        &src.board_id,
-        board_channel,
-        &msg_id,
-        seq,
-        thread_root,
-    )?;
+    )
+    .await?;
+    messages::record_thread_message_tx(tx, &src.board_id, board_channel, &msg_id, seq, thread_root)
+        .await?;
 
     if !initial_labels.is_empty() {
         for (k, v) in initial_labels {
-            let _ = labels::set_system_label_tx(tx, &src.board_id, &msg_id, k, v);
+            let _ = labels::set_system_label_tx(tx, &src.board_id, &msg_id, k, v).await;
         }
     }
 
     tx.execute(
-        "INSERT OR IGNORE INTO message_sync_map (
+        "INSERT INTO message_sync_map (
             board_id, source_id, message_id, platform_message_id, platform_url, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            src.board_id,
-            src.id,
-            msg_id,
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT DO NOTHING",
+        sql_args![
+            &src.board_id,
+            &src.id,
+            &msg_id,
             platform_msg_id,
             platform_url,
-            now
+            &now
         ],
-    )?;
+    )
+    .await?;
 
-    let stored = messages::load_stored_message_tx(tx, &src.board_id, &msg_id)?.unwrap();
-    let snap = messages::build_message_snapshot_tx(tx, &stored)?;
-    let view = messages::hydrate_message_view_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(tx, &src.board_id, &msg_id)
+        .await?
+        .unwrap();
+    let snap = messages::build_message_snapshot_tx(tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(tx, &stored).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2012,48 +2024,51 @@ fn insert_synced_message_tx(
             after_snapshot: Some(&snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
 
-    // Forward to any OTHER linked platforms (excluding `src.key`)
     let kind = if thread_root.is_none() { "post" } else { "reply" };
-    let _ = enqueue_outbound_for_message_tx(tx, &src.board_id, &msg_id, kind, None)?;
+    let _ = enqueue_outbound_for_message_tx(tx, &src.board_id, &msg_id, kind, None).await?;
 
     Ok((view, vec![ev.seq]))
 }
 
-fn find_linked_root_tx(
-    tx: &Connection,
+async fn find_linked_root_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     src: &StoredSyncSource,
     platform_channel: &str,
     platform_thread_id: &str,
 ) -> BoardResult<Option<(String, String)>> {
-    tx.query_row(
-        "SELECT thread_root_id, channel FROM thread_sync_links
-         WHERE board_id = ?1 AND source_id = ?2 AND platform_channel = ?3 AND platform_thread_id = ?4",
-        params![src.board_id, src.id, platform_channel, platform_thread_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT thread_root_id, channel FROM thread_sync_links
+             WHERE board_id = ?1 AND source_id = ?2 AND platform_channel = ?3 AND platform_thread_id = ?4",
+            sql_args![&src.board_id, &src.id, platform_channel, platform_thread_id],
+        )
+        .await?;
+    match row {
+        Some(r) => Ok(Some((r.get_str(0)?, r.get_str(1)?))),
+        None => Ok(None),
+    }
 }
 
-fn find_mapped_message_tx(
-    tx: &Connection,
+async fn find_mapped_message_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     src: &StoredSyncSource,
     platform_msg_id: &str,
 ) -> BoardResult<Option<String>> {
-    tx.query_row(
-        "SELECT message_id FROM message_sync_map
-         WHERE board_id = ?1 AND source_id = ?2 AND platform_message_id = ?3",
-        params![src.board_id, src.id, platform_msg_id],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT message_id FROM message_sync_map
+             WHERE board_id = ?1 AND source_id = ?2 AND platform_message_id = ?3",
+            sql_args![&src.board_id, &src.id, platform_msg_id],
+        )
+        .await?;
+    row.map(|r| r.get_str(0)).transpose()
 }
 
-fn create_link_and_emit_tx(
-    tx: &Connection,
+async fn create_link_and_emit_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     root_msg: &StoredMessageRow,
     platform_channel: &str,
@@ -2063,26 +2078,28 @@ fn create_link_and_emit_tx(
     let link_id = prefixed_id("lnk");
     let now = format_utc_ms(Utc::now());
     tx.execute(
-        "INSERT OR IGNORE INTO thread_sync_links (
+        "INSERT INTO thread_sync_links (
             id, board_id, thread_root_id, channel, source_id, platform,
             platform_channel, platform_thread_id, platform_url, direction, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            link_id,
-            src.board_id,
-            root_msg.id,
-            root_msg.channel,
-            src.id,
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT DO NOTHING",
+        sql_args![
+            &link_id,
+            &src.board_id,
+            &root_msg.id,
+            &root_msg.channel,
+            &src.id,
             src.platform.as_str(),
             platform_channel,
             platform_thread_id,
             platform_url,
             src.direction.as_str(),
-            now
+            &now
         ],
-    )?;
-    let snap = messages::build_message_snapshot_tx(tx, root_msg)?;
-    let view = messages::hydrate_message_view_tx(tx, root_msg)?;
+    )
+    .await?;
+    let snap = messages::build_message_snapshot_tx(tx, root_msg).await?;
+    let view = messages::hydrate_message_view_tx(tx, root_msg).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2102,14 +2119,15 @@ fn create_link_and_emit_tx(
             after_snapshot: Some(&snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(ev.seq)
 }
 
 // --- Slack Adapter ---
 
-fn process_slack_inbound_tx(
-    tx: &Connection,
+async fn process_slack_inbound_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     body: &Value,
 ) -> BoardResult<(Value, Vec<i64>)> {
@@ -2119,7 +2137,6 @@ fn process_slack_inbound_tx(
 
     match ev_type {
         "message" => {
-            // Skip our own bot echo
             if ev["bot_id"].as_str() == Some("openboards") {
                 return Ok((json!({ "ok": true, "ignored": "echo" }), seqs));
             }
@@ -2129,8 +2146,8 @@ fn process_slack_inbound_tx(
             if subtype == "message_changed" {
                 let ts = ev["message"]["ts"].as_str().unwrap_or("");
                 let new_text = slack_mrkdwn_to_gfm(ev["message"]["text"].as_str().unwrap_or(""));
-                if let Some(mid) = find_mapped_message_tx(tx, src, ts)? {
-                    if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, &new_text)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, ts).await? {
+                    if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, &new_text).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "edited": mid }), seqs));
@@ -2140,8 +2157,8 @@ fn process_slack_inbound_tx(
 
             if subtype == "message_deleted" {
                 let ts = ev["deleted_ts"].as_str().unwrap_or("");
-                if let Some(mid) = find_mapped_message_tx(tx, src, ts)? {
-                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, ts).await? {
+                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "deleted": mid }), seqs));
@@ -2153,8 +2170,9 @@ fn process_slack_inbound_tx(
             if ts.is_empty() {
                 return Ok((json!({ "ok": true, "ignored": "no_ts" }), seqs));
             }
-            // Echo suppression via message_sync_map
-            if find_mapped_message_tx(tx, src, ts)?.is_some() {
+            tx.advisory_xact_lock("sync_in", &format!("{}:{ts}", src.id))
+                .await?;
+            if find_mapped_message_tx(tx, src, ts).await?.is_some() {
                 return Ok((json!({ "ok": true, "ignored": "duplicate" }), seqs));
             }
 
@@ -2165,7 +2183,9 @@ fn process_slack_inbound_tx(
             let avatar = ev["user_avatar"].as_str();
             let permalink = ev["permalink"].as_str();
 
-            if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, slack_ch, thread_ts)? {
+            if let Some((root_id, board_ch)) =
+                find_linked_root_tx(tx, src, slack_ch, thread_ts).await?
+            {
                 let (view, mut s) = insert_synced_message_tx(
                     tx,
                     src,
@@ -2178,7 +2198,8 @@ fn process_slack_inbound_tx(
                     user_name,
                     avatar,
                     &BTreeMap::new(),
-                )?;
+                )
+                .await?;
                 seqs.append(&mut s);
                 return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
             }
@@ -2199,17 +2220,16 @@ fn process_slack_inbound_tx(
                 user_name,
                 avatar,
                 &BTreeMap::new(),
-            )?;
+            )
+            .await?;
             seqs.append(&mut s);
-            let root_stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)?.unwrap();
-            seqs.push(create_link_and_emit_tx(
-                tx,
-                src,
-                &root_stored,
-                slack_ch,
-                thread_ts,
-                permalink,
-            )?);
+            let root_stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)
+                .await?
+                .unwrap();
+            seqs.push(
+                create_link_and_emit_tx(tx, src, &root_stored, slack_ch, thread_ts, permalink)
+                    .await?,
+            );
             Ok((json!({ "ok": true, "messageId": view.id }), seqs))
         }
         "reaction_added" | "reaction_removed" => {
@@ -2217,14 +2237,16 @@ fn process_slack_inbound_tx(
             let emoji_raw = ev["reaction"].as_str().unwrap_or("");
             let user_id = ev["user"].as_str().unwrap_or("unknown");
             let remove = ev_type == "reaction_removed";
-            if let Some(mid) = find_mapped_message_tx(tx, src, ts)? {
+            if let Some(mid) = find_mapped_message_tx(tx, src, ts).await? {
                 let actor_id = format!(
                     "{}+{}:user:{}",
                     src.owner_principal,
                     src.key,
                     user_id.to_ascii_lowercase()
                 );
-                if let Some(seq) = apply_synced_reaction_tx(tx, src, &mid, &actor_id, emoji_raw, remove)? {
+                if let Some(seq) =
+                    apply_synced_reaction_tx(tx, src, &mid, &actor_id, emoji_raw, remove).await?
+                {
                     seqs.push(seq);
                 }
                 return Ok((json!({ "ok": true, "messageId": mid }), seqs));
@@ -2237,8 +2259,8 @@ fn process_slack_inbound_tx(
 
 // --- Linear Adapter ---
 
-fn process_linear_inbound_tx(
-    tx: &Connection,
+async fn process_linear_inbound_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     body: &Value,
 ) -> BoardResult<(Value, Vec<i64>)> {
@@ -2295,7 +2317,9 @@ fn process_linear_inbound_tx(
             }
 
             if action == "create" {
-                if find_mapped_message_tx(tx, src, issue_id)?.is_some() {
+                tx.advisory_xact_lock("sync_in", &format!("{}:{issue_id}", src.id))
+                    .await?;
+                if find_mapped_message_tx(tx, src, issue_id).await?.is_some() {
                     return Ok((json!({ "ok": true, "ignored": "echo" }), seqs));
                 }
                 let Some(board_ch) = lookup_mapped_channel(src, team_key, false) else {
@@ -2315,22 +2339,28 @@ fn process_linear_inbound_tx(
                     user_name,
                     None,
                     &issue_labels,
-                )?;
+                )
+                .await?;
                 seqs.append(&mut s);
-                let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)?.unwrap();
-                seqs.push(create_link_and_emit_tx(tx, src, &stored, team_key, issue_id, url)?);
+                let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)
+                    .await?
+                    .unwrap();
+                seqs.push(
+                    create_link_and_emit_tx(tx, src, &stored, team_key, issue_id, url).await?,
+                );
                 return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
             }
 
             if action == "update" {
-                if let Some((root_id, _)) = find_linked_root_tx(tx, src, team_key, issue_id)? {
+                if let Some((root_id, _)) = find_linked_root_tx(tx, src, team_key, issue_id).await?
+                {
                     if let Some(seq) =
-                        apply_synced_labels_tx(tx, src, &root_id, &issue_labels, false)?
+                        apply_synced_labels_tx(tx, src, &root_id, &issue_labels, false).await?
                     {
                         seqs.push(seq);
                     }
                     if !text.is_empty() {
-                        if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
+                        if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text).await? {
                             seqs.push(seq);
                         }
                     }
@@ -2339,8 +2369,9 @@ fn process_linear_inbound_tx(
             }
 
             if action == "remove" {
-                if let Some((root_id, _)) = find_linked_root_tx(tx, src, team_key, issue_id)? {
-                    if let Some(seq) = apply_synced_delete_tx(tx, src, &root_id)? {
+                if let Some((root_id, _)) = find_linked_root_tx(tx, src, team_key, issue_id).await?
+                {
+                    if let Some(seq) = apply_synced_delete_tx(tx, src, &root_id).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "deleted": root_id }), seqs));
@@ -2359,18 +2390,21 @@ fn process_linear_inbound_tx(
             let url = body["url"].as_str().or_else(|| data["url"].as_str());
 
             if action == "create" {
-                if find_mapped_message_tx(tx, src, comment_id)?.is_some() {
+                tx.advisory_xact_lock("sync_in", &format!("{}:{comment_id}", src.id))
+                    .await?;
+                if find_mapped_message_tx(tx, src, comment_id).await?.is_some() {
                     return Ok((json!({ "ok": true, "ignored": "echo" }), seqs));
                 }
-                let link: Option<(String, String)> = tx
-                    .query_row(
+                let link = tx
+                    .fetch_optional(
                         "SELECT thread_root_id, channel FROM thread_sync_links
                          WHERE board_id = ?1 AND source_id = ?2 AND platform_thread_id = ?3
                          LIMIT 1",
-                        params![src.board_id, src.id, issue_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        sql_args![&src.board_id, &src.id, issue_id],
                     )
-                    .optional()?;
+                    .await?
+                    .map(|r| Ok::<_, BoardError>((r.get_str(0)?, r.get_str(1)?)))
+                    .transpose()?;
                 if let Some((root_id, board_ch)) = link {
                     let uid = data["user"]["id"].as_str().unwrap_or("linear");
                     let uname = data["user"]["name"].as_str().unwrap_or(uid);
@@ -2386,21 +2420,24 @@ fn process_linear_inbound_tx(
                         uname,
                         None,
                         &BTreeMap::new(),
-                    )?;
+                    )
+                    .await?;
                     seqs.append(&mut s);
                     return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
                 }
                 let _ = team_key;
             } else if action == "update" {
-                if let Some(mid) = find_mapped_message_tx(tx, src, comment_id)? {
-                    if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, comment_body)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, comment_id).await? {
+                    if let Some(seq) =
+                        apply_synced_edit_tx(tx, src, &mid, comment_body).await?
+                    {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "edited": mid }), seqs));
                 }
             } else if action == "remove" {
-                if let Some(mid) = find_mapped_message_tx(tx, src, comment_id)? {
-                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, comment_id).await? {
+                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "deleted": mid }), seqs));
@@ -2414,8 +2451,8 @@ fn process_linear_inbound_tx(
 
 // --- GitHub Adapter (inbound-only by default, exact documented labels) ---
 
-fn process_github_inbound_tx(
-    tx: &Connection,
+async fn process_github_inbound_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     headers: &HeaderMap,
     body: &Value,
@@ -2449,14 +2486,16 @@ fn process_github_inbound_tx(
             gh_labels.insert("state".to_string(), st);
             collect_github_tags_and_assignees(issue, &mut gh_labels);
 
-            if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
+            tx.advisory_xact_lock("sync_in", &format!("{}:{p_mid}", src.id))
+                .await?;
+            if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid).await? {
                 if let Some(seq) =
-                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true)?
+                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true).await?
                 {
                     seqs.push(seq);
                 }
                 if action == "edited" {
-                    if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
+                    if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text).await? {
                         seqs.push(seq);
                     }
                 }
@@ -2480,10 +2519,13 @@ fn process_github_inbound_tx(
                 login,
                 avatar,
                 &gh_labels,
-            )?;
+            )
+            .await?;
             seqs.append(&mut s);
-            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)?.unwrap();
-            seqs.push(create_link_and_emit_tx(tx, src, &stored, repo, &p_tid, html_url)?);
+            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)
+                .await?
+                .unwrap();
+            seqs.push(create_link_and_emit_tx(tx, src, &stored, repo, &p_tid, html_url).await?);
             Ok((json!({ "ok": true, "messageId": view.id }), seqs))
         }
         "pull_request" => {
@@ -2515,14 +2557,16 @@ fn process_github_inbound_tx(
             }
             collect_github_tags_and_assignees(pr, &mut gh_labels);
 
-            if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
+            tx.advisory_xact_lock("sync_in", &format!("{}:{p_mid}", src.id))
+                .await?;
+            if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid).await? {
                 if let Some(seq) =
-                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true)?
+                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true).await?
                 {
                     seqs.push(seq);
                 }
                 if action == "edited" {
-                    if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
+                    if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text).await? {
                         seqs.push(seq);
                     }
                 }
@@ -2546,10 +2590,13 @@ fn process_github_inbound_tx(
                 login,
                 avatar,
                 &gh_labels,
-            )?;
+            )
+            .await?;
             seqs.append(&mut s);
-            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)?.unwrap();
-            seqs.push(create_link_and_emit_tx(tx, src, &stored, repo, &p_tid, html_url)?);
+            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)
+                .await?
+                .unwrap();
+            seqs.push(create_link_and_emit_tx(tx, src, &stored, repo, &p_tid, html_url).await?);
             Ok((json!({ "ok": true, "messageId": view.id }), seqs))
         }
         "pull_request_review" => {
@@ -2564,17 +2611,19 @@ fn process_github_inbound_tx(
             let login = review["user"]["login"].as_str().unwrap_or("github");
             let avatar = review["user"]["avatar_url"].as_str();
 
-            if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
+            tx.advisory_xact_lock("sync_in", &format!("{}:{rev_id}", src.id))
+                .await?;
+            if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, repo, &p_tid).await? {
                 if matches!(rev_state.as_str(), "approved" | "changes_requested") {
                     let mut rev_labels = BTreeMap::new();
                     rev_labels.insert("review".to_string(), rev_state.clone());
                     if let Some(seq) =
-                        apply_synced_labels_tx(tx, src, &root_id, &rev_labels, false)?
+                        apply_synced_labels_tx(tx, src, &root_id, &rev_labels, false).await?
                     {
                         seqs.push(seq);
                     }
                 }
-                if find_mapped_message_tx(tx, src, &rev_id)?.is_some() {
+                if find_mapped_message_tx(tx, src, &rev_id).await?.is_some() {
                     return Ok((json!({ "ok": true, "ignored": "duplicate" }), seqs));
                 }
                 let reply_text = if rev_body.is_empty() {
@@ -2594,7 +2643,8 @@ fn process_github_inbound_tx(
                     login,
                     avatar,
                     &BTreeMap::new(),
-                )?;
+                )
+                .await?;
                 seqs.append(&mut s);
                 return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
             }
@@ -2614,21 +2664,25 @@ fn process_github_inbound_tx(
             let avatar = comment["user"]["avatar_url"].as_str();
 
             if action == "edited" {
-                if let Some(mid) = find_mapped_message_tx(tx, src, &cid)? {
-                    if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, c_body)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, &cid).await? {
+                    if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, c_body).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "edited": mid }), seqs));
                 }
             } else if action == "deleted" {
-                if let Some(mid) = find_mapped_message_tx(tx, src, &cid)? {
-                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid)? {
+                if let Some(mid) = find_mapped_message_tx(tx, src, &cid).await? {
+                    if let Some(seq) = apply_synced_delete_tx(tx, src, &mid).await? {
                         seqs.push(seq);
                     }
                     return Ok((json!({ "ok": true, "deleted": mid }), seqs));
                 }
-            } else if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
-                if find_mapped_message_tx(tx, src, &cid)?.is_some() {
+            } else if let Some((root_id, board_ch)) =
+                find_linked_root_tx(tx, src, repo, &p_tid).await?
+            {
+                tx.advisory_xact_lock("sync_in", &format!("{}:{cid}", src.id))
+                    .await?;
+                if find_mapped_message_tx(tx, src, &cid).await?.is_some() {
                     return Ok((json!({ "ok": true, "ignored": "duplicate" }), seqs));
                 }
                 let (view, mut s) = insert_synced_message_tx(
@@ -2643,7 +2697,8 @@ fn process_github_inbound_tx(
                     login,
                     avatar,
                     &BTreeMap::new(),
-                )?;
+                )
+                .await?;
                 seqs.append(&mut s);
                 return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
             }
@@ -2678,21 +2733,21 @@ fn collect_github_tags_and_assignees(obj: &Value, out: &mut BTreeMap<String, Str
 
 /// Updates synced root labels and emits a `labels.changed` event whenever labels change,
 /// so `wait`/`tail`/watchers observing e.g. `--label state=merged` or `--label review=approved` wake up.
-fn apply_synced_labels_tx(
-    tx: &Connection,
+async fn apply_synced_labels_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     root_id: &str,
     new_labels: &BTreeMap<String, String>,
     replace_tags_and_assignees: bool,
 ) -> BoardResult<Option<i64>> {
-    let Some(stored) = messages::load_stored_message_tx(tx, &src.board_id, root_id)? else {
+    let Some(stored) = messages::load_stored_message_tx(tx, &src.board_id, root_id).await? else {
         return Ok(None);
     };
     if stored.deleted_at.is_some() {
         return Ok(None);
     }
-    let before_labels = labels::load_message_labels_tx(tx, root_id)?;
-    let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let before_labels = labels::load_message_labels_tx(tx, root_id).await?;
+    let before_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
 
     let mut unset = Vec::new();
     if replace_tags_and_assignees {
@@ -2701,8 +2756,9 @@ fn apply_synced_labels_tx(
             {
                 tx.execute(
                     "DELETE FROM message_labels WHERE message_id = ?1 AND key = ?2",
-                    params![root_id, k],
-                )?;
+                    sql_args![root_id, k],
+                )
+                .await?;
                 unset.push(k.clone());
             }
         }
@@ -2711,7 +2767,9 @@ fn apply_synced_labels_tx(
     let mut set = BTreeMap::new();
     for (k, v) in new_labels {
         if before_labels.get(k) != Some(v)
-            && labels::set_system_label_tx(tx, &src.board_id, root_id, k, v).is_ok()
+            && labels::set_system_label_tx(tx, &src.board_id, root_id, k, v)
+                .await
+                .is_ok()
         {
             set.insert(k.clone(), v.clone());
         }
@@ -2721,8 +2779,8 @@ fn apply_synced_labels_tx(
         return Ok(None);
     }
 
-    let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-    let after_msg = messages::hydrate_message_view_tx(tx, &stored)?;
+    let after_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
+    let after_msg = messages::hydrate_message_view_tx(tx, &stored).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2740,14 +2798,15 @@ fn apply_synced_labels_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&after_msg),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 
 // --- Custom Normalized Adapter ---
 
-fn process_custom_inbound_tx(
-    tx: &Connection,
+async fn process_custom_inbound_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     body: &Value,
 ) -> BoardResult<(Value, Vec<i64>)> {
@@ -2764,10 +2823,12 @@ fn process_custom_inbound_tx(
 
     match action {
         "post" | "reply" => {
-            if find_mapped_message_tx(tx, src, pmid)?.is_some() {
+            tx.advisory_xact_lock("sync_in", &format!("{}:{pmid}", src.id))
+                .await?;
+            if find_mapped_message_tx(tx, src, pmid).await?.is_some() {
                 return Ok((json!({ "ok": true, "ignored": "echo" }), seqs));
             }
-            if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, pch, pth)? {
+            if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, pch, pth).await? {
                 let (view, mut s) = insert_synced_message_tx(
                     tx,
                     src,
@@ -2780,7 +2841,8 @@ fn process_custom_inbound_tx(
                     uname,
                     uav,
                     &BTreeMap::new(),
-                )?;
+                )
+                .await?;
                 seqs.append(&mut s);
                 return Ok((json!({ "ok": true, "messageId": view.id }), seqs));
             }
@@ -2799,15 +2861,18 @@ fn process_custom_inbound_tx(
                 uname,
                 uav,
                 &BTreeMap::new(),
-            )?;
+            )
+            .await?;
             seqs.append(&mut s);
-            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)?.unwrap();
-            seqs.push(create_link_and_emit_tx(tx, src, &stored, pch, pth, purl)?);
+            let stored = messages::load_stored_message_tx(tx, &src.board_id, &view.id)
+                .await?
+                .unwrap();
+            seqs.push(create_link_and_emit_tx(tx, src, &stored, pch, pth, purl).await?);
             Ok((json!({ "ok": true, "messageId": view.id }), seqs))
         }
         "edit" => {
-            if let Some(mid) = find_mapped_message_tx(tx, src, pmid)? {
-                if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, text)? {
+            if let Some(mid) = find_mapped_message_tx(tx, src, pmid).await? {
+                if let Some(seq) = apply_synced_edit_tx(tx, src, &mid, text).await? {
                     seqs.push(seq);
                 }
                 return Ok((json!({ "ok": true, "edited": mid }), seqs));
@@ -2815,8 +2880,8 @@ fn process_custom_inbound_tx(
             Ok((json!({ "ok": true, "ignored": "unmapped_edit" }), seqs))
         }
         "delete" => {
-            if let Some(mid) = find_mapped_message_tx(tx, src, pmid)? {
-                if let Some(seq) = apply_synced_delete_tx(tx, src, &mid)? {
+            if let Some(mid) = find_mapped_message_tx(tx, src, pmid).await? {
+                if let Some(seq) = apply_synced_delete_tx(tx, src, &mid).await? {
                     seqs.push(seq);
                 }
                 return Ok((json!({ "ok": true, "deleted": mid }), seqs));
@@ -2825,15 +2890,22 @@ fn process_custom_inbound_tx(
         }
         "react" | "unreact" => {
             let emoji = body["emoji"].as_str().unwrap_or("");
-            if let Some(mid) = find_mapped_message_tx(tx, src, pmid)? {
+            if let Some(mid) = find_mapped_message_tx(tx, src, pmid).await? {
                 let actor_id = format!(
                     "{}+{}:user:{}",
                     src.owner_principal,
                     src.key,
                     uid.to_ascii_lowercase()
                 );
-                if let Some(seq) =
-                    apply_synced_reaction_tx(tx, src, &mid, &actor_id, emoji, action == "unreact")?
+                if let Some(seq) = apply_synced_reaction_tx(
+                    tx,
+                    src,
+                    &mid,
+                    &actor_id,
+                    emoji,
+                    action == "unreact",
+                )
+                .await?
                 {
                     seqs.push(seq);
                 }
@@ -2863,28 +2935,33 @@ fn lookup_mapped_channel<'a>(
         .and_then(|t| t.board_channel_for(is_pull))
 }
 
-fn apply_synced_edit_tx(
-    tx: &Connection,
+async fn apply_synced_edit_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     message_id: &str,
     new_text: &str,
 ) -> BoardResult<Option<i64>> {
-    let Some(msg) = messages::load_stored_message_tx(tx, &src.board_id, message_id)? else {
+    let Some(msg) = messages::load_stored_message_for_update_tx(tx, &src.board_id, message_id)
+        .await?
+    else {
         return Ok(None);
     };
     if msg.deleted_at.is_some() || msg.text == new_text {
         return Ok(None);
     }
-    let before_snap = messages::build_message_snapshot_tx(tx, &msg)?;
+    let before_snap = messages::build_message_snapshot_tx(tx, &msg).await?;
     let next_rev = msg.revision + 1;
     let now = format_utc_ms(Utc::now());
     tx.execute(
         "UPDATE messages SET text = ?1, revision = ?2, updated_at = ?3 WHERE id = ?4",
-        params![new_text, next_rev, now, message_id],
-    )?;
-    let updated = messages::load_stored_message_tx(tx, &src.board_id, message_id)?.unwrap();
-    let after_snap = messages::build_message_snapshot_tx(tx, &updated)?;
-    let view = messages::hydrate_message_view_tx(tx, &updated)?;
+        sql_args![new_text, next_rev, &now, message_id],
+    )
+    .await?;
+    let updated = messages::load_stored_message_tx(tx, &src.board_id, message_id)
+        .await?
+        .unwrap();
+    let after_snap = messages::build_message_snapshot_tx(tx, &updated).await?;
+    let view = messages::hydrate_message_view_tx(tx, &updated).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2898,36 +2975,43 @@ fn apply_synced_edit_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 
-fn apply_synced_delete_tx(
-    tx: &Connection,
+async fn apply_synced_delete_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     message_id: &str,
 ) -> BoardResult<Option<i64>> {
-    let Some(msg) = messages::load_stored_message_tx(tx, &src.board_id, message_id)? else {
+    let Some(msg) = messages::load_stored_message_for_update_tx(tx, &src.board_id, message_id)
+        .await?
+    else {
         return Ok(None);
     };
     if msg.deleted_at.is_some() {
         return Ok(None);
     }
-    let before_snap = messages::build_message_snapshot_tx(tx, &msg)?;
+    let before_snap = messages::build_message_snapshot_tx(tx, &msg).await?;
     let next_rev = msg.revision + 1;
     let now = format_utc_ms(Utc::now());
     tx.execute(
         "UPDATE messages SET text = '', deleted_at = ?1, revision = ?2, updated_at = ?1 WHERE id = ?3",
-        params![now, next_rev, message_id],
-    )?;
+        sql_args![&now, next_rev, message_id],
+    )
+    .await?;
     tx.execute(
         "DELETE FROM message_reactions WHERE message_id = ?1",
-        params![message_id],
-    )?;
-    labels::delete_message_labels_tx(tx, message_id)?;
-    let updated = messages::load_stored_message_tx(tx, &src.board_id, message_id)?.unwrap();
-    let after_snap = messages::build_message_snapshot_tx(tx, &updated)?;
-    let view = messages::hydrate_message_view_tx(tx, &updated)?;
+        sql_args![message_id],
+    )
+    .await?;
+    labels::delete_message_labels_tx(tx, message_id).await?;
+    let updated = messages::load_stored_message_tx(tx, &src.board_id, message_id)
+        .await?
+        .unwrap();
+    let after_snap = messages::build_message_snapshot_tx(tx, &updated).await?;
+    let view = messages::hydrate_message_view_tx(tx, &updated).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2941,12 +3025,13 @@ fn apply_synced_delete_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 
-fn apply_synced_reaction_tx(
-    tx: &Connection,
+async fn apply_synced_reaction_tx(
+    tx: &mut DbTx,
     src: &StoredSyncSource,
     message_id: &str,
     actor_id: &str,
@@ -2954,7 +3039,7 @@ fn apply_synced_reaction_tx(
     remove: bool,
 ) -> BoardResult<Option<i64>> {
     let emoji = messages::normalize_emoji(raw_emoji)?;
-    let Some(msg) = messages::load_stored_message_tx(tx, &src.board_id, message_id)? else {
+    let Some(msg) = messages::load_stored_message_tx(tx, &src.board_id, message_id).await? else {
         return Ok(None);
     };
     if msg.deleted_at.is_some() {
@@ -2963,21 +3048,26 @@ fn apply_synced_reaction_tx(
     let changed = if remove {
         tx.execute(
             "DELETE FROM message_reactions WHERE message_id = ?1 AND actor_id = ?2 AND emoji = ?3",
-            params![message_id, actor_id, emoji],
-        )? > 0
+            sql_args![message_id, actor_id, &emoji],
+        )
+        .await?
+            > 0
     } else {
         let now = format_utc_ms(Utc::now());
         tx.execute(
-            "INSERT OR IGNORE INTO message_reactions (board_id, message_id, emoji, actor_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![src.board_id, message_id, emoji, actor_id, now],
-        )? > 0
+            "INSERT INTO message_reactions (board_id, message_id, emoji, actor_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (message_id, actor_id, emoji) DO NOTHING",
+            sql_args![&src.board_id, message_id, &emoji, actor_id, &now],
+        )
+        .await?
+            > 0
     };
     if !changed {
         return Ok(None);
     }
-    let snap = messages::build_message_snapshot_tx(tx, &msg)?;
-    let view = messages::hydrate_message_view_tx(tx, &msg)?;
+    let snap = messages::build_message_snapshot_tx(tx, &msg).await?;
+    let view = messages::hydrate_message_view_tx(tx, &msg).await?;
     let ev = events::append_event_tx(
         tx,
         EventAppend {
@@ -2995,7 +3085,8 @@ fn apply_synced_reaction_tx(
             after_snapshot: Some(&snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 

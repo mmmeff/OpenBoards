@@ -53,7 +53,7 @@ async fn upload_inline(
     headers: HeaderMap,
     body: Body,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let filename = query
         .name
         .or_else(|| {
@@ -89,8 +89,9 @@ async fn init_upload(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<InitUploadInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let res = attachments::init_streaming_upload(&state.db, &resolved.id, &board, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let res =
+        attachments::init_streaming_upload(&state.db, &resolved.id, &board, &caller, input).await?;
     Ok((StatusCode::CREATED, Json(json!(res))))
 }
 
@@ -101,7 +102,7 @@ async fn put_upload(
     Query(query): Query<EnsureQuery>,
     body: Body,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let res = attachments::put_streaming_upload(
         &state.db,
         &state.config.data_dir,
@@ -120,7 +121,7 @@ async fn complete_upload(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let att = attachments::complete_streaming_upload(
         &state.db,
         &state.config.data_dir,
@@ -138,8 +139,8 @@ async fn download_attachment(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Response> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let att = attachments::authorize_download(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let att = attachments::authorize_download(&state.db, &resolved.id, &id, &caller).await?;
     let blob_path = attachments::content_blob_path(&state.config.data_dir, &att.sha256);
 
     let file = tokio::fs::File::open(&blob_path)

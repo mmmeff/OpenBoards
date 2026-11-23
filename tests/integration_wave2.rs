@@ -6,7 +6,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::{build_router, AppState};
 
@@ -18,16 +18,16 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
-        Self::with_rate_limit(0, 100)
+    async fn new() -> Self {
+        Self::with_rate_limit(0, 100).await
     }
 
-    fn with_rate_limit(rps: u32, burst: u32) -> Self {
+    async fn with_rate_limit(rps: u32, burst: u32) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -37,6 +37,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: rps,
                 rate_limit_burst: burst,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -130,7 +132,7 @@ impl TestHarness {
 
 #[tokio::test]
 async fn threads_replies_idempotency_guards_tombstones_and_blind_intake() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -458,7 +460,7 @@ async fn threads_replies_idempotency_guards_tombstones_and_blind_intake() {
 
 #[tokio::test]
 async fn mentions_visibility_isolation_and_by_and_thread_pagination() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -588,7 +590,7 @@ async fn mentions_visibility_isolation_and_by_and_thread_pagination() {
 
 #[tokio::test]
 async fn labels_cas_filters_inheritance_and_structured_schemas() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_eve_id, eve_tok) = h.create_user_with_token("eve", "eve@acme.com", "viewer").await;
 
@@ -864,7 +866,7 @@ async fn labels_cas_filters_inheritance_and_structured_schemas() {
 
 #[tokio::test]
 async fn attachments_inline_streaming_limits_and_tombstone_visibility() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -1099,7 +1101,7 @@ async fn attachments_inline_streaming_limits_and_tombstone_visibility() {
 
 #[tokio::test]
 async fn event_log_total_order_msg_cursor_before_after_visibility_and_bookkeeping() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -1335,31 +1337,37 @@ async fn event_log_total_order_msg_cursor_before_after_visibility_and_bookkeepin
         .any(|e| e["message"]["channel"].as_str() == Some("secret")));
 
     // Bookkeeping events hidden unless `all=true`
-    let board = boards::ensure_default_board(&h.state.db).unwrap();
-    h.state
-        .db
-        .with_tx(|tx| {
-            let stored = openboards::messages::load_stored_message_tx(tx, &board.id, &root_id)?
-                .unwrap();
-            let snap = openboards::messages::build_message_snapshot_tx(tx, &stored)?;
-            let view = openboards::messages::hydrate_message_view_tx(tx, &stored)?;
-            openboards::events::append_event_tx(
-                tx,
-                openboards::events::EventAppend {
-                    board_id: &board.id,
-                    event_type: openboards::events::EventType::TaskRenewed,
-                    channel: Some("dev"),
-                    message_id: Some(&root_id),
-                    actor_id: None,
-                    payload: json!({ "epoch": 1 }),
-                    before_snapshot: Some(&snap),
-                    after_snapshot: Some(&snap),
-                    after_message: Some(&view),
-                },
-            )?;
-            Ok(())
-        })
+    let board = boards::ensure_default_board(&h.state.db).await.unwrap();
+    {
+        let mut tx = h.state.db.begin_tx().await.unwrap();
+        let stored = openboards::messages::load_stored_message_tx(&mut tx, &board.id, &root_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let snap = openboards::messages::build_message_snapshot_tx(&mut tx, &stored)
+            .await
+            .unwrap();
+        let view = openboards::messages::hydrate_message_view_tx(&mut tx, &stored)
+            .await
+            .unwrap();
+        openboards::events::append_event_tx(
+            &mut tx,
+            openboards::events::EventAppend {
+                board_id: &board.id,
+                event_type: openboards::events::EventType::TaskRenewed,
+                channel: Some("dev"),
+                message_id: Some(&root_id),
+                actor_id: None,
+                payload: json!({ "epoch": 1 }),
+                before_snapshot: Some(&snap),
+                after_snapshot: Some(&snap),
+                after_message: Some(&view),
+            },
+        )
+        .await
         .unwrap();
+        tx.commit().await.unwrap();
+    }
 
     let (st, without_all) = h
         .req(
@@ -1389,7 +1397,7 @@ async fn event_log_total_order_msg_cursor_before_after_visibility_and_bookkeepin
 
 #[tokio::test]
 async fn live_long_poll_wakeup_wait_timeout_and_rate_limiting() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
 
     // 1. Wait timeout returns 408 timeout with cursor
@@ -1481,7 +1489,7 @@ async fn live_long_poll_wakeup_wait_timeout_and_rate_limiting() {
     assert_eq!(evs[0]["message"]["text"], "live reply");
 
     // 4. Per-principal rate limiting: burst=2 shared across profiles; returns 429 + Retry-After
-    let rl = TestHarness::with_rate_limit(1, 2);
+    let rl = TestHarness::with_rate_limit(1, 2).await;
     // Create Alice while using owner bucket (2 requests -> create user + create token consumes owner's 2)
     let (_uid, bob_tok) = rl.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -1519,7 +1527,7 @@ async fn live_long_poll_wakeup_wait_timeout_and_rate_limiting() {
 
 #[tokio::test]
 async fn spec_audit_narrowed_upload_attachment_edit_and_by_handle_prefix() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_uid, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
 
     // 1. Narrowed caller scoped to `dev/` can upload an attachment
@@ -1602,7 +1610,7 @@ async fn spec_audit_narrowed_upload_attachment_edit_and_by_handle_prefix() {
 
 #[tokio::test]
 async fn list_threads_indexed_pagination_subtrees_label_inheritance_hydration_and_permissions() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_uid_a, alice_tok) = h
         .create_user_with_token("alice", "alice@acme.com", "member")
         .await;

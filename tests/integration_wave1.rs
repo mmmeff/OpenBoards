@@ -6,7 +6,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::{build_router, AppState};
 
@@ -17,11 +17,11 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let owner_token = "owner-bootstrap-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -31,6 +31,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: 0,
                 rate_limit_burst: 100,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -158,7 +160,7 @@ impl TestHarness {
 
 #[tokio::test]
 async fn discovery_and_board_lifecycle_and_isolation() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
 
     // Unauthenticated /discovery
     let (st, body) = h
@@ -307,7 +309,7 @@ async fn discovery_and_board_lifecycle_and_isolation() {
 
 #[tokio::test]
 async fn grants_precedence_ties_roles_narrowing_guardrails_and_explain() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "developer").await;
     let (_eve_id, eve_tok) = h.create_user_with_token("eve", "eve@acme.com", "viewer").await;
@@ -689,7 +691,7 @@ async fn grants_precedence_ties_roles_narrowing_guardrails_and_explain() {
 
 #[tokio::test]
 async fn private_channels_atomicity_conflicts_and_actor_visibility() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
     let (_eve_id, eve_tok) = h.create_user_with_token("eve", "eve@acme.com", "viewer").await;
@@ -841,8 +843,9 @@ async fn private_channels_atomicity_conflicts_and_actor_visibility() {
 
     let grants_before = openboards::grants::load_grants(
         &h.state.db,
-        &boards::ensure_default_board(&h.state.db).unwrap().id,
+        &boards::ensure_default_board(&h.state.db).await.unwrap().id,
     )
+    .await
     .unwrap()
     .len();
 
@@ -860,8 +863,9 @@ async fn private_channels_atomicity_conflicts_and_actor_visibility() {
 
     let grants_after = openboards::grants::load_grants(
         &h.state.db,
-        &boards::ensure_default_board(&h.state.db).unwrap().id,
+        &boards::ensure_default_board(&h.state.db).await.unwrap().id,
     )
+    .await
     .unwrap()
     .len();
     assert_eq!(grants_before, grants_after);
@@ -883,8 +887,9 @@ async fn private_channels_atomicity_conflicts_and_actor_visibility() {
 
     let grants_before = openboards::grants::load_grants(
         &h.state.db,
-        &boards::ensure_default_board(&h.state.db).unwrap().id,
+        &boards::ensure_default_board(&h.state.db).await.unwrap().id,
     )
+    .await
     .unwrap()
     .len();
 
@@ -902,8 +907,9 @@ async fn private_channels_atomicity_conflicts_and_actor_visibility() {
 
     let grants_after = openboards::grants::load_grants(
         &h.state.db,
-        &boards::ensure_default_board(&h.state.db).unwrap().id,
+        &boards::ensure_default_board(&h.state.db).await.unwrap().id,
     )
+    .await
     .unwrap()
     .len();
     assert_eq!(grants_before, grants_after);
@@ -926,7 +932,7 @@ async fn private_channels_atomicity_conflicts_and_actor_visibility() {
 
 #[tokio::test]
 async fn whoami_admin_crud_profiles_and_revocation() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
 
     // Unauthenticated fails 401
     let (st, body) = h.req(Method::GET, "/whoami", None, &[], None).await;
@@ -985,7 +991,7 @@ async fn whoami_admin_crud_profiles_and_revocation() {
 
 #[tokio::test]
 async fn grant_updates_revocation_project_sync_narrowing_and_idempotent_channels() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
     let (_sup_id, sup_prod_tok) = h.create_project_with_token("support", "production").await;

@@ -251,9 +251,9 @@ async fn register_watcher(
     Json(body): Json<WatcherSpecBody>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     watchers::require_watcher_registration_access(&caller)?;
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let input = build_upsert_input(body, resolved.id, None, None, None)?;
-    let (watcher, created) = watchers::upsert_watcher(&state.db, &caller, input)?;
+    let (watcher, created) = watchers::upsert_watcher(&state.db, &caller, input).await?;
     state.watcher_wake.notify_one();
 
     let status = if created {
@@ -273,14 +273,15 @@ async fn list_watchers(
     Path(board): Path<String>,
     Query(query): Query<BoardEnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let scope = watchers::resolve_watcher_access_scope(
         &state.db,
         &resolved.id,
         &caller,
         query.owner.as_deref(),
-    )?;
-    let list = watchers::list_watchers(&state.db, &resolved.id, &scope)?;
+    )
+    .await?;
+    let list = watchers::list_watchers(&state.db, &resolved.id, &scope).await?;
     Ok(Json(json!({ "watchers": list })))
 }
 
@@ -290,14 +291,15 @@ async fn get_watcher(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<BoardEnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let scope = watchers::resolve_watcher_access_scope(
         &state.db,
         &resolved.id,
         &caller,
         query.owner.as_deref(),
-    )?;
-    let detail = watchers::get_watcher_detail(&state.db, &resolved.id, &id, &scope)?;
+    )
+    .await?;
+    let detail = watchers::get_watcher_detail(&state.db, &resolved.id, &id, &scope).await?;
     Ok(Json(json!(detail)))
 }
 
@@ -307,14 +309,15 @@ async fn delete_watcher(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<BoardEnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let scope = watchers::resolve_watcher_access_scope(
         &state.db,
         &resolved.id,
         &caller,
         query.owner.as_deref(),
-    )?;
-    watchers::delete_watcher(&state.db, &resolved.id, &id, &scope)?;
+    )
+    .await?;
+    watchers::delete_watcher(&state.db, &resolved.id, &id, &scope).await?;
     Ok(Json(json!({ "ok": true, "deleted": id })))
 }
 
@@ -324,18 +327,19 @@ async fn delete_board_watchers(
     Path(board): Path<String>,
     Query(query): Query<BoardEnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let scope = watchers::resolve_watcher_access_scope(
         &state.db,
         &resolved.id,
         &caller,
         query.owner.as_deref(),
-    )?;
+    )
+    .await?;
     if let Some(id) = query.id {
-        watchers::delete_watcher(&state.db, &resolved.id, &id, &scope)?;
+        watchers::delete_watcher(&state.db, &resolved.id, &id, &scope).await?;
         return Ok(Json(json!({ "ok": true, "deleted": 1, "id": id })));
     }
-    let deleted = watchers::delete_board_watchers(&state.db, &resolved.id, &scope)?;
+    let deleted = watchers::delete_board_watchers(&state.db, &resolved.id, &scope).await?;
     Ok(Json(json!({ "ok": true, "deleted": deleted })))
 }
 
@@ -368,7 +372,7 @@ async fn sync_deployment_watchers(
             .board
             .clone()
             .unwrap_or_else(|| default_board.clone());
-        let resolved = boards::resolve_board(&state.db, &target_board, ensure, &caller)?;
+        let resolved = boards::resolve_board(&state.db, &target_board, ensure, &caller).await?;
         let input = build_upsert_input(
             spec,
             resolved.id,
@@ -379,7 +383,7 @@ async fn sync_deployment_watchers(
         desired.push(input);
     }
 
-    let result = watchers::sync_deployment_watchers(&state.db, &caller, desired)?;
+    let result = watchers::sync_deployment_watchers(&state.db, &caller, desired).await?;
     state.watcher_wake.notify_one();
 
     Ok(Json(json!({

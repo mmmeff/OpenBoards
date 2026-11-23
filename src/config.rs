@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
 pub const DEFAULT_RATE_LIMIT_BURST: u32 = 200;
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 20;
 pub const DEFAULT_DATA_DIR: &str = "./.openboards";
 pub const LOCAL_DATA_DIR: &str = "./.board";
 pub const CLI_CONFIG_FILENAME: &str = ".openboard.json";
@@ -13,6 +14,7 @@ pub const CLI_CONFIG_FILENAME: &str = ".openboard.json";
 /// Global CLI configuration loaded from `.openboard.json` (or `--config <path>`).
 ///
 /// Unknown fields are rejected so typos in config keys fail fast with a clear error.
+/// `DATABASE_URL` is intentionally NOT supported here (strictly env-var-only).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CliFileConfig {
@@ -74,6 +76,98 @@ pub fn load_cli_config(
     }
 }
 
+/// Database connection target resolved strictly from `DATABASE_URL` or default SQLite path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbTarget {
+    SqlitePath(PathBuf),
+    SqliteUrl(String),
+    PostgresUrl(String),
+}
+
+impl DbTarget {
+    pub fn is_postgres(&self) -> bool {
+        matches!(self, Self::PostgresUrl(_))
+    }
+
+    /// Returns a credential-redacted summary safe for startup logs and error messages.
+    pub fn redacted_display(&self) -> String {
+        match self {
+            Self::SqlitePath(path) => format!("sqlite ({})", path.display()),
+            Self::SqliteUrl(url) => {
+                if url.contains(":memory:") || url.contains("mode=memory") {
+                    "sqlite (:memory:)".to_string()
+                } else {
+                    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+                    let path = without_query
+                        .strip_prefix("sqlite://")
+                        .or_else(|| without_query.strip_prefix("sqlite:"))
+                        .unwrap_or(without_query);
+                    format!("sqlite ({path})")
+                }
+            }
+            Self::PostgresUrl(url) => {
+                let without_scheme = url
+                    .strip_prefix("postgresql://")
+                    .or_else(|| url.strip_prefix("postgres://"))
+                    .unwrap_or("");
+                let without_query = without_scheme.split(['?', '#']).next().unwrap_or("");
+                let host_and_db = match without_query.rsplit_once('@') {
+                    Some((_, after_at)) => after_at,
+                    None => without_query,
+                };
+                if host_and_db.is_empty() {
+                    "postgres (<redacted>)".to_string()
+                } else {
+                    format!("postgres ({host_and_db})")
+                }
+            }
+        }
+    }
+}
+
+/// Resolves a `DbTarget` strictly from an optional `DATABASE_URL` value.
+/// Never echoes the raw connection string in error messages so credentials cannot leak.
+pub fn resolve_db_target(
+    database_url: Option<&str>,
+    default_db_path: PathBuf,
+    local_mode: bool,
+) -> Result<DbTarget, String> {
+    let Some(raw) = database_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DbTarget::SqlitePath(default_db_path));
+    };
+
+    if raw.starts_with("sqlite://") || raw.starts_with("sqlite:") {
+        return Ok(DbTarget::SqliteUrl(raw.to_string()));
+    }
+    if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+        if local_mode {
+            return Err(
+                "--local cannot be combined with a Postgres DATABASE_URL; unset DATABASE_URL or run without --local"
+                    .to_string(),
+            );
+        }
+        return Ok(DbTarget::PostgresUrl(raw.to_string()));
+    }
+
+    Err(
+        "unsupported DATABASE_URL scheme; supported schemes are sqlite://, postgres://, and postgresql://"
+            .to_string(),
+    )
+}
+
+fn parse_max_connections(raw: Option<&str>) -> Result<u32, String> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_DB_MAX_CONNECTIONS);
+    };
+    let parsed: u32 = val.parse().map_err(|_| {
+        format!("invalid OPENBOARDS_DB_MAX_CONNECTIONS value '{val}'; expected a positive integer")
+    })?;
+    if parsed == 0 {
+        return Err("OPENBOARDS_DB_MAX_CONNECTIONS must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
     /// Address to bind the HTTP server to
@@ -113,6 +207,8 @@ pub struct ServerConfig {
     pub admin_token: Option<String>,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
+    pub db_target: DbTarget,
+    pub db_max_connections: u32,
 }
 
 impl From<ServeArgs> for ServerConfig {
@@ -124,6 +220,7 @@ impl From<ServeArgs> for ServerConfig {
                 PathBuf::from(DEFAULT_DATA_DIR)
             }
         });
+        let db_path = data_dir.join("openboards.db");
         Self {
             listen: args.listen,
             data_dir,
@@ -131,11 +228,33 @@ impl From<ServeArgs> for ServerConfig {
             admin_token: args.admin_token,
             rate_limit_rps: args.rate_limit_rps,
             rate_limit_burst: args.rate_limit_burst,
+            db_target: DbTarget::SqlitePath(db_path),
+            db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
         }
     }
 }
 
 impl ServerConfig {
+    /// Builds `ServerConfig` from `ServeArgs`, reading `DATABASE_URL` and
+    /// `OPENBOARDS_DB_MAX_CONNECTIONS` strictly from process environment variables.
+    pub fn from_serve_args(args: ServeArgs) -> Result<Self, String> {
+        let database_url = std::env::var("DATABASE_URL").ok();
+        let max_conns = std::env::var("OPENBOARDS_DB_MAX_CONNECTIONS").ok();
+        Self::from_serve_args_with_env(args, database_url.as_deref(), max_conns.as_deref())
+    }
+
+    pub fn from_serve_args_with_env(
+        args: ServeArgs,
+        database_url: Option<&str>,
+        max_connections_env: Option<&str>,
+    ) -> Result<Self, String> {
+        let local_mode = args.local;
+        let mut cfg = Self::from(args);
+        cfg.db_target = resolve_db_target(database_url, cfg.db_path(), local_mode)?;
+        cfg.db_max_connections = parse_max_connections(max_connections_env)?;
+        Ok(cfg)
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("openboards.db")
     }
@@ -167,6 +286,11 @@ mod tests {
         assert!(cfg.admin_token.is_none());
         assert_eq!(cfg.rate_limit_rps, DEFAULT_RATE_LIMIT_RPS);
         assert_eq!(cfg.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
+        assert_eq!(cfg.db_max_connections, DEFAULT_DB_MAX_CONNECTIONS);
+        assert_eq!(
+            cfg.db_target,
+            DbTarget::SqlitePath(PathBuf::from("./.openboards/openboards.db"))
+        );
 
         let w = Wrapper::try_parse_from(["serve", "--local"]).unwrap();
         assert!(w.serve.local);
@@ -196,6 +320,69 @@ mod tests {
         assert_eq!(cfg.admin_token.as_deref(), Some("secret-tok"));
         assert_eq!(cfg.rate_limit_rps, 25);
         assert_eq!(cfg.rate_limit_burst, 50);
+
+        // --database-url CLI flag must NOT exist (strictly env-var-only)
+        let rejected = Wrapper::try_parse_from([
+            "serve",
+            "--database-url",
+            "postgres://user:pass@localhost/db",
+        ]);
+        assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn resolves_env_only_database_url_and_redacts_credentials() {
+        let w = Wrapper::try_parse_from(["serve"]).unwrap();
+        let cfg = ServerConfig::from_serve_args_with_env(
+            w.serve,
+            Some("postgres://admin:supersecret@db.internal:5432/openboards?sslmode=require"),
+            Some("32"),
+        )
+        .unwrap();
+        assert!(cfg.db_target.is_postgres());
+        assert_eq!(cfg.db_max_connections, 32);
+        let display = cfg.db_target.redacted_display();
+        assert_eq!(display, "postgres (db.internal:5432/openboards)");
+        assert!(!display.contains("supersecret"));
+        assert!(!display.contains("admin"));
+        assert!(!display.contains("sslmode"));
+
+        // --local + Postgres DATABASE_URL is rejected
+        let w_local = Wrapper::try_parse_from(["serve", "--local"]).unwrap();
+        let err = ServerConfig::from_serve_args_with_env(
+            w_local.serve,
+            Some("postgresql://u:secret@localhost:5432/ob"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--local"), "err={err}");
+        assert!(!err.contains("secret"), "must not leak password in error");
+
+        // Unsupported scheme fails without leaking raw URL/password
+        let w_bad = Wrapper::try_parse_from(["serve"]).unwrap();
+        let err = ServerConfig::from_serve_args_with_env(
+            w_bad.serve,
+            Some("mysql://root:my_secret_pw@localhost/ob"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsupported DATABASE_URL scheme"), "err={err}");
+        assert!(!err.contains("my_secret_pw"), "must not leak password");
+
+        // sqlite:// URL works even with --local
+        let w_sq = Wrapper::try_parse_from(["serve", "--local"]).unwrap();
+        let cfg_sq = ServerConfig::from_serve_args_with_env(
+            w_sq.serve,
+            Some("sqlite::memory:"),
+            None,
+        )
+        .unwrap();
+        assert!(!cfg_sq.db_target.is_postgres());
+        assert_eq!(cfg_sq.db_target.redacted_display(), "sqlite (:memory:)");
+
+        // Zero max connections is rejected
+        let w_zero = Wrapper::try_parse_from(["serve"]).unwrap();
+        assert!(ServerConfig::from_serve_args_with_env(w_zero.serve, None, Some("0")).is_err());
     }
 
     #[test]
@@ -253,10 +440,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let bad_field = tmp.path().join("unknown.json");
-        std::fs::write(&bad_field, r#"{"url":"http://127.0.0.1:8080","bogus":123}"#).unwrap();
+        std::fs::write(
+            &bad_field,
+            r#"{"url":"http://127.0.0.1:8080","database_url":"postgres://x"}"#,
+        )
+        .unwrap();
         let err = load_cli_config_from_path(&bad_field).unwrap_err();
         assert!(err.contains(&bad_field.display().to_string()), "err={err}");
-        assert!(err.contains("bogus"), "err={err}");
+        assert!(err.contains("database_url"), "err={err}");
 
         let bad_json = tmp.path().join("broken.json");
         std::fs::write(&bad_json, "{ not valid json").unwrap();
@@ -276,7 +467,6 @@ mod tests {
         let leaf = mid.join("service/src");
         std::fs::create_dir_all(&leaf).unwrap();
 
-        // Absent in tree -> None (assuming no .openboard.json above tmpdir)
         let isolated_search = find_cli_config(&leaf);
         assert!(
             isolated_search
@@ -285,26 +475,22 @@ mod tests {
                 .unwrap_or(true)
         );
 
-        // Root config found from deeply nested leaf
         std::fs::write(&root_cfg, r#"{"board":"root-board"}"#).unwrap();
         let (found_path, found_cfg) = load_cli_config(None, &leaf).unwrap().unwrap();
         assert_eq!(found_path, root_cfg);
         assert_eq!(found_cfg.board.as_deref(), Some("root-board"));
 
-        // Closer ancestor overrides outer ancestor
         let mid_cfg = mid.join(CLI_CONFIG_FILENAME);
         std::fs::write(&mid_cfg, r#"{"board":"mid-board"}"#).unwrap();
         let (found_path, found_cfg) = load_cli_config(None, &leaf).unwrap().unwrap();
         assert_eq!(found_path, mid_cfg);
         assert_eq!(found_cfg.board.as_deref(), Some("mid-board"));
 
-        // Directory named `.openboard.json` is skipped in favor of file in parent
         let leaf_dir_trap = leaf.join(CLI_CONFIG_FILENAME);
         std::fs::create_dir(&leaf_dir_trap).unwrap();
         let (found_path, _) = load_cli_config(None, &leaf).unwrap().unwrap();
         assert_eq!(found_path, mid_cfg);
 
-        // Explicit path wins over upward search
         let custom = tmp.path().join("custom.json");
         std::fs::write(&custom, r#"{"board":"explicit-board"}"#).unwrap();
         let (found_path, found_cfg) = load_cli_config(Some(&custom), &leaf).unwrap().unwrap();

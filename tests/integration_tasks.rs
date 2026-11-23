@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::tasks;
 use openboards::{build_router, AppState};
@@ -20,12 +20,12 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -35,6 +35,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: 0,
                 rate_limit_burst: 100,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -105,7 +107,7 @@ impl TestHarness {
 
 #[tokio::test]
 async fn task_lifecycle_leases_token_secrecy_expiry_and_ownership() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
     let (_eve_id, eve_tok) = h.create_user_with_token("eve", "eve@acme.com", "viewer").await;
@@ -263,6 +265,7 @@ async fn task_lifecycle_leases_token_secrecy_expiry_and_ownership() {
         &h.state.events,
         Utc::now() + Duration::minutes(5),
     )
+    .await
     .unwrap();
     assert_eq!(reaped, 1);
 
@@ -366,7 +369,7 @@ async fn task_lifecycle_leases_token_secrecy_expiry_and_ownership() {
 
 #[tokio::test]
 async fn dag_needs_cascade_reopen_batch_create_and_idempotency() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
 
     // 1. Batch create with internal `{ key }` DAG: fix -> review -> ship
@@ -597,7 +600,7 @@ async fn dag_needs_cascade_reopen_batch_create_and_idempotency() {
 
 #[tokio::test]
 async fn queue_claim_priority_limits_long_poll_and_root_mutation_coupling() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -826,7 +829,7 @@ async fn queue_claim_priority_limits_long_poll_and_root_mutation_coupling() {
 
 #[tokio::test]
 async fn existing_thread_task_assign_release_pagination_tree_limit_and_lease_expiry_wakeup() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -1016,7 +1019,7 @@ async fn existing_thread_task_assign_release_pagination_tree_limit_and_lease_exp
 
 #[tokio::test]
 async fn spec_audit_cross_table_idempotency_event_cursor_and_reserved_hint() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
 
     // 1. reserved_label for `board.task` names `tasks` commands in hint

@@ -29,7 +29,7 @@ async fn list_global_schemas(
     State(state): State<AppState>,
     _caller: CallerContext,
 ) -> BoardResult<Json<Value>> {
-    let list = schemas::list_schemas(&state.db)?;
+    let list = schemas::list_schemas(&state.db).await?;
     Ok(Json(json!({ "schemas": list })))
 }
 
@@ -38,7 +38,7 @@ async fn get_global_schema(
     _caller: CallerContext,
     Path(id): Path<String>,
 ) -> BoardResult<Json<Value>> {
-    let schema = schemas::get_schema(&state.db, &id)?;
+    let schema = schemas::get_schema(&state.db, &id).await?;
     Ok(Json(json!({ "schema": schema })))
 }
 
@@ -47,7 +47,7 @@ async fn create_global_schema(
     caller: CallerContext,
     Json(input): Json<CreateSchemaInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let (schema, created) = schemas::create_schema(&state.db, None, &caller, input)?;
+    let (schema, created) = schemas::create_schema(&state.db, None, &caller, input).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -62,8 +62,8 @@ async fn list_board_schemas(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let _resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let list = schemas::list_schemas(&state.db)?;
+    let _resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let list = schemas::list_schemas(&state.db).await?;
     Ok(Json(json!({ "schemas": list })))
 }
 
@@ -73,8 +73,8 @@ async fn get_board_schema(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let _resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let schema = schemas::get_schema(&state.db, &id)?;
+    let _resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let schema = schemas::get_schema(&state.db, &id).await?;
     Ok(Json(json!({ "schema": schema })))
 }
 
@@ -85,8 +85,9 @@ async fn create_board_schema(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateSchemaInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (schema, created) = schemas::create_schema(&state.db, Some(&resolved.id), &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (schema, created) =
+        schemas::create_schema(&state.db, Some(&resolved.id), &caller, input).await?;
     let status = if created {
         StatusCode::CREATED
     } else {

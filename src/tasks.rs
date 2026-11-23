@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::actors::{self, CallerContext};
-use crate::db::{sql_placeholders, Database};
+use crate::db::{escape_like_prefix, sql_placeholders, Database, DbRow, DbTx, Dialect, Queryable, SqlArg};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventHub, EventType};
 use crate::filter::{FilterContext, LabelPredicate, QueryFilter};
@@ -14,6 +13,7 @@ use crate::grants::{self, Grant};
 use crate::id::{hash_token, new_bearer_token};
 use crate::labels;
 use crate::messages::{self, MessageView, PostMessageInput, ThreadSummaryView};
+use crate::sql_args;
 use crate::validate::{
     validate_channel_path, validate_channel_pattern, validate_profile_name, validate_text_length,
 };
@@ -337,73 +337,101 @@ fn parse_lease_ms(lease_secs: Option<i64>, lease_ms: Option<i64>) -> BoardResult
     Ok(ms.min(MAX_LEASE_MS))
 }
 
-fn map_task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskRow> {
-    let state_str: String = r.get(4)?;
+fn map_task_row(r: &DbRow) -> BoardResult<StoredTaskRow> {
+    let state_str = r.get_str(4)?;
     let state = TaskState::parse(&state_str).unwrap_or(TaskState::Failed);
     Ok(StoredTaskRow {
-        message_id: r.get(0)?,
-        board_id: r.get(1)?,
-        channel: r.get(2)?,
-        seq: r.get(3)?,
+        message_id: r.get_str(0)?,
+        board_id: r.get_str(1)?,
+        channel: r.get_str(2)?,
+        seq: r.get_i64(3)?,
         state,
-        owner_actor: r.get(5)?,
-        assigned_for: r.get(6)?,
-        claimed_by: r.get(7)?,
-        claim_epoch: r.get(8)?,
-        claim_token: r.get(9)?,
-        claim_until: r.get(10)?,
-        block_reason: r.get(11)?,
-        block_kind: r.get(12)?,
-        result: r.get(13)?,
-        fail_reason: r.get(14)?,
-        cancel_reason: r.get(15)?,
+        owner_actor: r.get_str(5)?,
+        assigned_for: r.get_opt_str(6)?,
+        claimed_by: r.get_opt_str(7)?,
+        claim_epoch: r.get_i64(8)?,
+        claim_token: r.get_opt_str(9)?,
+        claim_until: r.get_opt_str(10)?,
+        block_reason: r.get_opt_str(11)?,
+        block_kind: r.get_opt_str(12)?,
+        result: r.get_opt_str(13)?,
+        fail_reason: r.get_opt_str(14)?,
+        cancel_reason: r.get_opt_str(15)?,
     })
 }
 
-fn load_task_row_tx(
-    conn: &Connection,
+async fn load_task_row_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     task_id: &str,
 ) -> BoardResult<Option<StoredTaskRow>> {
-    conn.query_row(
+    let row = conn
+        .fetch_optional(
+            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                    result, fail_reason, cancel_reason
+             FROM tasks
+             WHERE board_id = ?1 AND message_id = ?2",
+            sql_args![board_id, task_id],
+        )
+        .await?;
+    row.as_ref().map(map_task_row).transpose()
+}
+
+async fn load_task_row_for_update_tx(
+    tx: &mut DbTx,
+    board_id: &str,
+    task_id: &str,
+) -> BoardResult<Option<StoredTaskRow>> {
+    let sql = format!(
         "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
                 claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
                 result, fail_reason, cancel_reason
          FROM tasks
-         WHERE board_id = ?1 AND message_id = ?2",
-        params![board_id, task_id],
-        map_task_row,
-    )
-    .optional()
-    .map_err(Into::into)
+         WHERE board_id = ?1 AND message_id = ?2{}",
+        tx.lock_row_suffix()
+    );
+    let row = tx.fetch_optional(&sql, sql_args![board_id, task_id]).await?;
+    row.as_ref().map(map_task_row).transpose()
 }
 
-fn load_task_needs_tx(conn: &Connection, task_id: &str) -> BoardResult<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT needs_task_id FROM task_needs WHERE task_id = ?1 ORDER BY needs_task_id ASC",
-    )?;
-    let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
+async fn load_task_needs_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    task_id: &str,
+) -> BoardResult<Vec<String>> {
+    let rows = conn
+        .fetch_all(
+            "SELECT needs_task_id FROM task_needs WHERE task_id = ?1 ORDER BY needs_task_id ASC",
+            sql_args![task_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        out.push(r?);
+        out.push(r.get_str(0)?);
     }
     Ok(out)
 }
 
 /// Hydrates `Option<TaskView>` for a root message (never exposes `claim_token`).
-pub fn load_task_view_tx(conn: &Connection, message_id: &str) -> BoardResult<Option<TaskView>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                result, fail_reason, cancel_reason
-         FROM tasks
-         WHERE message_id = ?1",
-    )?;
-    let row: Option<StoredTaskRow> = stmt.query_row(params![message_id], map_task_row).optional()?;
-    let Some(t) = row else {
+pub async fn load_task_view_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    message_id: &str,
+) -> BoardResult<Option<TaskView>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                    result, fail_reason, cancel_reason
+             FROM tasks
+             WHERE message_id = ?1",
+            sql_args![message_id],
+        )
+        .await?;
+    let Some(r) = row else {
         return Ok(None);
     };
-    let needs = load_task_needs_tx(conn, message_id)?;
+    let t = map_task_row(&r)?;
+    let needs = load_task_needs_tx(conn, message_id).await?;
     Ok(Some(TaskView {
         state: t.state,
         owner: t.owner_actor,
@@ -420,8 +448,8 @@ pub fn load_task_view_tx(conn: &Connection, message_id: &str) -> BoardResult<Opt
     }))
 }
 
-pub fn load_task_views_batch_tx(
-    conn: &Connection,
+pub async fn load_task_views_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_ids: &[&str],
 ) -> BoardResult<HashMap<String, TaskView>> {
     let mut out: HashMap<String, TaskView> = HashMap::new();
@@ -439,10 +467,10 @@ pub fn load_task_views_batch_tx(
              WHERE message_id IN ({})",
             sql_placeholders(chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), map_task_row)?;
-        for row in rows {
-            stored_tasks.push(row?);
+        let args: Vec<SqlArg<'_>> = chunk.iter().copied().map(SqlArg::from).collect();
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in &rows {
+            stored_tasks.push(map_task_row(r)?);
         }
     }
 
@@ -460,13 +488,10 @@ pub fn load_task_views_batch_tx(
              ORDER BY task_id ASC, needs_task_id ASC",
             sql_placeholders(chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (tid, nid) = row?;
-            needs_map.entry(tid).or_default().push(nid);
+        let args: Vec<SqlArg<'_>> = chunk.iter().copied().map(SqlArg::from).collect();
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in rows {
+            needs_map.entry(r.get_str(0)?).or_default().push(r.get_str(1)?);
         }
     }
 
@@ -523,20 +548,25 @@ fn resolve_assigned_for(owner_actor: &str, raw_for: Option<&str>) -> BoardResult
     )))
 }
 
-fn all_needs_completed_tx(conn: &Connection, task_id: &str) -> BoardResult<bool> {
-    let unfinished: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM task_needs tn
-         JOIN tasks t ON t.message_id = tn.needs_task_id
-         WHERE tn.task_id = ?1 AND t.state != 'completed'",
-        params![task_id],
-        |r| r.get(0),
-    )?;
+async fn all_needs_completed_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    task_id: &str,
+) -> BoardResult<bool> {
+    let unfinished = conn
+        .fetch_one(
+            "SELECT COUNT(*)
+             FROM task_needs tn
+             JOIN tasks t ON t.message_id = tn.needs_task_id
+             WHERE tn.task_id = ?1 AND t.state != 'completed'",
+            sql_args![task_id],
+        )
+        .await?
+        .get_i64(0)?;
     Ok(unfinished == 0)
 }
 
-fn validate_prereqs_readable_tx(
-    conn: &Connection,
+async fn validate_prereqs_readable_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     board_grants: &[Grant],
     caller: &CallerContext,
@@ -547,12 +577,14 @@ fn validate_prereqs_readable_tx(
         if deduped.contains(nid) {
             continue;
         }
-        let prereq = load_task_row_tx(conn, board_id, nid)?.ok_or_else(|| {
-            BoardError::new(
-                ErrorCode::InvalidNeeds,
-                format!("prerequisite '{nid}' is not a task on this board"),
-            )
-        })?;
+        let prereq = load_task_row_tx(conn, board_id, nid)
+            .await?
+            .ok_or_else(|| {
+                BoardError::new(
+                    ErrorCode::InvalidNeeds,
+                    format!("prerequisite '{nid}' is not a task on this board"),
+                )
+            })?;
         if !grants::caller_permissions_on_channel(board_grants, caller, &prereq.channel).can_read()
         {
             return Err(BoardError::new(
@@ -566,8 +598,8 @@ fn validate_prereqs_readable_tx(
 }
 
 /// Checks whether setting `task_id` to depend on `new_needs` would introduce a cycle.
-fn check_no_cycle_tx(
-    conn: &Connection,
+async fn check_no_cycle_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     task_id: &str,
     new_needs: &[String],
@@ -585,12 +617,14 @@ fn check_no_cycle_tx(
         if !visited.insert(curr.clone()) {
             continue;
         }
-        let mut stmt = conn.prepare(
-            "SELECT needs_task_id FROM task_needs WHERE board_id = ?1 AND task_id = ?2",
-        )?;
-        let rows = stmt.query_map(params![board_id, curr], |r| r.get::<_, String>(0))?;
+        let rows = conn
+            .fetch_all(
+                "SELECT needs_task_id FROM task_needs WHERE board_id = ?1 AND task_id = ?2",
+                sql_args![board_id, &curr],
+            )
+            .await?;
         for r in rows {
-            stack.push(r?);
+            stack.push(r.get_str(0)?);
         }
     }
     Ok(())
@@ -599,72 +633,77 @@ fn check_no_cycle_tx(
 /// Expires all overdue `claimed` leases on `board_id` (or all boards if `board_id` is `None`)
 /// as of `now`, transitioning `claimed -> ready`, updating `board.task=ready`, and emitting
 /// `task.expired` + `task.ready`. Returns `(board_id, event_seq)` pairs for post-commit notify.
-pub fn expire_due_leases_tx(
-    conn: &Connection,
+pub async fn expire_due_leases_tx(
+    tx: &mut DbTx,
     board_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> BoardResult<Vec<(String, i64)>> {
     let now_str = format_utc_ms(now);
+    let skip_locked = match tx.dialect() {
+        Dialect::Sqlite => "",
+        Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
+    };
+
     let overdue: Vec<StoredTaskRow> = if let Some(bid) = board_id {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
                     claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
                     result, fail_reason, cancel_reason
              FROM tasks
              WHERE board_id = ?1 AND state = 'claimed' AND claim_until <= ?2
-             ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![bid, now_str], map_task_row)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        out
+             ORDER BY seq ASC
+             LIMIT 50{skip_locked}"
+        );
+        let rows = tx.fetch_all(&sql, sql_args![bid, &now_str]).await?;
+        rows.iter()
+            .map(map_task_row)
+            .collect::<BoardResult<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
                     claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
                     result, fail_reason, cancel_reason
              FROM tasks
              WHERE state = 'claimed' AND claim_until <= ?1
-             ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![now_str], map_task_row)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        out
+             ORDER BY seq ASC
+             LIMIT 50{skip_locked}"
+        );
+        let rows = tx.fetch_all(&sql, sql_args![&now_str]).await?;
+        rows.iter()
+            .map(map_task_row)
+            .collect::<BoardResult<Vec<_>>>()?
     };
 
     let mut emitted = Vec::new();
     for task in overdue {
         let Some(stored_msg) =
-            messages::load_stored_message_tx(conn, &task.board_id, &task.message_id)?
+            messages::load_stored_message_tx(tx, &task.board_id, &task.message_id).await?
         else {
             continue;
         };
-        let before_snap = messages::build_message_snapshot_tx(conn, &stored_msg)?;
+        let before_snap = messages::build_message_snapshot_tx(tx, &stored_msg).await?;
 
-        conn.execute(
+        tx.execute(
             "UPDATE tasks
              SET state = 'ready', claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
              WHERE message_id = ?2",
-            params![now_str, task.message_id],
-        )?;
+            sql_args![&now_str, &task.message_id],
+        )
+        .await?;
         labels::set_system_label_tx(
-            conn,
+            tx,
             &task.board_id,
             &task.message_id,
             "board.task",
             TaskState::Ready.as_str(),
-        )?;
+        )
+        .await?;
 
-        let after_snap = messages::build_message_snapshot_tx(conn, &stored_msg)?;
-        let after_msg = messages::hydrate_message_view_tx(conn, &stored_msg)?;
+        let after_snap = messages::build_message_snapshot_tx(tx, &stored_msg).await?;
+        let after_msg = messages::hydrate_message_view_tx(tx, &stored_msg).await?;
 
         let ev_exp = events::append_event_tx(
-            conn,
+            tx,
             EventAppend {
                 board_id: &task.board_id,
                 event_type: EventType::TaskExpired,
@@ -676,11 +715,12 @@ pub fn expire_due_leases_tx(
                 after_snapshot: Some(&after_snap),
                 after_message: Some(&after_msg),
             },
-        )?;
+        )
+        .await?;
         emitted.push((task.board_id.clone(), ev_exp.seq));
 
         let ev_ready = events::append_event_tx(
-            conn,
+            tx,
             EventAppend {
                 board_id: &task.board_id,
                 event_type: EventType::TaskReady,
@@ -692,7 +732,8 @@ pub fn expire_due_leases_tx(
                 after_snapshot: Some(&after_snap),
                 after_message: Some(&after_msg),
             },
-        )?;
+        )
+        .await?;
         emitted.push((task.board_id.clone(), ev_ready.seq));
     }
 
@@ -700,16 +741,18 @@ pub fn expire_due_leases_tx(
 }
 
 /// Public reaper called by background tokio loop and deterministic tests.
-pub fn reap_expired_leases(state: &AppState) -> BoardResult<usize> {
-    reap_expired_leases_at(&state.db, &state.events, Utc::now())
+pub async fn reap_expired_leases(state: &AppState) -> BoardResult<usize> {
+    reap_expired_leases_at(&state.db, &state.events, Utc::now()).await
 }
 
-pub fn reap_expired_leases_at(
+pub async fn reap_expired_leases_at(
     db: &Database,
     events_hub: &EventHub,
     now: DateTime<Utc>,
 ) -> BoardResult<usize> {
-    let emitted = db.with_tx(|tx| expire_due_leases_tx(tx, None, now))?;
+    let mut tx = db.begin_tx().await?;
+    let emitted = expire_due_leases_tx(&mut tx, None, now).await?;
+    tx.commit().await?;
     let count = emitted.len() / 2;
     for (bid, seq) in emitted {
         events_hub.notify(&bid, seq);
@@ -723,7 +766,7 @@ pub fn spawn_lease_reaper_loop(state: AppState) -> tokio::task::JoinHandle<()> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(err) = reap_expired_leases(&state) {
+            if let Err(err) = reap_expired_leases(&state).await {
                 tracing::warn!("lease reaper tick error: {err}");
             }
         }
@@ -782,8 +825,8 @@ fn validate_active_lease(
     Ok(())
 }
 
-fn claim_task_inner_tx(
-    conn: &Connection,
+async fn claim_task_inner_tx(
+    tx: &mut DbTx,
     board_id: &str,
     task: &StoredTaskRow,
     caller: &CallerContext,
@@ -828,48 +871,51 @@ fn claim_task_inner_tx(
         }
     }
 
-    let stored_msg = messages::load_stored_message_tx(conn, board_id, &task.message_id)?
+    let stored_msg = messages::load_stored_message_tx(tx, board_id, &task.message_id)
+        .await?
         .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{}' not found", task.message_id),
             )
         })?;
-    let before_snap = messages::build_message_snapshot_tx(conn, &stored_msg)?;
+    let before_snap = messages::build_message_snapshot_tx(tx, &stored_msg).await?;
 
     let new_epoch = task.claim_epoch + 1;
     let token = new_bearer_token();
     let now_str = format_utc_ms(now);
     let until_str = format_utc_ms(now + Duration::milliseconds(lease_ms));
 
-    actors::record_actor_write_tx(conn, board_id, &task.channel, caller)?;
+    actors::record_actor_write_tx(tx, board_id, &task.channel, caller).await?;
 
-    conn.execute(
+    tx.execute(
         "UPDATE tasks
          SET state = 'claimed', claimed_by = ?1, claim_epoch = ?2, claim_token = ?3,
              claim_until = ?4, updated_at = ?5
          WHERE message_id = ?6",
-        params![
-            caller_actor,
+        sql_args![
+            &caller_actor,
             new_epoch,
-            token,
-            until_str,
-            now_str,
-            task.message_id
+            &token,
+            &until_str,
+            &now_str,
+            &task.message_id
         ],
-    )?;
+    )
+    .await?;
     labels::set_system_label_tx(
-        conn,
+        tx,
         board_id,
         &task.message_id,
         "board.task",
         TaskState::Claimed.as_str(),
-    )?;
+    )
+    .await?;
 
-    let after_snap = messages::build_message_snapshot_tx(conn, &stored_msg)?;
-    let after_msg = messages::hydrate_message_view_tx(conn, &stored_msg)?;
+    let after_snap = messages::build_message_snapshot_tx(tx, &stored_msg).await?;
+    let after_msg = messages::hydrate_message_view_tx(tx, &stored_msg).await?;
     let ev = events::append_event_tx(
-        conn,
+        tx,
         EventAppend {
             board_id,
             event_type: EventType::TaskClaimed,
@@ -885,7 +931,8 @@ fn claim_task_inner_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&after_msg),
         },
-    )?;
+    )
+    .await?;
 
     Ok((
         ClaimedTaskView {
@@ -899,7 +946,7 @@ fn claim_task_inner_tx(
 }
 
 /// Creates a task (either starting a new thread in `channel`, or turning existing thread `re` into a task).
-pub fn create_task(
+pub async fn create_task(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -920,237 +967,254 @@ pub fn create_task(
         DEFAULT_LEASE_MS
     };
 
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
+
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let owner_actor = caller.actor_id();
+    let assigned_for = resolve_assigned_for(&owner_actor, input.assigned_for.as_deref())?;
+
+    let valid_needs =
+        validate_prereqs_readable_tx(&mut tx, board_id, &board_grants, caller, &input.needs)
+            .await?;
+
+    let (root_id, channel, msg_seq, replayed) = if let Some(ch) = input.channel {
+        validate_channel_path(&ch)?;
+        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
+        if !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "creating a task in '{ch}' requires 'label' permission"
+            )));
+        }
+        if input.claim && !perms.can_read() {
+            return Err(BoardError::forbidden(format!(
+                "claiming a task in '{ch}' requires 'read' and 'label' permissions"
+            )));
+        }
+
+        let posted = messages::post_message_in_tx(
+            &mut tx,
+            board_id,
+            caller,
+            PostMessageInput {
+                channel: ch.clone(),
+                text: input.text,
+                id: input.id,
+                attachments: input.attachments,
+                labels: input.labels,
+                schema: input.schema,
+                no_sync: input.no_sync,
+            },
+        )
+        .await?;
+        if let Some(seq) = posted.event_seq {
             event_seqs.push(seq);
         }
-
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let owner_actor = caller.actor_id();
-        let assigned_for = resolve_assigned_for(&owner_actor, input.assigned_for.as_deref())?;
-
-        // Validate prereqs upfront
-        let valid_needs =
-            validate_prereqs_readable_tx(tx, board_id, &board_grants, caller, &input.needs)?;
-
-        let (root_id, channel, msg_seq, replayed) = if let Some(ch) = input.channel {
-            validate_channel_path(&ch)?;
-            let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
-            if !perms.can_label() {
-                return Err(BoardError::forbidden(format!(
-                    "creating a task in '{ch}' requires 'label' permission"
-                )));
-            }
-            if input.claim && !perms.can_read() {
-                return Err(BoardError::forbidden(format!(
-                    "claiming a task in '{ch}' requires 'read' and 'label' permissions"
-                )));
-            }
-
-            let posted = messages::post_message_in_tx(
-                tx,
-                board_id,
-                caller,
-                PostMessageInput {
-                    channel: ch.clone(),
-                    text: input.text,
-                    id: input.id,
-                    attachments: input.attachments,
-                    labels: input.labels,
-                    schema: input.schema,
-                    no_sync: input.no_sync,
-                },
-            )?;
-            if let Some(seq) = posted.event_seq {
-                event_seqs.push(seq);
-            }
-            if posted.replayed {
-                if posted.message.task.is_none() {
-                    return Err(BoardError::new(
-                        ErrorCode::DuplicateId,
-                        "idempotency key was already used for a non-task post",
-                    ));
-                }
-                // Idempotent replay of an already-created task
-                return Ok(CreateTaskResult {
-                    task: posted.message,
-                    claim: None,
-                    replayed: true,
-                    event_seqs,
-                });
-            }
-            let stored = messages::load_stored_message_tx(tx, board_id, &posted.message.id)?
-                .expect("just inserted");
-            (posted.message.id, ch, stored.seq, false)
-        } else {
-            let target_id = input.re.as_deref().expect("checked");
-            let target =
-                messages::load_stored_message_tx(tx, board_id, target_id)?.ok_or_else(|| {
-                    BoardError::new(
-                        ErrorCode::MessageNotFound,
-                        format!("message '{target_id}' not found"),
-                    )
-                })?;
-            let perms =
-                grants::caller_permissions_on_channel(&board_grants, caller, &target.channel);
-            if !perms.can_read() {
+        if posted.replayed {
+            if posted.message.task.is_none() {
                 return Err(BoardError::new(
+                    ErrorCode::DuplicateId,
+                    "idempotency key was already used for a non-task post",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(CreateTaskResult {
+                task: posted.message,
+                claim: None,
+                replayed: true,
+                event_seqs,
+            });
+        }
+        let stored = messages::load_stored_message_tx(&mut tx, board_id, &posted.message.id)
+            .await?
+            .expect("just inserted");
+        (posted.message.id, ch, stored.seq, false)
+    } else {
+        let target_id = input.re.as_deref().expect("checked");
+        let target = messages::load_stored_message_tx(&mut tx, board_id, target_id)
+            .await?
+            .ok_or_else(|| {
+                BoardError::new(
                     ErrorCode::MessageNotFound,
                     format!("message '{target_id}' not found"),
-                ));
-            }
-            if !perms.can_label() {
-                return Err(BoardError::forbidden(format!(
-                    "creating a task in '{}' requires 'label' permission",
-                    target.channel
-                )));
-            }
-            let root_id = target.re.unwrap_or(target.id);
-            let root_msg =
-                messages::load_stored_message_tx(tx, board_id, &root_id)?.ok_or_else(|| {
-                    BoardError::new(
-                        ErrorCode::MessageNotFound,
-                        format!("thread root '{root_id}' not found"),
-                    )
-                })?;
-            if root_msg.deleted_at.is_some() {
-                return Err(BoardError::new(
-                    ErrorCode::MessageDeleted,
-                    format!("cannot create a task from deleted message '{root_id}'"),
-                ));
-            }
-            if load_task_row_tx(tx, board_id, &root_id)?.is_some() {
-                return Err(BoardError::new(
-                    ErrorCode::TaskAlreadyExists,
-                    format!("thread '{root_id}' is already a task"),
-                ));
-            }
-            actors::record_actor_write_tx(tx, board_id, &root_msg.channel, caller)?;
-            (root_id, root_msg.channel, root_msg.seq, false)
-        };
-
-        // Self-need check for existing thread converted to task
-        if valid_needs.iter().any(|n| n == &root_id) {
+                )
+            })?;
+        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &target.channel);
+        if !perms.can_read() {
             return Err(BoardError::new(
-                ErrorCode::InvalidNeeds,
-                "a task cannot depend on itself",
+                ErrorCode::MessageNotFound,
+                format!("message '{target_id}' not found"),
             ));
         }
+        if !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "creating a task in '{}' requires 'label' permission",
+                target.channel
+            )));
+        }
+        let root_id = target.re.unwrap_or(target.id);
+        let root_msg = messages::load_stored_message_for_update_tx(&mut tx, board_id, &root_id)
+            .await?
+            .ok_or_else(|| {
+                BoardError::new(
+                    ErrorCode::MessageNotFound,
+                    format!("thread root '{root_id}' not found"),
+                )
+            })?;
+        if root_msg.deleted_at.is_some() {
+            return Err(BoardError::new(
+                ErrorCode::MessageDeleted,
+                format!("cannot create a task from deleted message '{root_id}'"),
+            ));
+        }
+        if load_task_row_tx(&mut tx, board_id, &root_id).await?.is_some() {
+            return Err(BoardError::new(
+                ErrorCode::TaskAlreadyExists,
+                format!("thread '{root_id}' is already a task"),
+            ));
+        }
+        actors::record_actor_write_tx(&mut tx, board_id, &root_msg.channel, caller).await?;
+        (root_id, root_msg.channel, root_msg.seq, false)
+    };
 
-        let stored_msg = messages::load_stored_message_tx(tx, board_id, &root_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored_msg)?;
+    if valid_needs.iter().any(|n| n == &root_id) {
+        return Err(BoardError::new(
+            ErrorCode::InvalidNeeds,
+            "a task cannot depend on itself",
+        ));
+    }
 
-        let mut all_done = true;
-        for nid in &valid_needs {
-            if let Some(p) = load_task_row_tx(tx, board_id, nid)? {
-                if p.state != TaskState::Completed {
-                    all_done = false;
-                }
+    let stored_msg = messages::load_stored_message_tx(&mut tx, board_id, &root_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored_msg).await?;
+
+    let mut all_done = true;
+    for nid in &valid_needs {
+        if let Some(p) = load_task_row_tx(&mut tx, board_id, nid).await? {
+            if p.state != TaskState::Completed {
+                all_done = false;
             }
         }
-        let initial_state = if all_done {
-            TaskState::Ready
-        } else {
-            TaskState::Waiting
-        };
+    }
+    let initial_state = if all_done {
+        TaskState::Ready
+    } else {
+        TaskState::Waiting
+    };
 
+    tx.execute(
+        "INSERT INTO tasks (
+            message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+            claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+            result, fail_reason, cancel_reason, created_at, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            NULL, 0, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, ?8, ?8
+         )",
+        sql_args![
+            &root_id,
+            board_id,
+            &channel,
+            msg_seq,
+            initial_state.as_str(),
+            &owner_actor,
+            &assigned_for,
+            &now_str
+        ],
+    )
+    .await?;
+
+    for nid in &valid_needs {
         tx.execute(
-            "INSERT INTO tasks (
-                message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                result, fail_reason, cancel_reason, created_at, updated_at
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                NULL, 0, NULL, NULL, NULL, NULL,
-                NULL, NULL, NULL, ?8, ?8
-             )",
-            params![
-                root_id,
-                board_id,
-                channel,
-                msg_seq,
-                initial_state.as_str(),
-                owner_actor,
-                assigned_for,
-                now_str
-            ],
-        )?;
+            "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
+            sql_args![board_id, &root_id, nid],
+        )
+        .await?;
+    }
 
-        for nid in &valid_needs {
-            tx.execute(
-                "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
-                params![board_id, root_id, nid],
-            )?;
-        }
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        &root_id,
+        "board.task",
+        initial_state.as_str(),
+    )
+    .await?;
 
-        labels::set_system_label_tx(tx, board_id, &root_id, "board.task", initial_state.as_str())?;
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored_msg).await?;
+    let after_msg = messages::hydrate_message_view_tx(&mut tx, &stored_msg).await?;
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored_msg)?;
-        let after_msg = messages::hydrate_message_view_tx(tx, &stored_msg)?;
+    let ev_created = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskCreated,
+            channel: Some(&channel),
+            message_id: Some(&root_id),
+            actor_id: Some(&owner_actor),
+            payload: json!({
+                "state": initial_state.as_str(),
+                "needs": valid_needs,
+                "for": assigned_for
+            }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&after_msg),
+        },
+    )
+    .await?;
+    event_seqs.push(ev_created.seq);
 
-        let ev_created = events::append_event_tx(
-            tx,
+    if initial_state == TaskState::Ready {
+        let ev_ready = events::append_event_tx(
+            &mut tx,
             EventAppend {
                 board_id,
-                event_type: EventType::TaskCreated,
+                event_type: EventType::TaskReady,
                 channel: Some(&channel),
                 message_id: Some(&root_id),
                 actor_id: Some(&owner_actor),
-                payload: json!({
-                    "state": initial_state.as_str(),
-                    "needs": valid_needs,
-                    "for": assigned_for
-                }),
+                payload: json!({ "from": "created" }),
                 before_snapshot: Some(&before_snap),
                 after_snapshot: Some(&after_snap),
                 after_message: Some(&after_msg),
             },
-        )?;
-        event_seqs.push(ev_created.seq);
+        )
+        .await?;
+        event_seqs.push(ev_ready.seq);
+    }
 
-        if initial_state == TaskState::Ready {
-            let ev_ready = events::append_event_tx(
-                tx,
-                EventAppend {
-                    board_id,
-                    event_type: EventType::TaskReady,
-                    channel: Some(&channel),
-                    message_id: Some(&root_id),
-                    actor_id: Some(&owner_actor),
-                    payload: json!({ "from": "created" }),
-                    before_snapshot: Some(&before_snap),
-                    after_snapshot: Some(&after_snap),
-                    after_message: Some(&after_msg),
-                },
-            )?;
-            event_seqs.push(ev_ready.seq);
-        }
+    let (final_msg, claim) = if input.claim {
+        let task_row = load_task_row_for_update_tx(&mut tx, board_id, &root_id)
+            .await?
+            .unwrap();
+        let (claimed, ev_seq) =
+            claim_task_inner_tx(&mut tx, board_id, &task_row, caller, lease_ms, now).await?;
+        event_seqs.push(ev_seq);
+        let m = claimed.task.clone();
+        (m, Some(claimed))
+    } else {
+        (after_msg, None)
+    };
 
-        let (final_msg, claim) = if input.claim {
-            let task_row = load_task_row_tx(tx, board_id, &root_id)?.unwrap();
-            let (claimed, ev_seq) =
-                claim_task_inner_tx(tx, board_id, &task_row, caller, lease_ms, now)?;
-            event_seqs.push(ev_seq);
-            let m = claimed.task.clone();
-            (m, Some(claimed))
-        } else {
-            (after_msg, None)
-        };
-
-        Ok(CreateTaskResult {
-            task: final_msg,
-            claim,
-            replayed,
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(CreateTaskResult {
+        task: final_msg,
+        claim,
+        replayed,
+        event_seqs,
     })
 }
 
-/// Atomically creates a DAG batch of tasks in one SQLite transaction (`createMany`).
-pub fn create_many_tasks(
+/// Atomically creates a DAG batch of tasks in one database transaction (`createMany`).
+pub async fn create_many_tasks(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -1197,7 +1261,6 @@ pub fn create_many_tasks(
         validate_text_length(&t.text)?;
     }
 
-    // Validate internal keys & compute topological order
     let mut key_to_idx: HashMap<String, usize> = HashMap::new();
     for (idx, t) in input.tasks.iter().enumerate() {
         if let Some(k) = &t.key {
@@ -1272,280 +1335,305 @@ pub fn create_many_tasks(
         hash_token(&canonical)
     };
 
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let owner_actor = caller.actor_id();
-        let mut event_seqs: Vec<i64> = Vec::new();
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let owner_actor = caller.actor_id();
+    let mut event_seqs: Vec<i64> = Vec::new();
 
-        // Check batch idempotency
-        if let Some(idem_key) = &input.id {
-            let existing: Option<(String, String, String)> = tx
-                .query_row(
-                    "SELECT channel, request_hash, task_ids_json
-                     FROM task_batches
-                     WHERE board_id = ?1 AND caller_actor = ?2 AND idempotency_key = ?3",
-                    params![board_id, owner_actor, idem_key],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            if let Some((ch, hash, ids_json)) = existing {
-                if ch != input.channel || hash != request_hash {
-                    return Err(BoardError::new(
-                        ErrorCode::DuplicateId,
-                        format!("idempotency key '{idem_key}' was already used for different batch tasks"),
-                    ));
-                }
-                let ids: Vec<String> = serde_json::from_str(&ids_json)
-                    .map_err(|e| BoardError::internal(format!("corrupted batch ids: {e}")))?;
-                let mut views = Vec::with_capacity(ids.len());
-                for id in ids {
-                    let stored = messages::load_stored_message_tx(tx, board_id, &id)?
-                        .ok_or_else(|| BoardError::internal("missing batch task message"))?;
-                    views.push(messages::hydrate_message_view_tx(tx, &stored)?);
-                }
-                return Ok(BatchCreateResult {
-                    tasks: views,
-                    replayed: true,
-                    event_seqs,
-                });
-            }
-            let used_in_msg: bool = tx
-                .query_row(
-                    "SELECT 1 FROM idempotency_keys
-                     WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
-                    params![board_id, owner_actor, idem_key],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if used_in_msg {
+    if let Some(idem_key) = &input.id {
+        tx.advisory_xact_lock("idem", &format!("{board_id}:{owner_actor}:{idem_key}"))
+            .await?;
+        let existing = tx
+            .fetch_optional(
+                "SELECT channel, request_hash, task_ids_json
+                 FROM task_batches
+                 WHERE board_id = ?1 AND caller_actor = ?2 AND idempotency_key = ?3",
+                sql_args![board_id, &owner_actor, idem_key],
+            )
+            .await?;
+        if let Some(r) = existing {
+            let ch = r.get_str(0)?;
+            let hash = r.get_str(1)?;
+            let ids_json = r.get_str(2)?;
+            if ch != input.channel || hash != request_hash {
                 return Err(BoardError::new(
                     ErrorCode::DuplicateId,
-                    format!("idempotency key '{idem_key}' was already used for a post or reply"),
+                    format!(
+                        "idempotency key '{idem_key}' was already used for different batch tasks"
+                    ),
                 ));
             }
+            let ids: Vec<String> = serde_json::from_str(&ids_json)
+                .map_err(|e| BoardError::internal(format!("corrupted batch ids: {e}")))?;
+            let mut views = Vec::with_capacity(ids.len());
+            for id in ids {
+                let stored = messages::load_stored_message_tx(&mut tx, board_id, &id)
+                    .await?
+                    .ok_or_else(|| BoardError::internal("missing batch task message"))?;
+                views.push(messages::hydrate_message_view_tx(&mut tx, &stored).await?);
+            }
+            tx.commit().await?;
+            return Ok(BatchCreateResult {
+                tasks: views,
+                replayed: true,
+                event_seqs,
+            });
         }
-
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &input.channel);
-        if !perms.can_label() {
-            return Err(BoardError::forbidden(format!(
-                "creating tasks in '{}' requires 'label' permission",
-                input.channel
-            )));
+        let used_in_msg = tx
+            .fetch_optional(
+                "SELECT 1 FROM idempotency_keys
+                 WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
+                sql_args![board_id, &owner_actor, idem_key],
+            )
+            .await?
+            .is_some();
+        if used_in_msg {
+            return Err(BoardError::new(
+                ErrorCode::DuplicateId,
+                format!("idempotency key '{idem_key}' was already used for a post or reply"),
+            ));
         }
+    }
 
-        let mut created_ids: Vec<Option<String>> = vec![None; n];
-        for idx in topo_order {
-            let item = &input.tasks[idx];
-            let assigned_for =
-                resolve_assigned_for(&owner_actor, item.assigned_for.as_deref())?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &input.channel);
+    if !perms.can_label() {
+        return Err(BoardError::forbidden(format!(
+            "creating tasks in '{}' requires 'label' permission",
+            input.channel
+        )));
+    }
 
-            let mut resolved_need_ids: Vec<String> = Vec::with_capacity(item.needs.len());
-            for need in &item.needs {
-                match need {
-                    BatchNeedRef::Id(id) => resolved_need_ids.push(id.clone()),
-                    BatchNeedRef::Key { key } => {
-                        let dep_idx = key_to_idx[key];
-                        let dep_id = created_ids[dep_idx]
-                            .clone()
-                            .expect("topological order ensures dependency created first");
-                        resolved_need_ids.push(dep_id);
-                    }
+    let mut created_ids: Vec<Option<String>> = vec![None; n];
+    for idx in topo_order {
+        let item = &input.tasks[idx];
+        let assigned_for = resolve_assigned_for(&owner_actor, item.assigned_for.as_deref())?;
+
+        let mut resolved_need_ids: Vec<String> = Vec::with_capacity(item.needs.len());
+        for need in &item.needs {
+            match need {
+                BatchNeedRef::Id(id) => resolved_need_ids.push(id.clone()),
+                BatchNeedRef::Key { key } => {
+                    let dep_idx = key_to_idx[key];
+                    let dep_id = created_ids[dep_idx]
+                        .clone()
+                        .expect("topological order ensures dependency created first");
+                    resolved_need_ids.push(dep_id);
                 }
             }
-            let valid_needs = validate_prereqs_readable_tx(
-                tx,
-                board_id,
-                &board_grants,
-                caller,
-                &resolved_need_ids,
-            )?;
+        }
+        let valid_needs = validate_prereqs_readable_tx(
+            &mut tx,
+            board_id,
+            &board_grants,
+            caller,
+            &resolved_need_ids,
+        )
+        .await?;
 
-            let posted = messages::post_message_in_tx(
-                tx,
-                board_id,
-                caller,
-                PostMessageInput {
-                    channel: input.channel.clone(),
-                    text: item.text.clone(),
-                    id: None,
-                    attachments: item.attachments.clone(),
-                    labels: item.labels.clone(),
-                    schema: item.schema.clone(),
-                    no_sync: item.no_sync,
-                },
-            )?;
-            if let Some(seq) = posted.event_seq {
-                event_seqs.push(seq);
-            }
-            let root_id = posted.message.id;
-            let stored = messages::load_stored_message_tx(tx, board_id, &root_id)?.unwrap();
-            let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+        let posted = messages::post_message_in_tx(
+            &mut tx,
+            board_id,
+            caller,
+            PostMessageInput {
+                channel: input.channel.clone(),
+                text: item.text.clone(),
+                id: None,
+                attachments: item.attachments.clone(),
+                labels: item.labels.clone(),
+                schema: item.schema.clone(),
+                no_sync: item.no_sync,
+            },
+        )
+        .await?;
+        if let Some(seq) = posted.event_seq {
+            event_seqs.push(seq);
+        }
+        let root_id = posted.message.id;
+        let stored = messages::load_stored_message_tx(&mut tx, board_id, &root_id)
+            .await?
+            .unwrap();
+        let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-            let mut all_done = true;
-            for nid in &valid_needs {
-                if let Some(p) = load_task_row_tx(tx, board_id, nid)? {
-                    if p.state != TaskState::Completed {
-                        all_done = false;
-                    }
+        let mut all_done = true;
+        for nid in &valid_needs {
+            if let Some(p) = load_task_row_tx(&mut tx, board_id, nid).await? {
+                if p.state != TaskState::Completed {
+                    all_done = false;
                 }
             }
-            let initial_state = if all_done {
-                TaskState::Ready
-            } else {
-                TaskState::Waiting
-            };
+        }
+        let initial_state = if all_done {
+            TaskState::Ready
+        } else {
+            TaskState::Waiting
+        };
 
-            tx.execute(
-                "INSERT INTO tasks (
-                    message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                    result, fail_reason, cancel_reason, created_at, updated_at
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                    NULL, 0, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, ?8, ?8
-                 )",
-                params![
-                    root_id,
-                    board_id,
-                    input.channel,
-                    stored.seq,
-                    initial_state.as_str(),
-                    owner_actor,
-                    assigned_for,
-                    now_str
-                ],
-            )?;
-            for nid in &valid_needs {
-                tx.execute(
-                    "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
-                    params![board_id, root_id, nid],
-                )?;
-            }
-            labels::set_system_label_tx(
-                tx,
-                board_id,
+        tx.execute(
+            "INSERT INTO tasks (
+                message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                result, fail_reason, cancel_reason, created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                NULL, 0, NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, ?8, ?8
+             )",
+            sql_args![
                 &root_id,
-                "board.task",
+                board_id,
+                &input.channel,
+                stored.seq,
                 initial_state.as_str(),
-            )?;
+                &owner_actor,
+                &assigned_for,
+                &now_str
+            ],
+        )
+        .await?;
+        for nid in &valid_needs {
+            tx.execute(
+                "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
+                sql_args![board_id, &root_id, nid],
+            )
+            .await?;
+        }
+        labels::set_system_label_tx(
+            &mut tx,
+            board_id,
+            &root_id,
+            "board.task",
+            initial_state.as_str(),
+        )
+        .await?;
 
-            let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-            let after_msg = messages::hydrate_message_view_tx(tx, &stored)?;
-            let ev_created = events::append_event_tx(
-                tx,
+        let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+        let after_msg = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+        let ev_created = events::append_event_tx(
+            &mut tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::TaskCreated,
+                channel: Some(&input.channel),
+                message_id: Some(&root_id),
+                actor_id: Some(&owner_actor),
+                payload: json!({
+                    "state": initial_state.as_str(),
+                    "needs": valid_needs,
+                    "for": assigned_for
+                }),
+                before_snapshot: Some(&before_snap),
+                after_snapshot: Some(&after_snap),
+                after_message: Some(&after_msg),
+            },
+        )
+        .await?;
+        event_seqs.push(ev_created.seq);
+
+        if initial_state == TaskState::Ready {
+            let ev_ready = events::append_event_tx(
+                &mut tx,
                 EventAppend {
                     board_id,
-                    event_type: EventType::TaskCreated,
+                    event_type: EventType::TaskReady,
                     channel: Some(&input.channel),
                     message_id: Some(&root_id),
                     actor_id: Some(&owner_actor),
-                    payload: json!({
-                        "state": initial_state.as_str(),
-                        "needs": valid_needs,
-                        "for": assigned_for
-                    }),
+                    payload: json!({ "from": "created" }),
                     before_snapshot: Some(&before_snap),
                     after_snapshot: Some(&after_snap),
                     after_message: Some(&after_msg),
                 },
-            )?;
-            event_seqs.push(ev_created.seq);
-
-            if initial_state == TaskState::Ready {
-                let ev_ready = events::append_event_tx(
-                    tx,
-                    EventAppend {
-                        board_id,
-                        event_type: EventType::TaskReady,
-                        channel: Some(&input.channel),
-                        message_id: Some(&root_id),
-                        actor_id: Some(&owner_actor),
-                        payload: json!({ "from": "created" }),
-                        before_snapshot: Some(&before_snap),
-                        after_snapshot: Some(&after_snap),
-                        after_message: Some(&after_msg),
-                    },
-                )?;
-                event_seqs.push(ev_ready.seq);
-            }
-
-            created_ids[idx] = Some(root_id);
+            )
+            .await?;
+            event_seqs.push(ev_ready.seq);
         }
 
-        let ordered_ids: Vec<String> = created_ids.into_iter().map(Option::unwrap).collect();
-        if let Some(idem_key) = &input.id {
-            let ids_json = serde_json::to_string(&ordered_ids)
-                .map_err(|e| BoardError::internal(format!("failed to serialize batch ids: {e}")))?;
-            tx.execute(
-                "INSERT INTO task_batches (board_id, caller_actor, idempotency_key, channel, request_hash, task_ids_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    board_id,
-                    owner_actor,
-                    idem_key,
-                    input.channel,
-                    request_hash,
-                    ids_json,
-                    now_str
-                ],
-            )?;
-        }
+        created_ids[idx] = Some(root_id);
+    }
 
-        let mut views = Vec::with_capacity(ordered_ids.len());
-        for id in ordered_ids {
-            let stored = messages::load_stored_message_tx(tx, board_id, &id)?.unwrap();
-            views.push(messages::hydrate_message_view_tx(tx, &stored)?);
-        }
+    let ordered_ids: Vec<String> = created_ids.into_iter().map(Option::unwrap).collect();
+    if let Some(idem_key) = &input.id {
+        let ids_json = serde_json::to_string(&ordered_ids)
+            .map_err(|e| BoardError::internal(format!("failed to serialize batch ids: {e}")))?;
+        tx.execute(
+            "INSERT INTO task_batches (board_id, caller_actor, idempotency_key, channel, request_hash, task_ids_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            sql_args![
+                board_id,
+                &owner_actor,
+                idem_key,
+                &input.channel,
+                &request_hash,
+                &ids_json,
+                &now_str
+            ],
+        )
+        .await?;
+    }
 
-        Ok(BatchCreateResult {
-            tasks: views,
-            replayed: false,
-            event_seqs,
-        })
+    let mut views = Vec::with_capacity(ordered_ids.len());
+    for id in ordered_ids {
+        let stored = messages::load_stored_message_tx(&mut tx, board_id, &id)
+            .await?
+            .unwrap();
+        views.push(messages::hydrate_message_view_tx(&mut tx, &stored).await?);
+    }
+
+    tx.commit().await?;
+    Ok(BatchCreateResult {
+        tasks: views,
+        replayed: false,
+        event_seqs,
     })
 }
 
-pub fn get_task(
+pub async fn get_task(
     db: &Database,
     events_hub: &EventHub,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<MessageView> {
-    let emitted = db.with_tx(|tx| expire_due_leases_tx(tx, Some(board_id), Utc::now()))?;
+    let emitted = {
+        let mut tx = db.begin_tx().await?;
+        let e = expire_due_leases_tx(&mut tx, Some(board_id), Utc::now()).await?;
+        tx.commit().await?;
+        e
+    };
     for (bid, seq) in emitted {
         events_hub.notify(&bid, seq);
     }
 
-    db.with_conn(|conn| {
-        let task = load_task_row_tx(conn, board_id, task_id)?.ok_or_else(|| {
+    let mut conn = db.read_conn();
+    let task = load_task_row_tx(&mut conn, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if !grants::caller_permissions_on_channel(&board_grants, caller, &task.channel).can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("task '{task_id}' not found"),
-            ));
-        }
-        let stored = messages::load_stored_message_tx(conn, board_id, task_id)?.ok_or_else(|| {
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if !grants::caller_permissions_on_channel(&board_grants, caller, &task.channel).can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("task '{task_id}' not found"),
+        ));
+    }
+    let stored = messages::load_stored_message_tx(&mut conn, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        messages::hydrate_message_view_tx(conn, &stored)
-    })
+    messages::hydrate_message_view_tx(&mut conn, &stored).await
 }
 
-pub fn list_tasks(
+pub async fn list_tasks(
     db: &Database,
     events_hub: &EventHub,
     board_id: &str,
@@ -1560,8 +1648,8 @@ pub fn list_tasks(
     }
 
     let state_mode = match query.state.as_deref().map(str::trim) {
-        None | Some("") | Some("open") => None, // open states
-        Some("all") => Some(None),              // all states
+        None | Some("") | Some("open") => None,
+        Some("all") => Some(None),
         Some(other) => Some(Some(TaskState::parse(other)?)),
     };
 
@@ -1573,148 +1661,165 @@ pub fn list_tasks(
     };
     qfilter.validate()?;
 
-    let emitted = db.with_tx(|tx| expire_due_leases_tx(tx, Some(board_id), Utc::now()))?;
+    let emitted = {
+        let mut tx = db.begin_tx().await?;
+        let e = expire_due_leases_tx(&mut tx, Some(board_id), Utc::now()).await?;
+        tx.commit().await?;
+        e
+    };
     for (bid, seq) in emitted {
         events_hub.notify(&bid, seq);
     }
 
-    db.with_conn(|conn| {
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let has_wildcard_read =
-            grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_read();
-        let visible_actors = actors::list_board_actors(conn, board_id, has_wildcard_read, |ch| {
+    let mut conn = db.read_conn();
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    let has_wildcard_read =
+        grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_read();
+    let visible_actors =
+        actors::list_board_actors(&mut conn, board_id, has_wildcard_read, |ch| {
             grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read()
-        })?;
-        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &qfilter)?;
+        })
+        .await?;
+    let filter_ctx = FilterContext::build(&mut conn, caller, &visible_actors, &qfilter).await?;
 
-        let after_seq: i64 = match &query.after {
-            None => 0,
-            Some(c) if c == "0" => 0,
-            Some(c) => {
-                if let Some(m) = messages::load_stored_message_tx(conn, board_id, c)? {
-                    m.seq
-                } else if let Some(ev_seq) = events::parse_event_cursor_seq(c) {
-                    let msg_seq: Option<i64> = conn
-                        .query_row(
-                            "SELECT m.seq
-                             FROM events e
-                             JOIN messages m ON m.id = e.message_id
-                             WHERE e.board_id = ?1 AND e.seq <= ?2 AND e.event_type = 'message.posted'
-                             ORDER BY e.seq DESC LIMIT 1",
-                            params![board_id, ev_seq],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    msg_seq.unwrap_or(0)
-                } else {
-                    return Err(BoardError::bad_request(format!(
-                        "invalid tasks cursor '{c}'"
-                    )));
+    let after_seq: i64 = match &query.after {
+        None => 0,
+        Some(c) if c == "0" => 0,
+        Some(c) => {
+            if let Some(m) = messages::load_stored_message_tx(&mut conn, board_id, c).await? {
+                m.seq
+            } else if let Some(ev_seq) = events::parse_event_cursor_seq(c) {
+                let row = conn
+                    .fetch_optional(
+                        "SELECT m.seq
+                         FROM events e
+                         JOIN messages m ON m.id = e.message_id
+                         WHERE e.board_id = ?1 AND e.seq <= ?2 AND e.event_type = 'message.posted'
+                         ORDER BY e.seq DESC LIMIT 1",
+                        sql_args![board_id, ev_seq],
+                    )
+                    .await?;
+                match row {
+                    Some(r) => r.get_i64(0)?,
+                    None => 0,
                 }
+            } else {
+                return Err(BoardError::bad_request(format!(
+                    "invalid tasks cursor '{c}'"
+                )));
             }
-        };
+        }
+    };
 
-        let mut stmt = conn.prepare(
+    let rows = conn
+        .fetch_all(
             "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
                     claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
                     result, fail_reason, cancel_reason
              FROM tasks
              WHERE board_id = ?1 AND seq > ?2
              ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![board_id, after_seq], map_task_row)?;
+            sql_args![board_id, after_seq],
+        )
+        .await?;
 
-        let mut summaries = Vec::new();
-        let mut last_returned_id: Option<String> = None;
+    let mut summaries = Vec::new();
+    let mut last_returned_id: Option<String> = None;
 
-        for row_res in rows {
-            let task = row_res?;
-            match state_mode {
-                None => {
-                    if !task.state.is_open() {
-                        continue;
-                    }
-                }
-                Some(None) => {}
-                Some(Some(want)) => {
-                    if task.state != want {
-                        continue;
-                    }
-                }
-            }
-
-            if !grants::caller_permissions_on_channel(&board_grants, caller, &task.channel)
-                .can_read()
-            {
-                continue;
-            }
-            if !qfilter.matches_channel(&task.channel) {
-                continue;
-            }
-            if let Some(owner_f) = &query.owner {
-                if !matches_actor_or_principal_filter(owner_f, caller, &task.owner_actor) {
+    for r in &rows {
+        let task = map_task_row(r)?;
+        match state_mode {
+            None => {
+                if !task.state.is_open() {
                     continue;
                 }
             }
-            if let Some(for_f) = &query.assigned_for {
-                let Some(assigned) = &task.assigned_for else {
-                    continue;
-                };
-                if !matches_for_filter(for_f, caller, assigned) {
+            Some(None) => {}
+            Some(Some(want)) => {
+                if task.state != want {
                     continue;
                 }
-            }
-            if let Some(needs_f) = &query.needs {
-                let needs = load_task_needs_tx(conn, &task.message_id)?;
-                if !needs.iter().any(|n| n == needs_f) {
-                    continue;
-                }
-            }
-
-            let Some(stored) = messages::load_stored_message_tx(conn, board_id, &task.message_id)?
-            else {
-                continue;
-            };
-            let snap = messages::build_message_snapshot_tx(conn, &stored)?;
-            if !qfilter.matches_snapshot(&snap, &filter_ctx) {
-                continue;
-            }
-
-            let root_view = messages::hydrate_message_view_tx(conn, &stored)?;
-            let reply_count: usize = conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE board_id = ?1 AND re = ?2",
-                params![board_id, task.message_id],
-                |r| r.get::<_, i64>(0),
-            )? as usize;
-            let last_reply = conn
-                .query_row(
-                    "SELECT id FROM messages WHERE board_id = ?1 AND re = ?2 ORDER BY seq DESC LIMIT 1",
-                    params![board_id, task.message_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .and_then(|rid| messages::load_stored_message_tx(conn, board_id, &rid).ok().flatten())
-                .map(|r| messages::hydrate_message_view_tx(conn, &r))
-                .transpose()?;
-
-            last_returned_id = Some(task.message_id.clone());
-            summaries.push(ThreadSummaryView {
-                message: root_view,
-                replies: reply_count,
-                last: last_reply,
-            });
-            if summaries.len() >= limit {
-                break;
             }
         }
 
-        let cursor = last_returned_id
-            .or_else(|| query.after.clone())
-            .unwrap_or_else(|| "0".to_string());
-        Ok(TasksPage {
-            tasks: summaries,
-            cursor,
-        })
+        if !grants::caller_permissions_on_channel(&board_grants, caller, &task.channel).can_read() {
+            continue;
+        }
+        if !qfilter.matches_channel(&task.channel) {
+            continue;
+        }
+        if let Some(owner_f) = &query.owner {
+            if !matches_actor_or_principal_filter(owner_f, caller, &task.owner_actor) {
+                continue;
+            }
+        }
+        if let Some(for_f) = &query.assigned_for {
+            let Some(assigned) = &task.assigned_for else {
+                continue;
+            };
+            if !matches_for_filter(for_f, caller, assigned) {
+                continue;
+            }
+        }
+        if let Some(needs_f) = &query.needs {
+            let needs = load_task_needs_tx(&mut conn, &task.message_id).await?;
+            if !needs.iter().any(|n| n == needs_f) {
+                continue;
+            }
+        }
+
+        let Some(stored) = messages::load_stored_message_tx(&mut conn, board_id, &task.message_id)
+            .await?
+        else {
+            continue;
+        };
+        let snap = messages::build_message_snapshot_tx(&mut conn, &stored).await?;
+        if !qfilter.matches_snapshot(&snap, &filter_ctx) {
+            continue;
+        }
+
+        let root_view = messages::hydrate_message_view_tx(&mut conn, &stored).await?;
+        let reply_count = conn
+            .fetch_one(
+                "SELECT COUNT(*) FROM messages WHERE board_id = ?1 AND re = ?2",
+                sql_args![board_id, &task.message_id],
+            )
+            .await?
+            .get_i64(0)? as usize;
+        let last_reply_id = conn
+            .fetch_optional(
+                "SELECT id FROM messages WHERE board_id = ?1 AND re = ?2 ORDER BY seq DESC LIMIT 1",
+                sql_args![board_id, &task.message_id],
+            )
+            .await?;
+        let last_reply = match last_reply_id {
+            Some(lr) => {
+                let rid = lr.get_str(0)?;
+                match messages::load_stored_message_tx(&mut conn, board_id, &rid).await? {
+                    Some(rm) => Some(messages::hydrate_message_view_tx(&mut conn, &rm).await?),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+
+        last_returned_id = Some(task.message_id.clone());
+        summaries.push(ThreadSummaryView {
+            message: root_view,
+            replies: reply_count,
+            last: last_reply,
+        });
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+
+    let cursor = last_returned_id
+        .or_else(|| query.after.clone())
+        .unwrap_or_else(|| "0".to_string());
+    Ok(TasksPage {
+        tasks: summaries,
+        cursor,
     })
 }
 
@@ -1754,7 +1859,7 @@ fn matches_for_filter(filter: &str, caller: &CallerContext, assigned: &str) -> b
 }
 
 /// Claims one specific task by ID.
-pub fn claim_task(
+pub async fn claim_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
@@ -1762,38 +1867,40 @@ pub fn claim_task(
     input: ClaimInput,
 ) -> BoardResult<ClaimResult> {
     let lease_ms = parse_lease_ms(input.lease, input.lease_ms)?;
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        let perms = grants::caller_permissions_on_channel(&board_grants, caller, &task.channel);
-        if !perms.can_read() {
-            return Err(BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("task '{task_id}' not found"),
-            ));
-        }
-        if !perms.can_label() {
-            return Err(BoardError::forbidden(format!(
-                "claiming a task in '{}' requires 'label' permission",
-                task.channel
-            )));
-        }
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    let perms = grants::caller_permissions_on_channel(&board_grants, caller, &task.channel);
+    if !perms.can_read() {
+        return Err(BoardError::new(
+            ErrorCode::MessageNotFound,
+            format!("task '{task_id}' not found"),
+        ));
+    }
+    if !perms.can_label() {
+        return Err(BoardError::forbidden(format!(
+            "claiming a task in '{}' requires 'label' permission",
+            task.channel
+        )));
+    }
 
-        let (claim, seq) = claim_task_inner_tx(tx, board_id, &task, caller, lease_ms, now)?;
-        event_seqs.push(seq);
-        Ok(ClaimResult { claim, event_seqs })
-    })
+    let (claim, seq) = claim_task_inner_tx(&mut tx, board_id, &task, caller, lease_ms, now).await?;
+    event_seqs.push(seq);
+    tx.commit().await?;
+    Ok(ClaimResult { claim, event_seqs })
 }
 
 fn parse_claim_labels(raw: Option<&ClaimLabelFilter>) -> BoardResult<Vec<LabelPredicate>> {
@@ -1830,7 +1937,7 @@ pub struct ClaimReadyAttempt {
 /// - max 200 `(channel x owner)` places (`400 claim_too_wide`)
 /// - inspects at most 25 oldest ready tasks per `(channel, owner)` place for `--label` matching
 /// - priority: assigned (`for`) to caller first, then unassigned owned by caller's principal + `from`
-pub fn try_claim_ready_once(
+pub async fn try_claim_ready_once(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -1847,101 +1954,107 @@ pub fn try_claim_ready_once(
         }
     }
 
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let mut expired_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            expired_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let mut expired_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        expired_seqs.push(seq);
+    }
 
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
 
-        // Resolve matching claimable channels (read + label)
-        let mut all_channels: Vec<String> = Vec::new();
-        if let Some(prefix) = channel_spec.strip_suffix('/') {
-            let mut stmt = tx.prepare(
-                "SELECT path FROM channels WHERE board_id = ?1 AND (path = ?2 OR path LIKE ?3) ORDER BY path ASC",
-            )?;
-            let prefix_like = format!("{prefix}/%");
-            let rows = stmt.query_map(params![board_id, prefix, prefix_like], |r| {
-                r.get::<_, String>(0)
-            })?;
-            for r in rows {
-                let ch = r?;
-                let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
-                if perms.can_read() && perms.can_label() {
-                    all_channels.push(ch);
-                }
-            }
-            if all_channels.len() > MAX_CLAIM_SUBTREE_CHANNELS {
-                return Err(BoardError::new(
-                    ErrorCode::ChannelTreeTooLarge,
-                    format!(
-                        "subtree '{channel_spec}' has {} claimable channels, exceeding maximum of {MAX_CLAIM_SUBTREE_CHANNELS}",
-                        all_channels.len()
-                    ),
-                ));
-            }
-        } else if channel_spec == "*" {
-            let mut stmt =
-                tx.prepare("SELECT path FROM channels WHERE board_id = ?1 ORDER BY path ASC")?;
-            let rows = stmt.query_map(params![board_id], |r| r.get::<_, String>(0))?;
-            for r in rows {
-                let ch = r?;
-                let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
-                if perms.can_read() && perms.can_label() {
-                    all_channels.push(ch);
-                }
-            }
-            if all_channels.len() > MAX_CLAIM_SUBTREE_CHANNELS {
-                return Err(BoardError::new(
-                    ErrorCode::ChannelTreeTooLarge,
-                    format!(
-                        "channel tree has {} claimable channels, exceeding maximum of {MAX_CLAIM_SUBTREE_CHANNELS}",
-                        all_channels.len()
-                    ),
-                ));
-            }
-        } else {
-            let perms =
-                grants::caller_permissions_on_channel(&board_grants, caller, channel_spec);
-            if !perms.can_read() || !perms.can_label() {
-                return Err(BoardError::forbidden(format!(
-                    "claiming ready tasks in '{channel_spec}' requires 'read' and 'label' permissions"
-                )));
-            }
-            all_channels.push(channel_spec.to_string());
-        }
-
-        // Owners list: caller's principal + deduplicated `from_owners`
-        let caller_principal = caller.principal_id();
-        let mut owners: Vec<String> = vec![caller_principal.clone()];
-        for extra in from_owners {
-            let clean = extra.trim();
-            if !clean.is_empty() && !owners.iter().any(|o| o == clean) {
-                owners.push(clean.to_string());
+    let mut all_channels: Vec<String> = Vec::new();
+    if let Some(prefix) = channel_spec.strip_suffix('/') {
+        let prefix_like = format!("{}/%", escape_like_prefix(prefix));
+        let rows = tx
+            .fetch_all(
+                "SELECT path FROM channels WHERE board_id = ?1 AND (path = ?2 OR path LIKE ?3 ESCAPE '\\') ORDER BY path ASC",
+                sql_args![board_id, prefix, &prefix_like],
+            )
+            .await?;
+        for r in rows {
+            let ch = r.get_str(0)?;
+            let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
+            if perms.can_read() && perms.can_label() {
+                all_channels.push(ch);
             }
         }
-
-        let effective_channels = all_channels.len().max(1);
-        let places = effective_channels.saturating_mul(owners.len());
-        if places > MAX_CLAIM_PLACES {
+        if all_channels.len() > MAX_CLAIM_SUBTREE_CHANNELS {
             return Err(BoardError::new(
-                ErrorCode::ClaimTooWide,
+                ErrorCode::ChannelTreeTooLarge,
                 format!(
-                    "claim covers {places} (channel x owner) places, exceeding maximum of {MAX_CLAIM_PLACES}"
+                    "subtree '{channel_spec}' has {} claimable channels, exceeding maximum of {MAX_CLAIM_SUBTREE_CHANNELS}",
+                    all_channels.len()
                 ),
             ));
         }
+    } else if channel_spec == "*" {
+        let rows = tx
+            .fetch_all(
+                "SELECT path FROM channels WHERE board_id = ?1 ORDER BY path ASC",
+                sql_args![board_id],
+            )
+            .await?;
+        for r in rows {
+            let ch = r.get_str(0)?;
+            let perms = grants::caller_permissions_on_channel(&board_grants, caller, &ch);
+            if perms.can_read() && perms.can_label() {
+                all_channels.push(ch);
+            }
+        }
+        if all_channels.len() > MAX_CLAIM_SUBTREE_CHANNELS {
+            return Err(BoardError::new(
+                ErrorCode::ChannelTreeTooLarge,
+                format!(
+                    "channel tree has {} claimable channels, exceeding maximum of {MAX_CLAIM_SUBTREE_CHANNELS}",
+                    all_channels.len()
+                ),
+            ));
+        }
+    } else {
+        let perms = grants::caller_permissions_on_channel(&board_grants, caller, channel_spec);
+        if !perms.can_read() || !perms.can_label() {
+            return Err(BoardError::forbidden(format!(
+                "claiming ready tasks in '{channel_spec}' requires 'read' and 'label' permissions"
+            )));
+        }
+        all_channels.push(channel_spec.to_string());
+    }
 
-        let caller_actor = caller.actor_id();
-        let mut best_assigned: Option<StoredTaskRow> = None;
-        let mut best_unassigned: Option<StoredTaskRow> = None;
+    let caller_principal = caller.principal_id();
+    let mut owners: Vec<String> = vec![caller_principal.clone()];
+    for extra in from_owners {
+        let clean = extra.trim();
+        if !clean.is_empty() && !owners.iter().any(|o| o == clean) {
+            owners.push(clean.to_string());
+        }
+    }
 
-        for ch in &all_channels {
-            // 1. Assigned to caller (inspect up to 25 oldest ready tasks)
-            {
-                let mut stmt = tx.prepare(
+    let effective_channels = all_channels.len().max(1);
+    let places = effective_channels.saturating_mul(owners.len());
+    if places > MAX_CLAIM_PLACES {
+        return Err(BoardError::new(
+            ErrorCode::ClaimTooWide,
+            format!(
+                "claim covers {places} (channel x owner) places, exceeding maximum of {MAX_CLAIM_PLACES}"
+            ),
+        ));
+    }
+
+    let skip_locked = match tx.dialect() {
+        Dialect::Sqlite => "",
+        Dialect::Postgres => " FOR UPDATE SKIP LOCKED",
+    };
+
+    let caller_actor = caller.actor_id();
+    let mut assigned_candidates: Vec<StoredTaskRow> = Vec::new();
+    let mut unassigned_candidates: Vec<StoredTaskRow> = Vec::new();
+
+    for ch in &all_channels {
+        // 1. Assigned to caller (inspect up to 25 oldest ready tasks without over-locking siblings)
+        {
+            let rows = tx
+                .fetch_all(
                     "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
                             claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
                             result, fail_reason, cancel_reason
@@ -1949,125 +2062,138 @@ pub fn try_claim_ready_once(
                      WHERE board_id = ?1 AND channel = ?2 AND state = 'ready' AND assigned_for = ?3
                      ORDER BY seq ASC
                      LIMIT ?4",
-                )?;
-                let rows = stmt.query_map(
-                    params![board_id, ch, caller_actor, MAX_CLAIM_SCAN_PER_PLACE as i64],
-                    map_task_row,
-                )?;
-                for r in rows {
-                    let t = r?;
-                    if task_matches_labels_tx(tx, &t.message_id, label_preds)? {
-                        if best_assigned.as_ref().is_none_or(|b| t.seq < b.seq) {
-                            best_assigned = Some(t);
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // 2. Unassigned tasks per owner place (inspect at most 25 oldest ready tasks per place)
-            if best_assigned.is_none() {
-                for owner_spec in &owners {
-                    let (sql, p_param): (&str, String) = if owner_spec.contains('+') {
-                        (
-                            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                                    result, fail_reason, cancel_reason
-                             FROM tasks
-                             WHERE board_id = ?1 AND channel = ?2 AND state = 'ready'
-                               AND assigned_for IS NULL AND owner_actor = ?3
-                             ORDER BY seq ASC
-                             LIMIT ?4",
-                            owner_spec.clone(),
-                        )
-                    } else {
-                        (
-                            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                                    result, fail_reason, cancel_reason
-                             FROM tasks
-                             WHERE board_id = ?1 AND channel = ?2 AND state = 'ready'
-                               AND assigned_for IS NULL
-                               AND (owner_actor = ?3 OR owner_actor LIKE ?5)
-                             ORDER BY seq ASC
-                             LIMIT ?4",
-                            owner_spec.clone(),
-                        )
-                    };
-
-                    let mut stmt = tx.prepare(sql)?;
-                    let owner_like = format!("{p_param}+%");
-                    let rows = if owner_spec.contains('+') {
-                        stmt.query_map(
-                            params![board_id, ch, p_param, MAX_CLAIM_SCAN_PER_PLACE as i64],
-                            map_task_row,
-                        )?
-                    } else {
-                        stmt.query_map(
-                            params![
-                                board_id,
-                                ch,
-                                p_param,
-                                MAX_CLAIM_SCAN_PER_PLACE as i64,
-                                owner_like
-                            ],
-                            map_task_row,
-                        )?
-                    };
-                    for r in rows {
-                        let t = r?;
-                        if task_matches_labels_tx(tx, &t.message_id, label_preds)? {
-                            if best_unassigned.as_ref().is_none_or(|b| t.seq < b.seq) {
-                                best_unassigned = Some(t);
-                            }
-                            break;
-                        }
-                    }
+                    sql_args![board_id, ch, &caller_actor, MAX_CLAIM_SCAN_PER_PLACE as i64],
+                )
+                .await?;
+            for r in &rows {
+                let t = map_task_row(r)?;
+                if task_matches_labels_tx(&mut tx, &t.message_id, label_preds).await? {
+                    assigned_candidates.push(t);
                 }
             }
         }
 
-        if let Some(winner) = best_assigned.or(best_unassigned) {
-            let (claim, seq) = claim_task_inner_tx(tx, board_id, &winner, caller, lease_ms, now)?;
-            let mut seqs = expired_seqs;
-            seqs.push(seq);
-            return Ok(ClaimReadyAttempt {
-                claimed: Some(ClaimResult {
-                    claim,
-                    event_seqs: seqs,
-                }),
-                expired_seqs: Vec::new(),
-                next_expiry: None,
-            });
+        // 2. Unassigned tasks per owner place (inspect at most 25 oldest ready tasks per place)
+        for owner_spec in &owners {
+            let rows = if owner_spec.contains('+') {
+                tx.fetch_all(
+                    "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                            claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                            result, fail_reason, cancel_reason
+                     FROM tasks
+                     WHERE board_id = ?1 AND channel = ?2 AND state = 'ready'
+                       AND assigned_for IS NULL AND owner_actor = ?3
+                     ORDER BY seq ASC
+                     LIMIT ?4",
+                    sql_args![board_id, ch, owner_spec, MAX_CLAIM_SCAN_PER_PLACE as i64],
+                )
+                .await?
+            } else {
+                let owner_like = format!("{}+%", escape_like_prefix(owner_spec));
+                tx.fetch_all(
+                    "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                            claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                            result, fail_reason, cancel_reason
+                     FROM tasks
+                     WHERE board_id = ?1 AND channel = ?2 AND state = 'ready'
+                       AND assigned_for IS NULL
+                       AND (owner_actor = ?3 OR owner_actor LIKE ?5 ESCAPE '\\')
+                     ORDER BY seq ASC
+                     LIMIT ?4",
+                    sql_args![
+                        board_id,
+                        ch,
+                        owner_spec,
+                        MAX_CLAIM_SCAN_PER_PLACE as i64,
+                        &owner_like
+                    ],
+                )
+                .await?
+            };
+            for r in &rows {
+                let t = map_task_row(r)?;
+                if task_matches_labels_tx(&mut tx, &t.message_id, label_preds).await? {
+                    unassigned_candidates.push(t);
+                }
+            }
         }
+    }
 
-        // Compute earliest active claim expiry on this board for lease-expiry wakeup
-        let next_expiry: Option<DateTime<Utc>> = tx
-            .query_row(
-                "SELECT MIN(claim_until) FROM tasks WHERE board_id = ?1 AND state = 'claimed'",
-                params![board_id],
-                |r| r.get::<_, Option<String>>(0),
-            )?
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+    assigned_candidates.sort_by_key(|t| t.seq);
+    unassigned_candidates.sort_by_key(|t| t.seq);
 
-        Ok(ClaimReadyAttempt {
-            claimed: None,
-            expired_seqs,
-            next_expiry,
-        })
+    let lock_one_sql = format!(
+        "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                result, fail_reason, cancel_reason
+         FROM tasks
+         WHERE board_id = ?1 AND message_id = ?2 AND state = 'ready'{skip_locked}"
+    );
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for cand in assigned_candidates.into_iter().chain(unassigned_candidates) {
+        if !seen_ids.insert(cand.message_id.clone()) {
+            continue;
+        }
+        let Some(row) = tx
+            .fetch_optional(&lock_one_sql, sql_args![board_id, &cand.message_id])
+            .await?
+        else {
+            continue;
+        };
+        let locked = map_task_row(&row)?;
+        if locked.state != TaskState::Ready {
+            continue;
+        }
+        if let Some(ref assigned) = locked.assigned_for {
+            if assigned != &caller_actor {
+                continue;
+            }
+        }
+        if !task_matches_labels_tx(&mut tx, &locked.message_id, label_preds).await? {
+            continue;
+        }
+        let (claim, seq) =
+            claim_task_inner_tx(&mut tx, board_id, &locked, caller, lease_ms, now).await?;
+        let mut seqs = expired_seqs;
+        seqs.push(seq);
+        tx.commit().await?;
+        return Ok(ClaimReadyAttempt {
+            claimed: Some(ClaimResult {
+                claim,
+                event_seqs: seqs,
+            }),
+            expired_seqs: Vec::new(),
+            next_expiry: None,
+        });
+    }
+
+    let next_expiry: Option<DateTime<Utc>> = tx
+        .fetch_one(
+            "SELECT MIN(claim_until) FROM tasks WHERE board_id = ?1 AND state = 'claimed'",
+            sql_args![board_id],
+        )
+        .await?
+        .get_opt_str(0)?
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    tx.commit().await?;
+    Ok(ClaimReadyAttempt {
+        claimed: None,
+        expired_seqs,
+        next_expiry,
     })
 }
 
-fn task_matches_labels_tx(
-    conn: &Connection,
+async fn task_matches_labels_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     task_id: &str,
     preds: &[LabelPredicate],
 ) -> BoardResult<bool> {
     if preds.is_empty() {
         return Ok(true);
     }
-    let map = labels::load_message_labels_tx(conn, task_id)?;
+    let map = labels::load_message_labels_tx(conn, task_id).await?;
     Ok(preds.iter().all(|p| p.matches_map(&map)))
 }
 
@@ -2098,7 +2224,7 @@ pub fn parse_claim_ready_params(
     Ok((preds, lease_ms, wait_dur))
 }
 
-pub fn renew_task(
+pub async fn renew_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
@@ -2106,257 +2232,301 @@ pub fn renew_task(
     input: RenewInput,
 ) -> BoardResult<ClaimResult> {
     let lease_ms = parse_lease_ms(input.lease, input.lease_ms)?;
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
+    validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
 
-        let until_str = format_utc_ms(now + Duration::milliseconds(lease_ms));
-        tx.execute(
-            "UPDATE tasks SET claim_until = ?1, updated_at = ?2 WHERE message_id = ?3",
-            params![until_str, now_str, task_id],
-        )?;
+    let until_str = format_utc_ms(now + Duration::milliseconds(lease_ms));
+    tx.execute(
+        "UPDATE tasks SET claim_until = ?1, updated_at = ?2 WHERE message_id = ?3",
+        sql_args![&until_str, &now_str, task_id],
+    )
+    .await?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskRenewed,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "epoch": task.claim_epoch, "until": until_str }),
-                before_snapshot: Some(&snap),
-                after_snapshot: Some(&snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskRenewed,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "epoch": task.claim_epoch, "until": until_str }),
+            before_snapshot: Some(&snap),
+            after_snapshot: Some(&snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
 
-        Ok(ClaimResult {
-            claim: ClaimedTaskView {
-                task: view,
-                epoch: task.claim_epoch,
-                token: input.token,
-                until: until_str,
-            },
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(ClaimResult {
+        claim: ClaimedTaskView {
+            task: view,
+            epoch: task.claim_epoch,
+            token: input.token,
+            until: until_str,
+        },
+        event_seqs,
     })
 }
 
-pub fn release_task(
+pub async fn release_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
     input: ReleaseInput,
 ) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
+    validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'ready', claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
-             WHERE message_id = ?2",
-            params![now_str, task_id],
-        )?;
-        labels::set_system_label_tx(tx, board_id, task_id, "board.task", TaskState::Ready.as_str())?;
+    tx.execute(
+        "UPDATE tasks
+         SET state = 'ready', claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
+         WHERE message_id = ?2",
+        sql_args![&now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        task_id,
+        "board.task",
+        TaskState::Ready.as_str(),
+    )
+    .await?;
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
 
-        let ev_rel = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskReleased,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "epoch": task.claim_epoch }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev_rel.seq);
+    let ev_rel = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskReleased,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "epoch": task.claim_epoch }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev_rel.seq);
 
-        let ev_ready = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskReady,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "from": "released" }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev_ready.seq);
+    let ev_ready = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskReady,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "from": "released" }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev_ready.seq);
 
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn complete_task(
+pub async fn complete_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
     input: CompleteInput,
 ) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
+    validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'completed', result = ?1, claimed_by = NULL, claim_token = NULL,
-                 claim_until = NULL, updated_at = ?2
-             WHERE message_id = ?3",
-            params![input.result, now_str, task_id],
-        )?;
-        labels::set_system_label_tx(
-            tx,
+    tx.execute(
+        "UPDATE tasks
+         SET state = 'completed', result = ?1, claimed_by = NULL, claim_token = NULL,
+             claim_until = NULL, updated_at = ?2
+         WHERE message_id = ?3",
+        sql_args![&input.result, &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        task_id,
+        "board.task",
+        TaskState::Completed.as_str(),
+    )
+    .await?;
+
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+
+    let ev_comp = events::append_event_tx(
+        &mut tx,
+        EventAppend {
             board_id,
-            task_id,
-            "board.task",
-            TaskState::Completed.as_str(),
-        )?;
+            event_type: EventType::TaskCompleted,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "epoch": task.claim_epoch, "result": input.result }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev_comp.seq);
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
-
-        let ev_comp = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskCompleted,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "epoch": task.claim_epoch, "result": input.result }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev_comp.seq);
-
-        // Cascade: check every `waiting` dependent of `task_id`
-        let mut stmt = tx.prepare(
+    // Cascade: check every `waiting` dependent of `task_id`, locking each dependent row FOR UPDATE
+    // so concurrent prerequisite completions on Postgres never double-ready the same dependent.
+    let dep_rows = tx
+        .fetch_all(
             "SELECT tn.task_id
              FROM task_needs tn
              JOIN tasks t ON t.message_id = tn.task_id
              WHERE tn.board_id = ?1 AND tn.needs_task_id = ?2 AND t.state = 'waiting'
              ORDER BY t.seq ASC",
-        )?;
-        let dep_ids: Vec<String> = stmt
-            .query_map(params![board_id, task_id], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+            sql_args![board_id, task_id],
+        )
+        .await?;
+    let mut dep_ids = Vec::with_capacity(dep_rows.len());
+    for r in dep_rows {
+        dep_ids.push(r.get_str(0)?);
+    }
 
-        let mut readied = Vec::new();
-        for dep_id in dep_ids {
-            if all_needs_completed_tx(tx, &dep_id)? {
-                let dep_stored = messages::load_stored_message_tx(tx, board_id, &dep_id)?.unwrap();
-                let dep_before = messages::build_message_snapshot_tx(tx, &dep_stored)?;
-                tx.execute(
-                    "UPDATE tasks SET state = 'ready', updated_at = ?1 WHERE message_id = ?2",
-                    params![now_str, dep_id],
-                )?;
-                labels::set_system_label_tx(
-                    tx,
-                    board_id,
-                    &dep_id,
-                    "board.task",
-                    TaskState::Ready.as_str(),
-                )?;
-                let dep_after = messages::build_message_snapshot_tx(tx, &dep_stored)?;
-                let dep_view = messages::hydrate_message_view_tx(tx, &dep_stored)?;
-                let ev_r = events::append_event_tx(
-                    tx,
-                    EventAppend {
-                        board_id,
-                        event_type: EventType::TaskReady,
-                        channel: Some(&dep_stored.channel),
-                        message_id: Some(&dep_id),
-                        actor_id: Some(&actor_id),
-                        payload: json!({ "from": "dependency_completed", "prerequisite": task_id }),
-                        before_snapshot: Some(&dep_before),
-                        after_snapshot: Some(&dep_after),
-                        after_message: Some(&dep_view),
-                    },
-                )?;
-                event_seqs.push(ev_r.seq);
-                readied.push(dep_id);
-            }
+    let mut readied = Vec::new();
+    for dep_id in dep_ids {
+        let Some(locked_dep) = load_task_row_for_update_tx(&mut tx, board_id, &dep_id).await?
+        else {
+            continue;
+        };
+        if locked_dep.state != TaskState::Waiting {
+            continue;
         }
+        if all_needs_completed_tx(&mut tx, &dep_id).await? {
+            let dep_stored = messages::load_stored_message_tx(&mut tx, board_id, &dep_id)
+                .await?
+                .unwrap();
+            let dep_before = messages::build_message_snapshot_tx(&mut tx, &dep_stored).await?;
+            tx.execute(
+                "UPDATE tasks SET state = 'ready', updated_at = ?1 WHERE message_id = ?2",
+                sql_args![&now_str, &dep_id],
+            )
+            .await?;
+            labels::set_system_label_tx(
+                &mut tx,
+                board_id,
+                &dep_id,
+                "board.task",
+                TaskState::Ready.as_str(),
+            )
+            .await?;
+            let dep_after = messages::build_message_snapshot_tx(&mut tx, &dep_stored).await?;
+            let dep_view = messages::hydrate_message_view_tx(&mut tx, &dep_stored).await?;
+            let ev_r = events::append_event_tx(
+                &mut tx,
+                EventAppend {
+                    board_id,
+                    event_type: EventType::TaskReady,
+                    channel: Some(&dep_stored.channel),
+                    message_id: Some(&dep_id),
+                    actor_id: Some(&actor_id),
+                    payload: json!({ "from": "dependency_completed", "prerequisite": task_id }),
+                    before_snapshot: Some(&dep_before),
+                    after_snapshot: Some(&dep_after),
+                    after_message: Some(&dep_view),
+                },
+            )
+            .await?;
+            event_seqs.push(ev_r.seq);
+            readied.push(dep_id);
+        }
+    }
 
-        Ok(TransitionResult {
-            task: view,
-            readied,
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied,
+        event_seqs,
     })
 }
 
-pub fn fail_task(
+pub async fn fail_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
@@ -2366,63 +2536,76 @@ pub fn fail_task(
     if input.reason.trim().is_empty() {
         return Err(BoardError::bad_request("fail reason cannot be empty"));
     }
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
+    validate_active_lease(&task, input.epoch, &input.token, &now_str)?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'failed', fail_reason = ?1, claimed_by = NULL, claim_token = NULL,
-                 claim_until = NULL, updated_at = ?2
-             WHERE message_id = ?3",
-            params![input.reason, now_str, task_id],
-        )?;
-        labels::set_system_label_tx(tx, board_id, task_id, "board.task", TaskState::Failed.as_str())?;
+    tx.execute(
+        "UPDATE tasks
+         SET state = 'failed', fail_reason = ?1, claimed_by = NULL, claim_token = NULL,
+             claim_until = NULL, updated_at = ?2
+         WHERE message_id = ?3",
+        sql_args![&input.reason, &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        task_id,
+        "board.task",
+        TaskState::Failed.as_str(),
+    )
+    .await?;
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
 
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskFailed,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "epoch": task.claim_epoch, "reason": input.reason }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskFailed,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "epoch": task.claim_epoch, "reason": input.reason }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
 
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn block_task(
+pub async fn block_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
@@ -2432,279 +2615,302 @@ pub fn block_task(
     if input.reason.trim().is_empty() {
         return Err(BoardError::bad_request("block reason cannot be empty"));
     }
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
 
-        if let (Some(epoch), Some(token)) = (input.epoch, input.token.as_deref()) {
-            validate_active_lease(&task, epoch, token, &now_str)?;
-        } else {
-            require_owner_or_manage(caller, &board_grants, &task)?;
-            match task.state {
-                TaskState::Claimed => {
-                    return Err(BoardError::new(
-                        ErrorCode::TaskClaimed,
-                        "cannot block a claimed task without the active lease credentials",
-                    ));
-                }
-                TaskState::Completed | TaskState::Failed | TaskState::Canceled => {
-                    return Err(BoardError::new(
-                        ErrorCode::TaskFinished,
-                        format!("cannot block finished task '{}'", task.message_id),
-                    ));
-                }
-                TaskState::Waiting | TaskState::Ready | TaskState::Blocked => {}
+    if let (Some(epoch), Some(token)) = (input.epoch, input.token.as_deref()) {
+        validate_active_lease(&task, epoch, token, &now_str)?;
+    } else {
+        require_owner_or_manage(caller, &board_grants, &task)?;
+        match task.state {
+            TaskState::Claimed => {
+                return Err(BoardError::new(
+                    ErrorCode::TaskClaimed,
+                    "cannot block a claimed task without the active lease credentials",
+                ));
             }
+            TaskState::Completed | TaskState::Failed | TaskState::Canceled => {
+                return Err(BoardError::new(
+                    ErrorCode::TaskFinished,
+                    format!("cannot block finished task '{}'", task.message_id),
+                ));
+            }
+            TaskState::Waiting | TaskState::Ready | TaskState::Blocked => {}
         }
+    }
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'blocked', block_reason = ?1, block_kind = ?2,
-                 claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?3
-             WHERE message_id = ?4",
-            params![input.reason, input.kind, now_str, task_id],
-        )?;
-        labels::set_system_label_tx(
-            tx,
+    tx.execute(
+        "UPDATE tasks
+         SET state = 'blocked', block_reason = ?1, block_kind = ?2,
+             claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?3
+         WHERE message_id = ?4",
+        sql_args![&input.reason, &input.kind, &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        task_id,
+        "board.task",
+        TaskState::Blocked.as_str(),
+    )
+    .await?;
+
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
             board_id,
-            task_id,
-            "board.task",
-            TaskState::Blocked.as_str(),
-        )?;
+            event_type: EventType::TaskBlocked,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "reason": input.reason, "kind": input.kind }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
-
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskBlocked,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "reason": input.reason, "kind": input.kind }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
-
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn unblock_task(
+pub async fn unblock_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        require_owner_or_manage(caller, &board_grants, &task)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    require_owner_or_manage(caller, &board_grants, &task)?;
 
-        if task.state != TaskState::Blocked {
-            return Err(BoardError::conflict(format!(
-                "task '{task_id}' is '{}', not blocked",
+    if task.state != TaskState::Blocked {
+        return Err(BoardError::conflict(format!(
+            "task '{task_id}' is '{}', not blocked",
+            task.state.as_str()
+        )));
+    }
+
+    let next_state = if all_needs_completed_tx(&mut tx, task_id).await? {
+        TaskState::Ready
+    } else {
+        TaskState::Waiting
+    };
+
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+
+    tx.execute(
+        "UPDATE tasks
+         SET state = ?1, block_reason = NULL, block_kind = NULL, updated_at = ?2
+         WHERE message_id = ?3",
+        sql_args![next_state.as_str(), &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(&mut tx, board_id, task_id, "board.task", next_state.as_str())
+        .await?;
+
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskUnblocked,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "state": next_state.as_str() }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
+
+    if next_state == TaskState::Ready {
+        let ev_r = events::append_event_tx(
+            &mut tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::TaskReady,
+                channel: Some(&task.channel),
+                message_id: Some(task_id),
+                actor_id: Some(&actor_id),
+                payload: json!({ "from": "unblocked" }),
+                before_snapshot: Some(&before_snap),
+                after_snapshot: Some(&after_snap),
+                after_message: Some(&view),
+            },
+        )
+        .await?;
+        event_seqs.push(ev_r.seq);
+    }
+
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
+    })
+}
+
+pub async fn reopen_task(
+    db: &Database,
+    board_id: &str,
+    task_id: &str,
+    caller: &CallerContext,
+) -> BoardResult<TransitionResult> {
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
+
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
+            BoardError::new(
+                ErrorCode::MessageNotFound,
+                format!("task '{task_id}' not found"),
+            )
+        })?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    require_owner_or_manage(caller, &board_grants, &task)?;
+
+    if !matches!(task.state, TaskState::Failed | TaskState::Canceled) {
+        return Err(BoardError::new(
+            ErrorCode::TaskFinished,
+            format!(
+                "only failed or canceled tasks can be reopened (task is '{}')",
                 task.state.as_str()
-            )));
-        }
+            ),
+        ));
+    }
 
-        let next_state = if all_needs_completed_tx(tx, task_id)? {
-            TaskState::Ready
-        } else {
-            TaskState::Waiting
-        };
+    let next_state = if all_needs_completed_tx(&mut tx, task_id).await? {
+        TaskState::Ready
+    } else {
+        TaskState::Waiting
+    };
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = ?1, block_reason = NULL, block_kind = NULL, updated_at = ?2
-             WHERE message_id = ?3",
-            params![next_state.as_str(), now_str, task_id],
-        )?;
-        labels::set_system_label_tx(tx, board_id, task_id, "board.task", next_state.as_str())?;
+    tx.execute(
+        "UPDATE tasks
+         SET state = ?1, fail_reason = NULL, cancel_reason = NULL, updated_at = ?2
+         WHERE message_id = ?3",
+        sql_args![next_state.as_str(), &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(&mut tx, board_id, task_id, "board.task", next_state.as_str())
+        .await?;
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
 
-        let ev = events::append_event_tx(
-            tx,
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskReopened,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "state": next_state.as_str() }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
+
+    if next_state == TaskState::Ready {
+        let ev_r = events::append_event_tx(
+            &mut tx,
             EventAppend {
                 board_id,
-                event_type: EventType::TaskUnblocked,
+                event_type: EventType::TaskReady,
                 channel: Some(&task.channel),
                 message_id: Some(task_id),
                 actor_id: Some(&actor_id),
-                payload: json!({ "state": next_state.as_str() }),
+                payload: json!({ "from": "reopened" }),
                 before_snapshot: Some(&before_snap),
                 after_snapshot: Some(&after_snap),
                 after_message: Some(&view),
             },
-        )?;
-        event_seqs.push(ev.seq);
+        )
+        .await?;
+        event_seqs.push(ev_r.seq);
+    }
 
-        if next_state == TaskState::Ready {
-            let ev_r = events::append_event_tx(
-                tx,
-                EventAppend {
-                    board_id,
-                    event_type: EventType::TaskReady,
-                    channel: Some(&task.channel),
-                    message_id: Some(task_id),
-                    actor_id: Some(&actor_id),
-                    payload: json!({ "from": "unblocked" }),
-                    before_snapshot: Some(&before_snap),
-                    after_snapshot: Some(&after_snap),
-                    after_message: Some(&view),
-                },
-            )?;
-            event_seqs.push(ev_r.seq);
-        }
-
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn reopen_task(
-    db: &Database,
-    board_id: &str,
-    task_id: &str,
-    caller: &CallerContext,
-) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
-
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
-            BoardError::new(
-                ErrorCode::MessageNotFound,
-                format!("task '{task_id}' not found"),
-            )
-        })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        require_owner_or_manage(caller, &board_grants, &task)?;
-
-        if !matches!(task.state, TaskState::Failed | TaskState::Canceled) {
-            return Err(BoardError::new(
-                ErrorCode::TaskFinished,
-                format!(
-                    "only failed or canceled tasks can be reopened (task is '{}')",
-                    task.state.as_str()
-                ),
-            ));
-        }
-
-        let next_state = if all_needs_completed_tx(tx, task_id)? {
-            TaskState::Ready
-        } else {
-            TaskState::Waiting
-        };
-
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-
-        tx.execute(
-            "UPDATE tasks
-             SET state = ?1, fail_reason = NULL, cancel_reason = NULL, updated_at = ?2
-             WHERE message_id = ?3",
-            params![next_state.as_str(), now_str, task_id],
-        )?;
-        labels::set_system_label_tx(tx, board_id, task_id, "board.task", next_state.as_str())?;
-
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
-
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskReopened,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "state": next_state.as_str() }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
-
-        if next_state == TaskState::Ready {
-            let ev_r = events::append_event_tx(
-                tx,
-                EventAppend {
-                    board_id,
-                    event_type: EventType::TaskReady,
-                    channel: Some(&task.channel),
-                    message_id: Some(task_id),
-                    actor_id: Some(&actor_id),
-                    payload: json!({ "from": "reopened" }),
-                    before_snapshot: Some(&before_snap),
-                    after_snapshot: Some(&after_snap),
-                    after_message: Some(&view),
-                },
-            )?;
-            event_seqs.push(ev_r.seq);
-        }
-
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
-    })
-}
-
-pub fn cancel_task(
+pub async fn cancel_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
@@ -2714,295 +2920,329 @@ pub fn cancel_task(
     if input.reason.trim().is_empty() {
         return Err(BoardError::bad_request("cancel reason cannot be empty"));
     }
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        require_owner_or_manage(caller, &board_grants, &task)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    require_owner_or_manage(caller, &board_grants, &task)?;
 
-        if matches!(task.state, TaskState::Completed | TaskState::Canceled) {
-            return Err(BoardError::new(
-                ErrorCode::TaskFinished,
-                format!("task '{task_id}' is already {}", task.state.as_str()),
-            ));
-        }
+    if matches!(task.state, TaskState::Completed | TaskState::Canceled) {
+        return Err(BoardError::new(
+            ErrorCode::TaskFinished,
+            format!("task '{task_id}' is already {}", task.state.as_str()),
+        ));
+    }
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks
-             SET state = 'canceled', cancel_reason = ?1, claimed_by = NULL, claim_token = NULL,
-                 claim_until = NULL, updated_at = ?2
-             WHERE message_id = ?3",
-            params![input.reason, now_str, task_id],
-        )?;
-        labels::set_system_label_tx(
-            tx,
+    tx.execute(
+        "UPDATE tasks
+         SET state = 'canceled', cancel_reason = ?1, claimed_by = NULL, claim_token = NULL,
+             claim_until = NULL, updated_at = ?2
+         WHERE message_id = ?3",
+        sql_args![&input.reason, &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(
+        &mut tx,
+        board_id,
+        task_id,
+        "board.task",
+        TaskState::Canceled.as_str(),
+    )
+    .await?;
+
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
             board_id,
-            task_id,
-            "board.task",
-            TaskState::Canceled.as_str(),
-        )?;
+            event_type: EventType::TaskCanceled,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "reason": input.reason }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
-
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskCanceled,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "reason": input.reason }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
-
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn assign_task(
+pub async fn assign_task(
     db: &Database,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
     input: AssignInput,
 ) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        require_owner_or_manage(caller, &board_grants, &task)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    require_owner_or_manage(caller, &board_grants, &task)?;
 
-        if task.state.is_finished() {
-            return Err(BoardError::new(
-                ErrorCode::TaskFinished,
-                format!("cannot assign finished task '{task_id}'"),
-            ));
-        }
+    if task.state.is_finished() {
+        return Err(BoardError::new(
+            ErrorCode::TaskFinished,
+            format!("cannot assign finished task '{task_id}'"),
+        ));
+    }
 
-        let assigned_for = resolve_assigned_for(&task.owner_actor, input.assigned_for.as_deref())?;
+    let assigned_for = resolve_assigned_for(&task.owner_actor, input.assigned_for.as_deref())?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute(
-            "UPDATE tasks SET assigned_for = ?1, updated_at = ?2 WHERE message_id = ?3",
-            params![assigned_for, now_str, task_id],
-        )?;
+    tx.execute(
+        "UPDATE tasks SET assigned_for = ?1, updated_at = ?2 WHERE message_id = ?3",
+        sql_args![&assigned_for, &now_str, task_id],
+    )
+    .await?;
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
 
-        let ev = events::append_event_tx(
-            tx,
-            EventAppend {
-                board_id,
-                event_type: EventType::TaskAssigned,
-                channel: Some(&task.channel),
-                message_id: Some(task_id),
-                actor_id: Some(&actor_id),
-                payload: json!({ "for": assigned_for }),
-                before_snapshot: Some(&before_snap),
-                after_snapshot: Some(&after_snap),
-                after_message: Some(&view),
-            },
-        )?;
-        event_seqs.push(ev.seq);
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskAssigned,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "for": assigned_for }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
 
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
-pub fn update_task_needs(
+pub async fn update_task_needs(
     db: &Database,
     board_id: &str,
     task_id: &str,
     caller: &CallerContext,
     input: UpdateNeedsInput,
 ) -> BoardResult<TransitionResult> {
-    db.with_tx(|tx| {
-        let now = Utc::now();
-        let now_str = format_utc_ms(now);
-        let mut event_seqs: Vec<i64> = Vec::new();
-        for (_, seq) in expire_due_leases_tx(tx, Some(board_id), now)? {
-            event_seqs.push(seq);
-        }
+    let mut tx = db.begin_tx().await?;
+    // Serialize DAG edits per board on Postgres to prevent concurrent cycle races.
+    let lock_board_sql = format!("SELECT id FROM boards WHERE id = ?1{}", tx.lock_row_suffix());
+    let _ = tx.fetch_one(&lock_board_sql, sql_args![board_id]).await?;
 
-        let task = load_task_row_tx(tx, board_id, task_id)?.ok_or_else(|| {
+    let now = Utc::now();
+    let now_str = format_utc_ms(now);
+    let mut event_seqs: Vec<i64> = Vec::new();
+    for (_, seq) in expire_due_leases_tx(&mut tx, Some(board_id), now).await? {
+        event_seqs.push(seq);
+    }
+
+    let task = load_task_row_for_update_tx(&mut tx, board_id, task_id)
+        .await?
+        .ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("task '{task_id}' not found"),
             )
         })?;
-        let board_grants = grants::load_grants_tx(tx, board_id)?;
-        require_owner_or_manage(caller, &board_grants, &task)?;
+    let board_grants = grants::load_grants_tx(&mut tx, board_id).await?;
+    require_owner_or_manage(caller, &board_grants, &task)?;
 
-        if task.state == TaskState::Claimed {
-            return Err(BoardError::new(
-                ErrorCode::TaskClaimed,
-                "cannot change needs while task is claimed",
-            ));
-        }
-        if task.state.is_finished() {
-            return Err(BoardError::new(
-                ErrorCode::TaskFinished,
-                format!("cannot change needs on finished task '{task_id}'"),
-            ));
-        }
+    if task.state == TaskState::Claimed {
+        return Err(BoardError::new(
+            ErrorCode::TaskClaimed,
+            "cannot change needs while task is claimed",
+        ));
+    }
+    if task.state.is_finished() {
+        return Err(BoardError::new(
+            ErrorCode::TaskFinished,
+            format!("cannot change needs on finished task '{task_id}'"),
+        ));
+    }
 
-        let valid_needs =
-            validate_prereqs_readable_tx(tx, board_id, &board_grants, caller, &input.needs)?;
-        check_no_cycle_tx(tx, board_id, task_id, &valid_needs)?;
+    let valid_needs =
+        validate_prereqs_readable_tx(&mut tx, board_id, &board_grants, caller, &input.needs)
+            .await?;
+    check_no_cycle_tx(&mut tx, board_id, task_id, &valid_needs).await?;
 
-        let stored = messages::load_stored_message_tx(tx, board_id, task_id)?.unwrap();
-        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let stored = messages::load_stored_message_tx(&mut tx, board_id, task_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
 
-        tx.execute("DELETE FROM task_needs WHERE task_id = ?1", params![task_id])?;
-        for nid in &valid_needs {
-            tx.execute(
-                "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
-                params![board_id, task_id, nid],
-            )?;
-        }
-
-        // Re-evaluate waiting <-> ready (keeping blocked as blocked)
-        let next_state = if task.state == TaskState::Blocked {
-            TaskState::Blocked
-        } else if all_needs_completed_tx(tx, task_id)? {
-            TaskState::Ready
-        } else {
-            TaskState::Waiting
-        };
-
+    tx.execute(
+        "DELETE FROM task_needs WHERE task_id = ?1",
+        sql_args![task_id],
+    )
+    .await?;
+    for nid in &valid_needs {
         tx.execute(
-            "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE message_id = ?3",
-            params![next_state.as_str(), now_str, task_id],
-        )?;
-        labels::set_system_label_tx(tx, board_id, task_id, "board.task", next_state.as_str())?;
+            "INSERT INTO task_needs (board_id, task_id, needs_task_id) VALUES (?1, ?2, ?3)",
+            sql_args![board_id, task_id, nid],
+        )
+        .await?;
+    }
 
-        let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
-        let view = messages::hydrate_message_view_tx(tx, &stored)?;
-        let actor_id = caller.actor_id();
+    let next_state = if task.state == TaskState::Blocked {
+        TaskState::Blocked
+    } else if all_needs_completed_tx(&mut tx, task_id).await? {
+        TaskState::Ready
+    } else {
+        TaskState::Waiting
+    };
 
-        let ev = events::append_event_tx(
-            tx,
+    tx.execute(
+        "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE message_id = ?3",
+        sql_args![next_state.as_str(), &now_str, task_id],
+    )
+    .await?;
+    labels::set_system_label_tx(&mut tx, board_id, task_id, "board.task", next_state.as_str())
+        .await?;
+
+    let after_snap = messages::build_message_snapshot_tx(&mut tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(&mut tx, &stored).await?;
+    let actor_id = caller.actor_id();
+
+    let ev = events::append_event_tx(
+        &mut tx,
+        EventAppend {
+            board_id,
+            event_type: EventType::TaskNeedsChanged,
+            channel: Some(&task.channel),
+            message_id: Some(task_id),
+            actor_id: Some(&actor_id),
+            payload: json!({ "needs": valid_needs, "state": next_state.as_str() }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&view),
+        },
+    )
+    .await?;
+    event_seqs.push(ev.seq);
+
+    if task.state != TaskState::Ready && next_state == TaskState::Ready {
+        let ev_r = events::append_event_tx(
+            &mut tx,
             EventAppend {
                 board_id,
-                event_type: EventType::TaskNeedsChanged,
+                event_type: EventType::TaskReady,
                 channel: Some(&task.channel),
                 message_id: Some(task_id),
                 actor_id: Some(&actor_id),
-                payload: json!({ "needs": valid_needs, "state": next_state.as_str() }),
+                payload: json!({ "from": "needs_changed" }),
                 before_snapshot: Some(&before_snap),
                 after_snapshot: Some(&after_snap),
                 after_message: Some(&view),
             },
-        )?;
-        event_seqs.push(ev.seq);
+        )
+        .await?;
+        event_seqs.push(ev_r.seq);
+    }
 
-        if task.state != TaskState::Ready && next_state == TaskState::Ready {
-            let ev_r = events::append_event_tx(
-                tx,
-                EventAppend {
-                    board_id,
-                    event_type: EventType::TaskReady,
-                    channel: Some(&task.channel),
-                    message_id: Some(task_id),
-                    actor_id: Some(&actor_id),
-                    payload: json!({ "from": "needs_changed" }),
-                    before_snapshot: Some(&before_snap),
-                    after_snapshot: Some(&after_snap),
-                    after_message: Some(&view),
-                },
-            )?;
-            event_seqs.push(ev_r.seq);
-        }
-
-        Ok(TransitionResult {
-            task: view,
-            readied: Vec::new(),
-            event_seqs,
-        })
+    tx.commit().await?;
+    Ok(TransitionResult {
+        task: view,
+        readied: Vec::new(),
+        event_seqs,
     })
 }
 
 /// Root-message deletion hook: cancels any unfinished task attached to `message_id`.
-pub fn on_root_deleted_tx(
-    conn: &Connection,
+pub async fn on_root_deleted_tx(
+    tx: &mut DbTx,
     board_id: &str,
     message_id: &str,
     actor_id: &str,
 ) -> BoardResult<Option<i64>> {
-    let Some(task) = load_task_row_tx(conn, board_id, message_id)? else {
+    let Some(task) = load_task_row_for_update_tx(tx, board_id, message_id).await? else {
         return Ok(None);
     };
     if matches!(task.state, TaskState::Completed | TaskState::Canceled) {
         return Ok(None);
     }
 
-    let stored = messages::load_stored_message_tx(conn, board_id, message_id)?.unwrap();
-    let before_snap = messages::build_message_snapshot_tx(conn, &stored)?;
+    let stored = messages::load_stored_message_tx(tx, board_id, message_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
     let now_str = format_utc_ms(Utc::now());
 
-    conn.execute(
+    tx.execute(
         "UPDATE tasks
          SET state = 'canceled', cancel_reason = 'root message deleted',
              claimed_by = NULL, claim_token = NULL, claim_until = NULL, updated_at = ?1
          WHERE message_id = ?2",
-        params![now_str, message_id],
-    )?;
+        sql_args![&now_str, message_id],
+    )
+    .await?;
     labels::set_system_label_tx(
-        conn,
+        tx,
         board_id,
         message_id,
         "board.task",
         TaskState::Canceled.as_str(),
-    )?;
+    )
+    .await?;
 
-    let after_snap = messages::build_message_snapshot_tx(conn, &stored)?;
-    let view = messages::hydrate_message_view_tx(conn, &stored)?;
+    let after_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(tx, &stored).await?;
     let ev = events::append_event_tx(
-        conn,
+        tx,
         EventAppend {
             board_id,
             event_type: EventType::TaskCanceled,
@@ -3014,20 +3254,20 @@ pub fn on_root_deleted_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 
 /// Root-message edit hook: if someone other than the task's exact owner actor edits an unfinished
-/// task's root message (e.g., bare principal editing a profile's task, or original thread author
-/// editing a thread converted into a task by another user), transitions the task to `blocked`.
-pub fn on_root_edited_tx(
-    conn: &Connection,
+/// task's root message, transitions the task to `blocked`.
+pub async fn on_root_edited_tx(
+    tx: &mut DbTx,
     board_id: &str,
     message_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<Option<i64>> {
-    let Some(task) = load_task_row_tx(conn, board_id, message_id)? else {
+    let Some(task) = load_task_row_for_update_tx(tx, board_id, message_id).await? else {
         return Ok(None);
     };
     if task.state.is_finished() || task.state == TaskState::Blocked {
@@ -3038,30 +3278,34 @@ pub fn on_root_edited_tx(
         return Ok(None);
     }
 
-    let stored = messages::load_stored_message_tx(conn, board_id, message_id)?.unwrap();
-    let before_snap = messages::build_message_snapshot_tx(conn, &stored)?;
+    let stored = messages::load_stored_message_tx(tx, board_id, message_id)
+        .await?
+        .unwrap();
+    let before_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
     let now_str = format_utc_ms(Utc::now());
 
-    conn.execute(
+    tx.execute(
         "UPDATE tasks
          SET state = 'blocked', block_reason = 'root message edited by non-owner',
              block_kind = 'root_edited', claimed_by = NULL, claim_token = NULL,
              claim_until = NULL, updated_at = ?1
          WHERE message_id = ?2",
-        params![now_str, message_id],
-    )?;
+        sql_args![&now_str, message_id],
+    )
+    .await?;
     labels::set_system_label_tx(
-        conn,
+        tx,
         board_id,
         message_id,
         "board.task",
         TaskState::Blocked.as_str(),
-    )?;
+    )
+    .await?;
 
-    let after_snap = messages::build_message_snapshot_tx(conn, &stored)?;
-    let view = messages::hydrate_message_view_tx(conn, &stored)?;
+    let after_snap = messages::build_message_snapshot_tx(tx, &stored).await?;
+    let view = messages::hydrate_message_view_tx(tx, &stored).await?;
     let ev = events::append_event_tx(
-        conn,
+        tx,
         EventAppend {
             board_id,
             event_type: EventType::TaskBlocked,
@@ -3076,7 +3320,8 @@ pub fn on_root_edited_tx(
             after_snapshot: Some(&after_snap),
             after_message: Some(&view),
         },
-    )?;
+    )
+    .await?;
     Ok(Some(ev.seq))
 }
 

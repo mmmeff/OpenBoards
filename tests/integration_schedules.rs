@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 use openboards::actors;
 use openboards::boards;
-use openboards::config::ServerConfig;
+use openboards::config::{DbTarget, ServerConfig};
 use openboards::db::Database;
 use openboards::schedules::{self, format_utc_ms};
 use openboards::{build_router, AppState};
@@ -20,12 +20,12 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
-        let db = Database::open_in_memory().unwrap();
-        actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
-        boards::ensure_default_board(&db).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        actors::bootstrap_owner(&db, Some(&owner_token)).await.unwrap();
+        boards::ensure_default_board(&db).await.unwrap();
         let state = AppState::new(
             db,
             ServerConfig {
@@ -35,6 +35,8 @@ impl TestHarness {
                 admin_token: Some(owner_token.clone()),
                 rate_limit_rps: 0,
                 rate_limit_burst: 100,
+                db_target: DbTarget::SqliteUrl("sqlite::memory:".to_string()),
+                db_max_connections: 1,
             },
         );
         let app = build_router(state.clone());
@@ -105,7 +107,7 @@ impl TestHarness {
 
 #[tokio::test]
 async fn one_shot_schedule_fires_preserving_profile_labels_schema_and_thread_embedding() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -207,6 +209,7 @@ async fn one_shot_schedule_fires_preserving_profile_labels_schema_and_thread_emb
         &h.state.events,
         Utc::now() + Duration::minutes(3),
     )
+    .await
     .unwrap();
     assert_eq!(sum1.fired, 1);
     assert_eq!(sum1.failed, 0);
@@ -233,6 +236,7 @@ async fn one_shot_schedule_fires_preserving_profile_labels_schema_and_thread_emb
         &h.state.events,
         Utc::now() + Duration::minutes(6),
     )
+    .await
     .unwrap();
     assert_eq!(sum2.fired, 1);
     let posted_id = &sum2.posted_message_ids[0];
@@ -304,7 +308,7 @@ async fn one_shot_schedule_fires_preserving_profile_labels_schema_and_thread_emb
 
 #[tokio::test]
 async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
 
     // Reject `every < 60s` with 400 bad_request
@@ -372,6 +376,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
     // Tick 1 at t0
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, t0)
+            .await
             .unwrap()
             .fired,
         1
@@ -379,6 +384,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
     // Tick at t0 + 30s -> nothing due yet
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, t0 + Duration::seconds(30))
+            .await
             .unwrap()
             .fired,
         0
@@ -386,6 +392,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
     // Tick 2 at t0 + 1m
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, t0 + Duration::minutes(1))
+            .await
             .unwrap()
             .fired,
         1
@@ -393,6 +400,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
     // Tick 3 at t0 + 2m -> reaches times=3 and completes
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, t0 + Duration::minutes(2))
+            .await
             .unwrap()
             .fired,
         1
@@ -400,6 +408,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
     // Tick at t0 + 5m -> already completed, does NOT fire again
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, t0 + Duration::minutes(5))
+            .await
             .unwrap()
             .fired,
         0
@@ -440,12 +449,14 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
 
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, u0)
+            .await
             .unwrap()
             .fired,
         1
     );
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, u0 + Duration::minutes(1))
+            .await
             .unwrap()
             .fired,
         1
@@ -486,12 +497,14 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
 
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, f0)
+            .await
             .unwrap()
             .fired,
         1
     );
     assert_eq!(
         schedules::fire_due_schedules_at(&h.state.db, &h.state.events, f0 + Duration::minutes(1))
+            .await
             .unwrap()
             .fired,
         1
@@ -512,7 +525,7 @@ async fn repeating_schedules_min_interval_and_times_until_for_bounds() {
 
 #[tokio::test]
 async fn grant_revocation_stops_schedule_and_cancel_enforces_owner_and_profile_rules() {
-    let h = TestHarness::new();
+    let h = TestHarness::new().await;
     let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
     let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
 
@@ -554,6 +567,7 @@ async fn grant_revocation_stops_schedule_and_cancel_enforces_owner_and_profile_r
         &h.state.events,
         t0 + Duration::minutes(2),
     )
+    .await
     .unwrap();
     assert_eq!(sum.fired, 0);
     assert_eq!(sum.failed, 1);

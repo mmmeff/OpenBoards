@@ -1,33 +1,379 @@
+use std::borrow::Cow;
+use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::time::Duration;
 
 use chrono::Utc;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+    SqliteSynchronous,
+};
+use sqlx::{Postgres, Row, Sqlite, Transaction};
 
+use crate::config::{DbTarget, DEFAULT_DB_MAX_CONNECTIONS};
 use crate::error::{BoardError, BoardResult};
+
+const STARTUP_LOCK_KEY: i64 = 67_108_864_198_201;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SqlArg<'a> {
+    Text(Cow<'a, str>),
+    OptText(Option<Cow<'a, str>>),
+    Int(i64),
+    OptInt(Option<i64>),
+    Bytes(Cow<'a, [u8]>),
+}
+
+impl<'a> From<&'a str> for SqlArg<'a> {
+    fn from(v: &'a str) -> Self {
+        Self::Text(Cow::Borrowed(v))
+    }
+}
+
+impl<'a> From<&'a String> for SqlArg<'a> {
+    fn from(v: &'a String) -> Self {
+        Self::Text(Cow::Borrowed(v.as_str()))
+    }
+}
+
+impl From<String> for SqlArg<'_> {
+    fn from(v: String) -> Self {
+        Self::Text(Cow::Owned(v))
+    }
+}
+
+impl<'a> From<Option<&'a str>> for SqlArg<'a> {
+    fn from(v: Option<&'a str>) -> Self {
+        Self::OptText(v.map(Cow::Borrowed))
+    }
+}
+
+impl<'a> From<&'a Option<String>> for SqlArg<'a> {
+    fn from(v: &'a Option<String>) -> Self {
+        Self::OptText(v.as_deref().map(Cow::Borrowed))
+    }
+}
+
+impl From<Option<String>> for SqlArg<'_> {
+    fn from(v: Option<String>) -> Self {
+        Self::OptText(v.map(Cow::Owned))
+    }
+}
+
+impl From<i64> for SqlArg<'_> {
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<Option<i64>> for SqlArg<'_> {
+    fn from(v: Option<i64>) -> Self {
+        Self::OptInt(v)
+    }
+}
+
+impl<'a> From<&'a [u8]> for SqlArg<'a> {
+    fn from(v: &'a [u8]) -> Self {
+        Self::Bytes(Cow::Borrowed(v))
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for SqlArg<'a> {
+    fn from(v: &'a Vec<u8>) -> Self {
+        Self::Bytes(Cow::Borrowed(v.as_slice()))
+    }
+}
+
+impl From<Vec<u8>> for SqlArg<'_> {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Bytes(Cow::Owned(v))
+    }
+}
+
+#[macro_export]
+macro_rules! sql_args {
+    () => {
+        &[] as &[$crate::db::SqlArg<'_>]
+    };
+    ($($arg:expr),+ $(,)?) => {
+        &[$($crate::db::SqlArg::from($arg)),+] as &[$crate::db::SqlArg<'_>]
+    };
+}
+
+pub enum DbRow {
+    Sqlite(SqliteRow),
+    Postgres(PgRow),
+}
+
+impl DbRow {
+    pub fn get_str(&self, idx: usize) -> BoardResult<String> {
+        match self {
+            Self::Sqlite(r) => r.try_get(idx).map_err(BoardError::from),
+            Self::Postgres(r) => r.try_get(idx).map_err(BoardError::from),
+        }
+    }
+
+    pub fn get_opt_str(&self, idx: usize) -> BoardResult<Option<String>> {
+        match self {
+            Self::Sqlite(r) => r.try_get(idx).map_err(BoardError::from),
+            Self::Postgres(r) => r.try_get(idx).map_err(BoardError::from),
+        }
+    }
+
+    pub fn get_i64(&self, idx: usize) -> BoardResult<i64> {
+        match self {
+            Self::Sqlite(r) => r.try_get(idx).map_err(BoardError::from),
+            Self::Postgres(r) => r.try_get(idx).map_err(BoardError::from),
+        }
+    }
+
+    pub fn get_opt_i64(&self, idx: usize) -> BoardResult<Option<i64>> {
+        match self {
+            Self::Sqlite(r) => r.try_get(idx).map_err(BoardError::from),
+            Self::Postgres(r) => r.try_get(idx).map_err(BoardError::from),
+        }
+    }
+
+    pub fn get_bytes(&self, idx: usize) -> BoardResult<Vec<u8>> {
+        match self {
+            Self::Sqlite(r) => r.try_get(idx).map_err(BoardError::from),
+            Self::Postgres(r) => r.try_get(idx).map_err(BoardError::from),
+        }
+    }
+}
+
+/// Rewrites SQLite-style `?N` (or bare `?`) placeholders to Postgres `$N` placeholders
+/// while skipping single-quoted string literals, double-quoted identifiers, `--` line
+/// comments, and `/* ... */` block comments.
+pub fn rewrite_placeholders_for_pg(sql: &str) -> Cow<'_, str> {
+    if !sql.contains('?') {
+        return Cow::Borrowed(sql);
+    }
+
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 8);
+    let mut i = 0;
+    let mut auto_idx: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        // Single-quoted SQL string literal (handles '' escapes)
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    if i < len && bytes[i] == b'\'' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Double-quoted SQL identifier (handles "" escapes)
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'"' {
+                    i += 1;
+                    if i < len && bytes[i] == b'"' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Line comment: -- ...\n
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Block comment: /* ... */
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        if b == b'?' {
+            let mut j = i + 1;
+            while j < len && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            out.push('$');
+            if j > i + 1 {
+                out.push_str(&sql[i + 1..j]);
+                i = j;
+            } else {
+                auto_idx += 1;
+                use std::fmt::Write;
+                let _ = write!(&mut out, "{auto_idx}");
+                i += 1;
+            }
+            continue;
+        }
+
+        // Copy full UTF-8 character safely
+        let ch = sql[i..].chars().next().expect("valid utf-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    Cow::Owned(out)
+}
+
+/// Escapes `\`, `%`, and `_` for portable `LIKE ?N ESCAPE '\'` prefix matching.
+pub fn escape_like_prefix(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Builds a comma-separated numbered placeholder list (`?1,?2,...` or starting at `start`)
+/// for portable `IN (...)` batch queries across SQLite and PostgreSQL.
+pub fn sql_placeholders_from(start: usize, count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    let mut s = String::with_capacity(count * 4);
+    for offset in 0..count {
+        if offset > 0 {
+            s.push(',');
+        }
+        use std::fmt::Write;
+        let _ = write!(&mut s, "?{}", start + offset);
+    }
+    s
+}
+
+/// Builds a comma-separated numbered placeholder list starting at `?1`.
+pub fn sql_placeholders(count: usize) -> String {
+    sql_placeholders_from(1, count)
+}
+
+fn bind_sqlite_args<'q>(
+    mut q: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    args: &'q [SqlArg<'q>],
+) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    for arg in args {
+        q = match arg {
+            SqlArg::Text(s) => q.bind(s.as_ref()),
+            SqlArg::OptText(opt) => q.bind(opt.as_deref()),
+            SqlArg::Int(v) => q.bind(*v),
+            SqlArg::OptInt(opt) => q.bind(*opt),
+            SqlArg::Bytes(b) => q.bind(b.as_ref()),
+        };
+    }
+    q
+}
+
+fn bind_pg_args<'q>(
+    mut q: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    args: &'q [SqlArg<'q>],
+) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments> {
+    for arg in args {
+        q = match arg {
+            SqlArg::Text(s) => q.bind(s.as_ref()),
+            SqlArg::OptText(opt) => q.bind(opt.as_deref()),
+            SqlArg::Int(v) => q.bind(*v),
+            SqlArg::OptInt(opt) => q.bind(*opt),
+            SqlArg::Bytes(b) => q.bind(b.as_ref()),
+        };
+    }
+    q
+}
 
 struct Migration {
     version: i64,
     name: &'static str,
-    sql: &'static str,
+    sqlite_sql: &'static str,
+    postgres_sql: Option<&'static str>,
+}
+
+impl Migration {
+    fn ddl_for(&self, dialect: Dialect) -> Cow<'static, str> {
+        match dialect {
+            Dialect::Sqlite => Cow::Borrowed(self.sqlite_sql),
+            Dialect::Postgres => match self.postgres_sql {
+                Some(pg) => Cow::Borrowed(pg),
+                None => Cow::Owned(sqlite_ddl_to_postgres(self.sqlite_sql)),
+            },
+        }
+    }
+}
+
+fn sqlite_ddl_to_postgres(sqlite_sql: &str) -> String {
+    sqlite_sql
+        .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+        .replace("INTEGER", "BIGINT")
 }
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "001_init",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS server_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 2,
         name: "002_auth_actors",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
@@ -93,11 +439,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_actor_activity_board
                 ON actor_activity (board_id);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 3,
         name: "003_boards_channels_grants",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS boards (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -131,11 +478,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_grants_board
                 ON grants (board_id);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 4,
         name: "004_threads_messages",
-        sql: r#"
+        sqlite_sql: r#"
             ALTER TABLE boards ADD COLUMN next_msg_seq INTEGER NOT NULL DEFAULT 1;
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -194,11 +542,12 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (board_id, caller_actor, key)
             );
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 5,
         name: "005_labels_and_schemas",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS message_labels (
                 board_id TEXT NOT NULL,
                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -232,11 +581,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_message_blocks_board
                 ON message_blocks (board_id, message_id);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 6,
         name: "006_attachments",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS attachments (
                 id TEXT PRIMARY KEY,
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -261,11 +611,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_message_attachments_att
                 ON message_attachments (board_id, attachment_id);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 7,
         name: "007_events",
-        sql: r#"
+        sqlite_sql: r#"
             ALTER TABLE boards ADD COLUMN next_event_seq INTEGER NOT NULL DEFAULT 1;
 
             CREATE TABLE IF NOT EXISTS events (
@@ -288,11 +639,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_events_board_msg
                 ON events (board_id, message_id);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 8,
         name: "008_tasks",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS tasks (
                 message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -340,11 +692,12 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (board_id, caller_actor, idempotency_key)
             );
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 9,
         name: "009_schedules",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS schedules (
                 id TEXT PRIMARY KEY,
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -378,11 +731,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_schedules_board_channel
                 ON schedules (board_id, channel, status, next_run_at);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 10,
         name: "010_watchers",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS watchers (
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
                 owner_principal TEXT NOT NULL,
@@ -427,11 +781,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_watcher_deliveries_status
                 ON watcher_deliveries (status, next_attempt_at);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 11,
         name: "011_sync",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS sync_sources (
                 id TEXT PRIMARY KEY,
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -516,11 +871,12 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_sync_deliveries_pending
                 ON sync_deliveries (status, next_attempt_at);
         "#,
+        postgres_sql: None,
     },
     Migration {
         version: 12,
         name: "012_thread_summaries",
-        sql: r#"
+        sqlite_sql: r#"
             CREATE TABLE IF NOT EXISTS threads (
                 root_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
                 board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -538,7 +894,7 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_messages_board_channel_re_seq
                 ON messages (board_id, channel, re, seq);
 
-            INSERT OR IGNORE INTO threads (
+            INSERT INTO threads (
                 root_id, board_id, channel, root_seq, last_seq, last_id, last_reply_id, reply_count
             )
             SELECT
@@ -557,176 +913,646 @@ const MIGRATIONS: &[Migration] = &[
                 (SELECT m.id FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id ORDER BY m.seq DESC LIMIT 1),
                 (SELECT COUNT(*) FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id)
             FROM messages r
-            WHERE r.re IS NULL;
+            WHERE r.re IS NULL
+            ON CONFLICT (root_id) DO NOTHING;
         "#,
+        postgres_sql: None,
     },
 ];
 
-/// SQLite database wrapper in WAL mode with foreign keys enabled.
-///
-/// File-backed databases use a serialized write connection paired with a small pool of
-/// read-only WAL connections so concurrent reads scale across CPU cores without blocking writes.
+#[derive(Clone)]
+enum DbBackend {
+    Sqlite {
+        writer: SqlitePool,
+        readers: Option<SqlitePool>,
+    },
+    Postgres(PgPool),
+}
+
+/// Multi-SQL persistence handle supporting embedded SQLite (WAL + concurrent reader pool)
+/// and PostgreSQL (`PgPool`).
 #[derive(Clone)]
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
-    read_conns: Option<Arc<Vec<Mutex<Connection>>>>,
-    next_reader: Arc<AtomicUsize>,
+    backend: DbBackend,
+}
+
+/// Lightweight read-only handle over `Database` that routes SQLite reads to the
+/// concurrent `query_only = ON` WAL reader pool (when file-backed) and Postgres reads to `PgPool`.
+#[derive(Clone, Copy)]
+pub struct DbRead<'a>(&'a Database);
+
+enum TxBackend {
+    Sqlite(Transaction<'static, Sqlite>),
+    Postgres(Transaction<'static, Postgres>),
+}
+
+/// Active database transaction (`BEGIN IMMEDIATE` on SQLite, `BEGIN` on PostgreSQL).
+/// Dropping without calling `commit().await` rolls back automatically.
+pub struct DbTx {
+    backend: TxBackend,
+}
+
+/// Unified query execution interface implemented for both `DbRead<'_>` (pool reads)
+/// and `DbTx` (active transactions), allowing domain helpers to run in either context.
+pub trait Queryable: Send {
+    fn dialect(&self) -> Dialect;
+
+    fn execute<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<u64>> + Send + 'a;
+
+    fn fetch_all<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<Vec<DbRow>>> + Send + 'a;
+
+    fn fetch_optional<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<Option<DbRow>>> + Send + 'a;
+
+    fn fetch_one<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<DbRow>> + Send + 'a;
+}
+
+impl Queryable for DbRead<'_> {
+    fn dialect(&self) -> Dialect {
+        self.0.dialect()
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<u64>> + Send + 'a {
+        let db = self.0;
+        async move {
+            match &db.backend {
+                DbBackend::Sqlite { writer, readers } => {
+                    let pool = readers.as_ref().unwrap_or(writer);
+                    let res = bind_sqlite_args(sqlx::query(sql), args)
+                        .execute(pool)
+                        .await?;
+                    Ok(res.rows_affected())
+                }
+                DbBackend::Postgres(pool) => {
+                    let pg_sql = rewrite_placeholders_for_pg(sql);
+                    let res = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                        .execute(pool)
+                        .await?;
+                    Ok(res.rows_affected())
+                }
+            }
+        }
+    }
+
+    fn fetch_all<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<Vec<DbRow>>> + Send + 'a {
+        let db = self.0;
+        async move {
+            match &db.backend {
+                DbBackend::Sqlite { writer, readers } => {
+                    let pool = readers.as_ref().unwrap_or(writer);
+                    let rows = bind_sqlite_args(sqlx::query(sql), args)
+                        .fetch_all(pool)
+                        .await?;
+                    Ok(rows.into_iter().map(DbRow::Sqlite).collect())
+                }
+                DbBackend::Postgres(pool) => {
+                    let pg_sql = rewrite_placeholders_for_pg(sql);
+                    let rows = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                        .fetch_all(pool)
+                        .await?;
+                    Ok(rows.into_iter().map(DbRow::Postgres).collect())
+                }
+            }
+        }
+    }
+
+    fn fetch_optional<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<Option<DbRow>>> + Send + 'a {
+        let db = self.0;
+        async move {
+            match &db.backend {
+                DbBackend::Sqlite { writer, readers } => {
+                    let pool = readers.as_ref().unwrap_or(writer);
+                    let row = bind_sqlite_args(sqlx::query(sql), args)
+                        .fetch_optional(pool)
+                        .await?;
+                    Ok(row.map(DbRow::Sqlite))
+                }
+                DbBackend::Postgres(pool) => {
+                    let pg_sql = rewrite_placeholders_for_pg(sql);
+                    let row = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                        .fetch_optional(pool)
+                        .await?;
+                    Ok(row.map(DbRow::Postgres))
+                }
+            }
+        }
+    }
+
+    fn fetch_one<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> impl Future<Output = BoardResult<DbRow>> + Send + 'a {
+        let db = self.0;
+        async move {
+            match &db.backend {
+                DbBackend::Sqlite { writer, readers } => {
+                    let pool = readers.as_ref().unwrap_or(writer);
+                    let row = bind_sqlite_args(sqlx::query(sql), args)
+                        .fetch_one(pool)
+                        .await?;
+                    Ok(DbRow::Sqlite(row))
+                }
+                DbBackend::Postgres(pool) => {
+                    let pg_sql = rewrite_placeholders_for_pg(sql);
+                    let row = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                        .fetch_one(pool)
+                        .await?;
+                    Ok(DbRow::Postgres(row))
+                }
+            }
+        }
+    }
+}
+
+impl Queryable for DbTx {
+    fn dialect(&self) -> Dialect {
+        match &self.backend {
+            TxBackend::Sqlite(_) => Dialect::Sqlite,
+            TxBackend::Postgres(_) => Dialect::Postgres,
+        }
+    }
+
+    async fn execute<'a>(&'a mut self, sql: &'a str, args: &'a [SqlArg<'a>]) -> BoardResult<u64> {
+        match &mut self.backend {
+            TxBackend::Sqlite(tx) => {
+                let res = bind_sqlite_args(sqlx::query(sql), args)
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(res.rows_affected())
+            }
+            TxBackend::Postgres(tx) => {
+                let pg_sql = rewrite_placeholders_for_pg(sql);
+                let res = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(res.rows_affected())
+            }
+        }
+    }
+
+    async fn fetch_all<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> BoardResult<Vec<DbRow>> {
+        match &mut self.backend {
+            TxBackend::Sqlite(tx) => {
+                let rows = bind_sqlite_args(sqlx::query(sql), args)
+                    .fetch_all(&mut **tx)
+                    .await?;
+                Ok(rows.into_iter().map(DbRow::Sqlite).collect())
+            }
+            TxBackend::Postgres(tx) => {
+                let pg_sql = rewrite_placeholders_for_pg(sql);
+                let rows = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                    .fetch_all(&mut **tx)
+                    .await?;
+                Ok(rows.into_iter().map(DbRow::Postgres).collect())
+            }
+        }
+    }
+
+    async fn fetch_optional<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> BoardResult<Option<DbRow>> {
+        match &mut self.backend {
+            TxBackend::Sqlite(tx) => {
+                let row = bind_sqlite_args(sqlx::query(sql), args)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                Ok(row.map(DbRow::Sqlite))
+            }
+            TxBackend::Postgres(tx) => {
+                let pg_sql = rewrite_placeholders_for_pg(sql);
+                let row = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                Ok(row.map(DbRow::Postgres))
+            }
+        }
+    }
+
+    async fn fetch_one<'a>(
+        &'a mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> BoardResult<DbRow> {
+        match &mut self.backend {
+            TxBackend::Sqlite(tx) => {
+                let row = bind_sqlite_args(sqlx::query(sql), args)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                Ok(DbRow::Sqlite(row))
+            }
+            TxBackend::Postgres(tx) => {
+                let pg_sql = rewrite_placeholders_for_pg(sql);
+                let row = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                Ok(DbRow::Postgres(row))
+            }
+        }
+    }
+}
+
+impl DbTx {
+    /// Returns `" FOR UPDATE"` on PostgreSQL and `""` on SQLite (which already serializes
+    /// writers via `BEGIN IMMEDIATE`).
+    pub fn lock_row_suffix(&self) -> &'static str {
+        match self.dialect() {
+            Dialect::Sqlite => "",
+            Dialect::Postgres => " FOR UPDATE",
+        }
+    }
+
+    /// Acquires a transaction-scoped advisory lock on PostgreSQL (automatically released on
+    /// commit/rollback). No-op on SQLite because `BEGIN IMMEDIATE` already serializes writers.
+    pub async fn advisory_xact_lock(&mut self, namespace: &str, key: &str) -> BoardResult<()> {
+        match &mut self.backend {
+            TxBackend::Sqlite(_) => Ok(()),
+            TxBackend::Postgres(tx) => {
+                let lock_id = format!("{namespace}:{key}");
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&lock_id)
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Executes a statement returning the raw `sqlx::Error` so callers can inspect constraint
+    /// violation codes directly (e.g., race-tolerant unique inserts).
+    pub async fn execute_raw_err<'a>(
+        &mut self,
+        sql: &'a str,
+        args: &'a [SqlArg<'a>],
+    ) -> Result<u64, sqlx::Error> {
+        match &mut self.backend {
+            TxBackend::Sqlite(tx) => {
+                let res = bind_sqlite_args(sqlx::query(sql), args)
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(res.rows_affected())
+            }
+            TxBackend::Postgres(tx) => {
+                let pg_sql = rewrite_placeholders_for_pg(sql);
+                let res = bind_pg_args(sqlx::query(pg_sql.as_ref()), args)
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(res.rows_affected())
+            }
+        }
+    }
+
+    pub async fn commit(self) -> BoardResult<()> {
+        match self.backend {
+            TxBackend::Sqlite(tx) => tx.commit().await?,
+            TxBackend::Postgres(tx) => tx.commit().await?,
+        }
+        Ok(())
+    }
+
+    pub async fn rollback(self) -> BoardResult<()> {
+        match self.backend {
+            TxBackend::Sqlite(tx) => tx.rollback().await?,
+            TxBackend::Postgres(tx) => tx.rollback().await?,
+        }
+        Ok(())
+    }
 }
 
 impl Database {
-    pub fn open(path: &Path) -> BoardResult<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    BoardError::internal(format!(
-                        "failed to create data directory '{}': {e}",
-                        parent.display()
-                    ))
-                })?;
+    /// Opens a file-backed SQLite database in WAL mode with a concurrent read-only WAL pool
+    /// and runs all pending migrations.
+    pub async fn open(path: &Path) -> BoardResult<Self> {
+        let target = DbTarget::SqlitePath(path.to_path_buf());
+        Self::connect(&target, DEFAULT_DB_MAX_CONNECTIONS).await
+    }
+
+    /// Opens an in-memory SQLite database (single pinned connection) and runs all migrations.
+    pub async fn open_in_memory() -> BoardResult<Self> {
+        let target = DbTarget::SqliteUrl("sqlite::memory:".to_string());
+        Self::connect(&target, 1).await
+    }
+
+    /// Connects to `target` and runs all pending migrations under `with_startup_lock`.
+    pub async fn connect(target: &DbTarget, max_connections: u32) -> BoardResult<Self> {
+        let db = Self::connect_raw(target, max_connections).await?;
+        db.with_startup_lock(|| db.run_migrations()).await?;
+        Ok(db)
+    }
+
+    /// Connects to `target` without running migrations yet (so startup can hold one
+    /// `with_startup_lock` across migrations + initial seeding).
+    pub async fn connect_raw(target: &DbTarget, max_connections: u32) -> BoardResult<Self> {
+        match target {
+            DbTarget::SqlitePath(path) => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            BoardError::internal(format!(
+                                "failed to create data directory '{}': {e}",
+                                parent.display()
+                            ))
+                        })?;
+                    }
+                }
+                let writer_opts = SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .foreign_keys(true)
+                    .busy_timeout(Duration::from_secs(5));
+                let reader_opts = SqliteConnectOptions::new()
+                    .filename(path)
+                    .read_only(true)
+                    .foreign_keys(true)
+                    .busy_timeout(Duration::from_secs(5))
+                    .pragma("query_only", "ON");
+                Self::connect_sqlite_file(writer_opts, reader_opts).await
             }
-        }
-        let conn = Connection::open(path)?;
-        let db = Self::init(conn, true)?;
-
-        let reader_count = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(2, 8))
-            .unwrap_or(4);
-        let mut readers = Vec::with_capacity(reader_count);
-        for _ in 0..reader_count {
-            let rc = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            rc.pragma_update(None, "query_only", "ON")?;
-            rc.pragma_update(None, "foreign_keys", "ON")?;
-            rc.pragma_update(None, "busy_timeout", 5000)?;
-            readers.push(Mutex::new(rc));
-        }
-
-        Ok(Self {
-            conn: db.conn,
-            read_conns: Some(Arc::new(readers)),
-            next_reader: db.next_reader,
-        })
-    }
-
-    pub fn open_in_memory() -> BoardResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(conn, false)
-    }
-
-    fn init(mut conn: Connection, enable_wal: bool) -> BoardResult<Self> {
-        if enable_wal {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-        }
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
-        run_migrations(&mut conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            read_conns: None,
-            next_reader: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    pub fn with_conn<T, F>(&self, f: F) -> BoardResult<T>
-    where
-        F: FnOnce(&Connection) -> BoardResult<T>,
-    {
-        if let Some(readers) = &self.read_conns {
-            let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % readers.len();
-            for offset in 0..readers.len() {
-                let idx = (start + offset) % readers.len();
-                if let Ok(guard) = readers[idx].try_lock() {
-                    return f(&guard);
+            DbTarget::SqliteUrl(url) => {
+                let is_memory = url.contains(":memory:") || url.contains("mode=memory");
+                let base_opts = SqliteConnectOptions::from_str(url).map_err(|_| {
+                    BoardError::bad_request("invalid SQLite DATABASE_URL format")
+                })?;
+                if is_memory {
+                    let opts = base_opts
+                        .foreign_keys(true)
+                        .busy_timeout(Duration::from_secs(5));
+                    let writer = SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .idle_timeout(None)
+                        .max_lifetime(None)
+                        .connect_with(opts)
+                        .await?;
+                    Ok(Self {
+                        backend: DbBackend::Sqlite {
+                            writer,
+                            readers: None,
+                        },
+                    })
+                } else {
+                    let writer_opts = base_opts
+                        .clone()
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Wal)
+                        .synchronous(SqliteSynchronous::Normal)
+                        .foreign_keys(true)
+                        .busy_timeout(Duration::from_secs(5));
+                    let reader_opts = base_opts
+                        .read_only(true)
+                        .foreign_keys(true)
+                        .busy_timeout(Duration::from_secs(5))
+                        .pragma("query_only", "ON");
+                    Self::connect_sqlite_file(writer_opts, reader_opts).await
                 }
             }
-            let guard = readers[start]
-                .lock()
-                .map_err(|_| BoardError::internal("read database mutex poisoned"))?;
-            return f(&guard);
+            DbTarget::PostgresUrl(url) => {
+                let opts = PgConnectOptions::from_str(url)
+                    .map_err(|_| {
+                        BoardError::bad_request(
+                            "invalid PostgreSQL DATABASE_URL format (credentials redacted)",
+                        )
+                    })?
+                    .application_name("openboards");
+                let pool = PgPoolOptions::new()
+                    .max_connections(max_connections.max(1))
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect_with(opts)
+                    .await
+                    .map_err(|e| {
+                        BoardError::internal(format!(
+                            "failed to connect to {}: {e}",
+                            target.redacted_display()
+                        ))
+                    })?;
+                Ok(Self {
+                    backend: DbBackend::Postgres(pool),
+                })
+            }
         }
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|_| BoardError::internal("database mutex poisoned"))?;
-        f(&guard)
     }
 
-    pub fn with_tx<T, F>(&self, f: F) -> BoardResult<T>
-    where
-        F: FnOnce(&Transaction<'_>) -> BoardResult<T>,
-    {
-        let mut guard = self
-            .conn
-            .lock()
-            .map_err(|_| BoardError::internal("database mutex poisoned"))?;
-        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = f(&tx)?;
-        tx.commit()?;
-        Ok(result)
-    }
+    async fn connect_sqlite_file(
+        writer_opts: SqliteConnectOptions,
+        reader_opts: SqliteConnectOptions,
+    ) -> BoardResult<Self> {
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(writer_opts)
+            .await?;
+        // Ensure the database file and WAL journal are initialized before opening read-only pool.
+        let conn = writer.acquire().await?;
+        drop(conn);
 
-    pub fn schema_version(&self) -> BoardResult<i64> {
-        self.with_conn(|conn| {
-            let version: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM _migrations",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(version)
+        let reader_count = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8) as u32)
+            .unwrap_or(4);
+        let readers = SqlitePoolOptions::new()
+            .max_connections(reader_count)
+            .connect_with(reader_opts)
+            .await?;
+
+        Ok(Self {
+            backend: DbBackend::Sqlite {
+                writer,
+                readers: Some(readers),
+            },
         })
     }
-}
 
-/// Builds a comma-separated placeholder list (`?,?,...`) for `IN (...)` batch queries.
-pub fn sql_placeholders(count: usize) -> String {
-    if count == 0 {
-        return String::new();
-    }
-    let mut s = String::with_capacity(count * 2 - 1);
-    for i in 0..count {
-        if i > 0 {
-            s.push(',');
+    pub fn dialect(&self) -> Dialect {
+        match &self.backend {
+            DbBackend::Sqlite { .. } => Dialect::Sqlite,
+            DbBackend::Postgres(_) => Dialect::Postgres,
         }
-        s.push('?');
     }
-    s
-}
 
-fn run_migrations(conn: &mut Connection) -> BoardResult<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS _migrations (
-            version INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at TEXT NOT NULL
-        );
-        "#,
-    )?;
+    /// Returns a read-only handle implementing `Queryable`.
+    pub fn read_conn(&self) -> DbRead<'_> {
+        DbRead(self)
+    }
 
-    for migration in MIGRATIONS {
-        let applied: bool = conn
-            .query_row(
-                "SELECT 1 FROM _migrations WHERE version = ?1",
-                rusqlite::params![migration.version],
-                |_| Ok(true),
+    /// Begins a write transaction (`BEGIN IMMEDIATE` on SQLite, `BEGIN` on Postgres).
+    pub async fn begin_tx(&self) -> BoardResult<DbTx> {
+        match &self.backend {
+            DbBackend::Sqlite { writer, .. } => {
+                let tx = writer.begin_with("BEGIN IMMEDIATE").await?;
+                Ok(DbTx {
+                    backend: TxBackend::Sqlite(tx),
+                })
+            }
+            DbBackend::Postgres(pool) => {
+                let tx = pool.begin().await?;
+                Ok(DbTx {
+                    backend: TxBackend::Postgres(tx),
+                })
+            }
+        }
+    }
+
+    /// Serializes startup DDL migrations and first-boot seeding across replicas via a
+    /// PostgreSQL session advisory lock. No-op wrapper on SQLite.
+    pub async fn with_startup_lock<T, F, Fut>(&self, f: F) -> BoardResult<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = BoardResult<T>>,
+    {
+        match &self.backend {
+            DbBackend::Sqlite { .. } => f().await,
+            DbBackend::Postgres(pool) => {
+                let mut lock_conn = pool.acquire().await?;
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(STARTUP_LOCK_KEY)
+                    .execute(&mut *lock_conn)
+                    .await?;
+                let result = f().await;
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(STARTUP_LOCK_KEY)
+                    .execute(&mut *lock_conn)
+                    .await;
+                result
+            }
+        }
+    }
+
+    /// Applies all unapplied schema migrations (`001`–`012`).
+    pub async fn run_migrations(&self) -> BoardResult<()> {
+        let dialect = self.dialect();
+        let meta_ddl = match dialect {
+            Dialect::Sqlite => {
+                "CREATE TABLE IF NOT EXISTS _migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );"
+            }
+            Dialect::Postgres => {
+                "CREATE TABLE IF NOT EXISTS _migrations (
+                    version BIGINT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );"
+            }
+        };
+
+        {
+            let mut tx = self.begin_tx().await?;
+            execute_raw_ddl(&mut tx, meta_ddl).await?;
+            tx.commit().await?;
+        }
+
+        for migration in MIGRATIONS {
+            let applied = self
+                .read_conn()
+                .fetch_optional(
+                    "SELECT 1 FROM _migrations WHERE version = ?1",
+                    sql_args![migration.version],
+                )
+                .await?
+                .is_some();
+            if applied {
+                continue;
+            }
+
+            let ddl = migration.ddl_for(dialect);
+            let mut tx = self.begin_tx().await?;
+            // Re-check inside tx in case another startup race completed before us
+            let already = tx
+                .fetch_optional(
+                    "SELECT 1 FROM _migrations WHERE version = ?1",
+                    sql_args![migration.version],
+                )
+                .await?
+                .is_some();
+            if already {
+                tx.commit().await?;
+                continue;
+            }
+            execute_raw_ddl(&mut tx, ddl.as_ref()).await?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                sql_args![migration.version, migration.name, &now],
             )
-            .optional()?
-            .unwrap_or(false);
-        if applied {
-            continue;
+            .await?;
+            tx.commit().await?;
         }
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(migration.sql)?;
-        tx.execute(
-            "INSERT INTO _migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![migration.version, migration.name, Utc::now().to_rfc3339()],
-        )?;
-        tx.commit()?;
+
+        Ok(())
     }
 
+    /// Verifies live database connectivity with a 2-second timeout (used by `GET /readyz`).
+    pub async fn ping(&self) -> BoardResult<()> {
+        let fut = async {
+            let mut conn = self.read_conn();
+            let _ = conn.fetch_one("SELECT 1", sql_args![]).await?;
+            Ok::<(), BoardError>(())
+        };
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .map_err(|_| BoardError::internal("database readiness check timed out"))?
+    }
+
+    pub async fn schema_version(&self) -> BoardResult<i64> {
+        let mut conn = self.read_conn();
+        let row = conn
+            .fetch_one("SELECT COALESCE(MAX(version), 0) FROM _migrations", sql_args![])
+            .await?;
+        row.get_i64(0)
+    }
+
+    /// Exposes the underlying `PgPool` when running on PostgreSQL (used by Phase B `PgListener`).
+    pub fn pg_pool(&self) -> Option<&PgPool> {
+        match &self.backend {
+            DbBackend::Postgres(pool) => Some(pool),
+            DbBackend::Sqlite { .. } => None,
+        }
+    }
+}
+
+async fn execute_raw_ddl(tx: &mut DbTx, ddl: &str) -> BoardResult<()> {
+    match &mut tx.backend {
+        TxBackend::Sqlite(inner) => {
+            sqlx::raw_sql(ddl).execute(&mut **inner).await?;
+        }
+        TxBackend::Postgres(inner) => {
+            sqlx::raw_sql(ddl).execute(&mut **inner).await?;
+        }
+    }
     Ok(())
 }
 
@@ -735,51 +1561,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initializes_file_db_with_wal_and_foreign_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("openboards.db");
-        let db = Database::open(&db_path).unwrap();
-        let expected_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
-
-        assert_eq!(db.schema_version().unwrap(), expected_version);
-
-        db.with_conn(|conn| {
-            let journal_mode: String =
-                conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-            let foreign_keys: i64 =
-                conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-            assert_eq!(journal_mode.to_lowercase(), "wal");
-            assert_eq!(foreign_keys, 1);
-            Ok(())
-        })
-        .unwrap();
-
-        // Reopening is idempotent
-        let db2 = Database::open(&db_path).unwrap();
-        assert_eq!(db2.schema_version().unwrap(), expected_version);
-
-        // Read-only WAL pool enforces query_only = ON
-        let write_err = db2.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO server_meta (key, value) VALUES ('ro_test', '1')",
-                [],
-            )?;
-            Ok(())
-        });
-        assert!(write_err.is_err());
+    fn rewrites_placeholders_safely_for_postgres() {
+        assert_eq!(rewrite_placeholders_for_pg("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            rewrite_placeholders_for_pg("SELECT * FROM t WHERE a = ?1 AND b = ?2 AND c = ?1"),
+            "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $1"
+        );
+        // Non-sequential ?5 before ?4
+        assert_eq!(
+            rewrite_placeholders_for_pg("WHERE x LIKE ?5 OR y = ?4"),
+            "WHERE x LIKE $5 OR y = $4"
+        );
+        // Bare ? rewritten sequentially
+        assert_eq!(
+            rewrite_placeholders_for_pg("WHERE a = ? AND id IN (?,?,?)"),
+            "WHERE a = $1 AND id IN ($2,$3,$4)"
+        );
+        // Single-quoted literals, escaped quotes, comments, and double-quoted identifiers untouched
+        assert_eq!(
+            rewrite_placeholders_for_pg(
+                "SELECT 'what''s ?1?', \"col?2\" FROM t -- comment ?3\n/* block ?4 */ WHERE a = ?1"
+            ),
+            "SELECT 'what''s ?1?', \"col?2\" FROM t -- comment ?3\n/* block ?4 */ WHERE a = $1"
+        );
     }
 
     #[test]
-    fn initializes_in_memory_db_with_foreign_keys() {
-        let db = Database::open_in_memory().unwrap();
+    fn escapes_like_prefixes_and_builds_numbered_placeholders() {
+        assert_eq!(escape_like_prefix("v2_beta"), r"v2\_beta");
+        assert_eq!(escape_like_prefix(r"a%b\c_d"), r"a\%b\\c\_d");
+        assert_eq!(sql_placeholders(0), "");
+        assert_eq!(sql_placeholders(3), "?1,?2,?3");
+        assert_eq!(sql_placeholders_from(2, 3), "?2,?3,?4");
+    }
+
+    #[test]
+    fn generates_clean_postgres_ddl_for_all_migrations() {
+        assert_eq!(MIGRATIONS.len(), 12);
+        for m in MIGRATIONS {
+            let pg = m.ddl_for(Dialect::Postgres);
+            assert!(
+                !pg.contains("INTEGER"),
+                "migration {} still contains INTEGER in PG DDL",
+                m.name
+            );
+            assert!(
+                !pg.contains("AUTOINCREMENT"),
+                "migration {} still contains AUTOINCREMENT in PG DDL",
+                m.name
+            );
+            assert!(
+                !pg.contains("INSERT OR IGNORE"),
+                "migration {} still contains INSERT OR IGNORE in PG DDL",
+                m.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initializes_file_db_with_wal_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("openboards.db");
+        let db = Database::open(&db_path).await.unwrap();
         let expected_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
-        assert_eq!(db.schema_version().unwrap(), expected_version);
-        db.with_conn(|conn| {
-            let foreign_keys: i64 =
-                conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-            assert_eq!(foreign_keys, 1);
-            Ok(())
-        })
-        .unwrap();
+
+        assert_eq!(db.dialect(), Dialect::Sqlite);
+        assert_eq!(db.schema_version().await.unwrap(), expected_version);
+        db.ping().await.unwrap();
+
+        let mut conn = db.read_conn();
+        let jm = conn.fetch_one("PRAGMA journal_mode", sql_args![]).await.unwrap();
+        assert_eq!(jm.get_str(0).unwrap().to_lowercase(), "wal");
+        let fk = conn.fetch_one("PRAGMA foreign_keys", sql_args![]).await.unwrap();
+        assert_eq!(fk.get_i64(0).unwrap(), 1);
+
+        // Reopening is idempotent
+        let db2 = Database::open(&db_path).await.unwrap();
+        assert_eq!(db2.schema_version().await.unwrap(), expected_version);
+
+        // Read-only WAL pool enforces query_only = ON
+        let mut ro = db2.read_conn();
+        let write_err = ro
+            .execute(
+                "INSERT INTO server_meta (key, value) VALUES ('ro_test', '1')",
+                sql_args![],
+            )
+            .await;
+        assert!(write_err.is_err());
+    }
+
+    #[tokio::test]
+    async fn initializes_in_memory_db_with_foreign_keys() {
+        let db = Database::open_in_memory().await.unwrap();
+        let expected_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
+        assert_eq!(db.schema_version().await.unwrap(), expected_version);
+        db.ping().await.unwrap();
+        let mut conn = db.read_conn();
+        let fk = conn.fetch_one("PRAGMA foreign_keys", sql_args![]).await.unwrap();
+        assert_eq!(fk.get_i64(0).unwrap(), 1);
     }
 }

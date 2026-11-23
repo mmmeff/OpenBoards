@@ -24,8 +24,8 @@ async fn update_labels(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<UpdateLabelsInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let outcome = labels::update_labels(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let outcome = labels::update_labels(&state.db, &resolved.id, &id, &caller, input).await?;
     if let Some(seq) = outcome.event_seq {
         state.events.notify(&resolved.id, seq);
     }

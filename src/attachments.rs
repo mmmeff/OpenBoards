@@ -5,17 +5,17 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use chrono::Utc;
 use http_body_util::BodyExt;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::actors::CallerContext;
-use crate::db::{sql_placeholders, Database};
+use crate::db::{sql_placeholders, Database, Queryable, SqlArg};
 use crate::error::{BoardError, BoardResult};
 use crate::grants::{self, Grant};
 use crate::id::new_attachment_id;
 use crate::messages::AttachmentRef;
+use crate::sql_args;
 
 pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 pub const MAX_INLINE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
@@ -115,9 +115,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     hex
 }
 
-fn require_can_upload(db: &Database, board_id: &str, caller: &CallerContext) -> BoardResult<()> {
-    let board_grants = grants::load_grants(db, board_id)?;
-    // Must have `post` somewhere on the board (checking grant patterns and any narrowing patterns)
+async fn require_can_upload(
+    db: &Database,
+    board_id: &str,
+    caller: &CallerContext,
+) -> BoardResult<()> {
+    let board_grants = grants::load_grants(db, board_id).await?;
     let can_post_anywhere = grants::caller_permissions_at_pattern(&board_grants, caller, "*")
         .can_post_new_thread()
         || board_grants.iter().any(|g| {
@@ -236,7 +239,7 @@ pub async fn upload_inline(
 ) -> BoardResult<AttachmentRef> {
     let name = validate_filename(filename)?;
     let content_type = validate_content_type(content_type);
-    require_can_upload(db, board_id, caller)?;
+    require_can_upload(db, board_id, caller).await?;
 
     let att_id = new_attachment_id();
     let part = temp_part_path(data_dir, &att_id);
@@ -252,14 +255,23 @@ pub async fn upload_inline(
 
     let now = Utc::now().to_rfc3339();
     let uploader = caller.actor_id();
-    db.with_tx(|tx| {
-        tx.execute(
-            "INSERT INTO attachments (id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8)",
-            params![att_id, board_id, name, content_type, size as i64, sha256, uploader, now],
-        )?;
-        Ok(())
-    })?;
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "INSERT INTO attachments (id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8)",
+        sql_args![
+            &att_id,
+            board_id,
+            &name,
+            &content_type,
+            size as i64,
+            &sha256,
+            &uploader,
+            &now
+        ],
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(AttachmentRef {
         id: att_id,
@@ -270,7 +282,7 @@ pub async fn upload_inline(
 }
 
 /// Step 1 of streaming two-step upload (<= 100 MB): reserves an attachment ID.
-pub fn init_streaming_upload(
+pub async fn init_streaming_upload(
     db: &Database,
     board_id: &str,
     board_route_segment: &str,
@@ -287,22 +299,23 @@ pub fn init_streaming_upload(
             .with_status(StatusCode::PAYLOAD_TOO_LARGE));
         }
     }
-    require_can_upload(db, board_id, caller)?;
+    require_can_upload(db, board_id, caller).await?;
 
     let att_id = new_attachment_id();
     let now = Utc::now().to_rfc3339();
     let uploader = caller.actor_id();
 
-    db.with_tx(|tx| {
-        tx.execute(
-            "INSERT INTO attachments (id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 0, '', ?5, 'pending', ?6)",
-            params![att_id, board_id, name, content_type, uploader, now],
-        )?;
-        Ok(())
-    })?;
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "INSERT INTO attachments (id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0, '', ?5, 'pending', ?6)",
+        sql_args![&att_id, board_id, &name, &content_type, &uploader, &now],
+    )
+    .await?;
+    tx.commit().await?;
 
-    let upload_url = format!("/v1/messageboard/boards/{board_route_segment}/attachments/uploads/{att_id}");
+    let upload_url =
+        format!("/v1/messageboard/boards/{board_route_segment}/attachments/uploads/{att_id}");
     let complete_url = format!("{upload_url}/complete");
 
     Ok(InitUploadResult {
@@ -324,8 +337,11 @@ pub async fn put_streaming_upload(
     caller: &CallerContext,
     body: Body,
 ) -> BoardResult<UploadChunkResult> {
-    let rec = db.with_conn(|conn| load_attachment_tx(conn, board_id, att_id))?
-        .ok_or_else(|| BoardError::not_found(format!("upload '{att_id}' not found")))?;
+    let rec = {
+        let mut conn = db.read_conn();
+        load_attachment_tx(&mut conn, board_id, att_id).await?
+    }
+    .ok_or_else(|| BoardError::not_found(format!("upload '{att_id}' not found")))?;
 
     if !caller.owns_actor_item(&rec.uploader_actor) {
         return Err(BoardError::forbidden(
@@ -339,14 +355,14 @@ pub async fn put_streaming_upload(
     let part = temp_part_path(data_dir, att_id);
     let (size, sha256) = stream_body_to_file(body, &part, MAX_ATTACHMENT_BYTES, None).await?;
 
-    db.with_tx(|tx| {
-        tx.execute(
-            "UPDATE attachments SET size = ?1, sha256 = ?2, status = 'uploaded'
-             WHERE board_id = ?3 AND id = ?4",
-            params![size as i64, sha256, board_id, att_id],
-        )?;
-        Ok(())
-    })?;
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "UPDATE attachments SET size = ?1, sha256 = ?2, status = 'uploaded'
+         WHERE board_id = ?3 AND id = ?4",
+        sql_args![size as i64, &sha256, board_id, att_id],
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(UploadChunkResult {
         id: att_id.to_string(),
@@ -363,8 +379,11 @@ pub async fn complete_streaming_upload(
     att_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<AttachmentRef> {
-    let rec = db.with_conn(|conn| load_attachment_tx(conn, board_id, att_id))?
-        .ok_or_else(|| BoardError::not_found(format!("upload '{att_id}' not found")))?;
+    let rec = {
+        let mut conn = db.read_conn();
+        load_attachment_tx(&mut conn, board_id, att_id).await?
+    }
+    .ok_or_else(|| BoardError::not_found(format!("upload '{att_id}' not found")))?;
 
     if !caller.owns_actor_item(&rec.uploader_actor) {
         return Err(BoardError::forbidden(
@@ -383,43 +402,44 @@ pub async fn complete_streaming_upload(
     let part = temp_part_path(data_dir, att_id);
     commit_staged_blob(data_dir, &part, &rec.sha256).await?;
 
-    db.with_tx(|tx| {
-        tx.execute(
-            "UPDATE attachments SET status = 'ready' WHERE board_id = ?1 AND id = ?2",
-            params![board_id, att_id],
-        )?;
-        Ok(())
-    })?;
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "UPDATE attachments SET status = 'ready' WHERE board_id = ?1 AND id = ?2",
+        sql_args![board_id, att_id],
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(rec.to_ref())
 }
 
-pub fn load_attachment_tx(
-    conn: &Connection,
+pub async fn load_attachment_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     att_id: &str,
 ) -> BoardResult<Option<AttachmentRecord>> {
-    conn.query_row(
-        "SELECT id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at
-         FROM attachments
-         WHERE board_id = ?1 AND id = ?2",
-        params![board_id, att_id],
-        |r| {
-            Ok(AttachmentRecord {
-                id: r.get(0)?,
-                board_id: r.get(1)?,
-                name: r.get(2)?,
-                content_type: r.get(3)?,
-                size: r.get::<_, i64>(4)? as u64,
-                sha256: r.get(5)?,
-                uploader_actor: r.get(6)?,
-                status: r.get(7)?,
-                created_at: r.get(8)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, board_id, name, content_type, size, sha256, uploader_actor, status, created_at
+             FROM attachments
+             WHERE board_id = ?1 AND id = ?2",
+            sql_args![board_id, att_id],
+        )
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(AttachmentRecord {
+            id: r.get_str(0)?,
+            board_id: r.get_str(1)?,
+            name: r.get_str(2)?,
+            content_type: r.get_str(3)?,
+            size: r.get_i64(4)? as u64,
+            sha256: r.get_str(5)?,
+            uploader_actor: r.get_str(6)?,
+            status: r.get_str(7)?,
+            created_at: r.get_str(8)?,
+        })),
+    }
 }
 
 /// Checks whether `caller` is permitted to read/download or attach `att` on `board_id`:
@@ -429,8 +449,8 @@ pub fn load_attachment_tx(
 ///
 /// On tombstoned messages (where no live message references `att.id`), only uploader or `*`-read
 /// callers can access it.
-pub fn caller_can_access_attachment_tx(
-    conn: &Connection,
+pub async fn caller_can_access_attachment_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     board_grants: &[Grant],
     caller: &CallerContext,
@@ -443,15 +463,17 @@ pub fn caller_can_access_attachment_tx(
         return Ok(true);
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT m.channel
-         FROM message_attachments ma
-         JOIN messages m ON m.id = ma.message_id
-         WHERE ma.board_id = ?1 AND ma.attachment_id = ?2 AND m.deleted_at IS NULL",
-    )?;
-    let channels = stmt.query_map(params![board_id, att.id], |r| r.get::<_, String>(0))?;
-    for ch_res in channels {
-        let ch = ch_res?;
+    let rows = conn
+        .fetch_all(
+            "SELECT m.channel
+             FROM message_attachments ma
+             JOIN messages m ON m.id = ma.message_id
+             WHERE ma.board_id = ?1 AND ma.attachment_id = ?2 AND m.deleted_at IS NULL",
+            sql_args![board_id, &att.id],
+        )
+        .await?;
+    for r in rows {
+        let ch = r.get_str(0)?;
         if grants::caller_permissions_on_channel(board_grants, caller, &ch).can_read() {
             return Ok(true);
         }
@@ -460,8 +482,8 @@ pub fn caller_can_access_attachment_tx(
 }
 
 /// Validates and links attachments to a message inside a write transaction.
-pub fn validate_and_link_attachments_tx(
-    conn: &Connection,
+pub async fn validate_and_link_attachments_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     board_grants: &[Grant],
     caller: &CallerContext,
@@ -480,15 +502,15 @@ pub fn validate_and_link_attachments_tx(
         }
         seen.push(att_id.as_str());
 
-        let att = load_attachment_tx(conn, board_id, att_id)?.ok_or_else(|| {
-            BoardError::not_found(format!("attachment '{att_id}' not found"))
-        })?;
+        let att = load_attachment_tx(conn, board_id, att_id)
+            .await?
+            .ok_or_else(|| BoardError::not_found(format!("attachment '{att_id}' not found")))?;
         if att.status != "ready" {
             return Err(BoardError::bad_request(format!(
                 "attachment '{att_id}' is not ready"
             )));
         }
-        if !caller_can_access_attachment_tx(conn, board_id, board_grants, caller, &att)? {
+        if !caller_can_access_attachment_tx(conn, board_id, board_grants, caller, &att).await? {
             return Err(BoardError::forbidden(format!(
                 "caller cannot access attachment '{att_id}'"
             )));
@@ -496,40 +518,41 @@ pub fn validate_and_link_attachments_tx(
         conn.execute(
             "INSERT INTO message_attachments (board_id, message_id, attachment_id, idx)
              VALUES (?1, ?2, ?3, ?4)",
-            params![board_id, message_id, att_id, idx as i64],
-        )?;
+            sql_args![board_id, message_id, att_id, idx as i64],
+        )
+        .await?;
     }
     Ok(())
 }
 
-pub fn load_message_attachments_tx(
-    conn: &Connection,
+pub async fn load_message_attachments_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_id: &str,
 ) -> BoardResult<Vec<AttachmentRef>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT a.id, a.name, a.content_type, a.size
-         FROM message_attachments ma
-         JOIN attachments a ON a.id = ma.attachment_id
-         WHERE ma.message_id = ?1
-         ORDER BY ma.idx ASC",
-    )?;
-    let rows = stmt.query_map(params![message_id], |r| {
-        Ok(AttachmentRef {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            content_type: r.get(2)?,
-            size: r.get::<_, i64>(3)? as u64,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    let rows = conn
+        .fetch_all(
+            "SELECT a.id, a.name, a.content_type, a.size
+             FROM message_attachments ma
+             JOIN attachments a ON a.id = ma.attachment_id
+             WHERE ma.message_id = ?1
+             ORDER BY ma.idx ASC",
+            sql_args![message_id],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(AttachmentRef {
+            id: r.get_str(0)?,
+            name: r.get_str(1)?,
+            content_type: r.get_str(2)?,
+            size: r.get_i64(3)? as u64,
+        });
     }
     Ok(out)
 }
 
-pub fn load_messages_attachments_batch_tx(
-    conn: &Connection,
+pub async fn load_messages_attachments_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     message_ids: &[&str],
 ) -> BoardResult<HashMap<String, Vec<AttachmentRef>>> {
     let mut out: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
@@ -545,20 +568,16 @@ pub fn load_messages_attachments_batch_tx(
              ORDER BY ma.message_id ASC, ma.idx ASC",
             sql_placeholders(chunk.len())
         );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                AttachmentRef {
-                    id: r.get(1)?,
-                    name: r.get(2)?,
-                    content_type: r.get(3)?,
-                    size: r.get::<_, i64>(4)? as u64,
-                },
-            ))
-        })?;
-        for row in rows {
-            let (mid, att) = row?;
+        let args: Vec<SqlArg<'_>> = chunk.iter().copied().map(SqlArg::from).collect();
+        let rows = conn.fetch_all(&sql, &args).await?;
+        for r in rows {
+            let mid = r.get_str(0)?;
+            let att = AttachmentRef {
+                id: r.get_str(1)?,
+                name: r.get_str(2)?,
+                content_type: r.get_str(3)?,
+                size: r.get_i64(4)? as u64,
+            };
             out.entry(mid).or_default().push(att);
         }
     }
@@ -566,26 +585,28 @@ pub fn load_messages_attachments_batch_tx(
 }
 
 /// Resolves an attachment for download, enforcing visibility and tombstone rules.
-pub fn authorize_download(
+pub async fn authorize_download(
     db: &Database,
     board_id: &str,
     att_id: &str,
     caller: &CallerContext,
 ) -> BoardResult<AttachmentRecord> {
-    db.with_conn(|conn| {
-        let att = load_attachment_tx(conn, board_id, att_id)?
-            .ok_or_else(|| BoardError::not_found(format!("attachment '{att_id}' not found")))?;
-        if att.status != "ready" {
-            return Err(BoardError::not_found(format!("attachment '{att_id}' not found")));
-        }
-        let board_grants = grants::load_grants_tx(conn, board_id)?;
-        if !caller_can_access_attachment_tx(conn, board_id, &board_grants, caller, &att)? {
-            return Err(BoardError::forbidden(format!(
-                "not permitted to download attachment '{att_id}'"
-            )));
-        }
-        Ok(att)
-    })
+    let mut conn = db.read_conn();
+    let att = load_attachment_tx(&mut conn, board_id, att_id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("attachment '{att_id}' not found")))?;
+    if att.status != "ready" {
+        return Err(BoardError::not_found(format!(
+            "attachment '{att_id}' not found"
+        )));
+    }
+    let board_grants = grants::load_grants_tx(&mut conn, board_id).await?;
+    if !caller_can_access_attachment_tx(&mut conn, board_id, &board_grants, caller, &att).await? {
+        return Err(BoardError::forbidden(format!(
+            "not permitted to download attachment '{att_id}'"
+        )));
+    }
+    Ok(att)
 }
 
 #[cfg(test)]

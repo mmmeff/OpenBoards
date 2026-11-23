@@ -64,8 +64,8 @@ async fn register_source(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<RegisterSyncSourceInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (source, created) = sync::register_source(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (source, created) = sync::register_source(&state.db, &resolved.id, &caller, input).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -80,8 +80,8 @@ async fn list_sources(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let sources = sync::list_sources(&state.db, &resolved.id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let sources = sync::list_sources(&state.db, &resolved.id, &caller).await?;
     Ok(Json(json!({ "sources": sources })))
 }
 
@@ -91,8 +91,8 @@ async fn delete_source(
     Path((board, key)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let deleted = sync::delete_source(&state.db, &resolved.id, &key, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let deleted = sync::delete_source(&state.db, &resolved.id, &key, &caller).await?;
     Ok(Json(json!({ "ok": true, "deleted": deleted })))
 }
 
@@ -102,8 +102,8 @@ async fn get_inbox(
     Path((board, key)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let events = sync::get_inbox(&state.db, &resolved.id, &key, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let events = sync::get_inbox(&state.db, &resolved.id, &key, &caller).await?;
     Ok(Json(json!({ "inbox": events })))
 }
 
@@ -113,9 +113,9 @@ async fn get_source_records(
     Path((board, key)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let (source, links, deliveries) =
-        sync::get_source_records(&state.db, &resolved.id, &key, &caller)?;
+        sync::get_source_records(&state.db, &resolved.id, &key, &caller).await?;
     Ok(Json(json!({
         "source": source,
         "links": links,
@@ -129,8 +129,8 @@ async fn list_thread_links(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let targets = sync::list_thread_links(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let targets = sync::list_thread_links(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!({ "targets": targets })))
 }
 
@@ -141,8 +141,8 @@ async fn link_thread(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<LinkThreadInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (link, seqs) = sync::link_thread(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let (link, seqs) = sync::link_thread(&state.db, &resolved.id, &id, &caller, input).await?;
     for seq in seqs {
         state.events.notify(&resolved.id, seq);
     }
@@ -159,8 +159,8 @@ async fn find_linked(
     Path(board): Path<String>,
     Query(query): Query<LinkedQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let thread = sync::find_linked_thread(&state.db, &resolved.id, &query.url, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let thread = sync::find_linked_thread(&state.db, &resolved.id, &query.url, &caller).await?;
     Ok(Json(json!(thread)))
 }
 
@@ -171,8 +171,8 @@ async fn send_typing(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<TypingInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let targets = sync::send_typing(&state.db, &resolved.id, &id, &caller, input).await?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let targets = sync::send_typing(&state, &resolved.id, &id, &caller, input).await?;
     Ok(Json(json!({ "targets": targets })))
 }
 
@@ -182,7 +182,7 @@ async fn webhook_global(
     headers: HeaderMap,
     body: Bytes,
 ) -> BoardResult<Json<Value>> {
-    let res = sync::handle_inbound_webhook(&state, None, &key, &headers, &body)?;
+    let res = sync::handle_inbound_webhook(&state, None, &key, &headers, &body).await?;
     Ok(Json(res))
 }
 
@@ -192,23 +192,23 @@ async fn webhook_board(
     headers: HeaderMap,
     body: Bytes,
 ) -> BoardResult<Json<Value>> {
-    let board_view = state
-        .db
-        .with_tx(|tx| {
-            if let Some(b) = boards::find_board_tx(tx, &board)? {
-                return Ok(Some(b));
-            }
-            if board.eq_ignore_ascii_case(boards::DEFAULT_BOARD_NAME) {
-                return Ok(Some(boards::ensure_default_board_tx(tx)?));
-            }
-            Ok(None)
-        })?
-        .ok_or_else(|| {
-            crate::error::BoardError::new(
-                crate::error::ErrorCode::BoardNotFound,
-                format!("board '{board}' not found"),
-            )
-        })?;
-    let res = sync::handle_inbound_webhook(&state, Some(&board_view.id), &key, &headers, &body)?;
+    let board_view = {
+        let mut conn = state.db.read_conn();
+        if let Some(b) = boards::find_board_tx(&mut conn, &board).await? {
+            Some(b)
+        } else if board.eq_ignore_ascii_case(boards::DEFAULT_BOARD_NAME) {
+            Some(boards::ensure_default_board(&state.db).await?)
+        } else {
+            None
+        }
+    }
+    .ok_or_else(|| {
+        crate::error::BoardError::new(
+            crate::error::ErrorCode::BoardNotFound,
+            format!("board '{board}' not found"),
+        )
+    })?;
+    let res =
+        sync::handle_inbound_webhook(&state, Some(&board_view.id), &key, &headers, &body).await?;
     Ok(Json(res))
 }

@@ -27,8 +27,8 @@ async fn board_me(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let board_grants = grants::load_grants(&state.db, &resolved.id)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let board_grants = grants::load_grants(&state.db, &resolved.id).await?;
     let can = grants::summarize_caller_can(&board_grants, &caller);
     let mut view = serde_json::to_value(caller.whoami_view())
         .map_err(|e| crate::error::BoardError::internal(format!("serialization error: {e}")))?;
@@ -45,15 +45,15 @@ async fn list_actors(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let board_grants = grants::load_grants(&state.db, &resolved.id)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let board_grants = grants::load_grants(&state.db, &resolved.id).await?;
     let has_wildcard_read =
         grants::caller_permissions_at_pattern(&board_grants, &caller, "*").can_read();
 
-    let actors = state.db.with_conn(|conn| {
-        actors::list_board_actors(conn, &resolved.id, has_wildcard_read, |channel| {
-            grants::caller_permissions_on_channel(&board_grants, &caller, channel).can_read()
-        })
-    })?;
+    let mut conn = state.db.read_conn();
+    let actors = actors::list_board_actors(&mut conn, &resolved.id, has_wildcard_read, |channel| {
+        grants::caller_permissions_on_channel(&board_grants, &caller, channel).can_read()
+    })
+    .await?;
     Ok(Json(json!({ "actors": actors })))
 }

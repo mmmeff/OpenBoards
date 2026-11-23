@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::actors::{self, ActorView, CallerContext};
+use crate::db::Queryable;
 use crate::error::{BoardError, BoardResult};
 use crate::validate::{validate_channel_path, validate_channel_pattern, validate_label_key};
 
@@ -98,20 +98,17 @@ pub struct FilterContext {
 }
 
 impl FilterContext {
-    pub fn build(
-        conn: &Connection,
+    pub async fn build<C: Queryable + ?Sized>(
+        conn: &mut C,
         caller: &CallerContext,
         visible_actors: &[ActorView],
         filter: &QueryFilter,
     ) -> BoardResult<Self> {
         let mentions_target_ids = match &filter.mentions {
             None => None,
-            Some(raw) => Some(resolve_mentions_filter_targets(
-                conn,
-                caller,
-                visible_actors,
-                raw,
-            )?),
+            Some(raw) => Some(
+                resolve_mentions_filter_targets(conn, caller, visible_actors, raw).await?,
+            ),
         };
         Ok(Self {
             caller_actor_id: caller.actor_id(),
@@ -122,8 +119,8 @@ impl FilterContext {
     }
 }
 
-fn resolve_mentions_filter_targets(
-    conn: &Connection,
+async fn resolve_mentions_filter_targets<C: Queryable + ?Sized>(
+    conn: &mut C,
     caller: &CallerContext,
     visible_actors: &[ActorView],
     raw: &str,
@@ -138,9 +135,8 @@ fn resolve_mentions_filter_targets(
     if trimmed.contains(':') {
         return Ok(vec![trimmed.to_string()]);
     }
-    // Check email lookup (only return if actor is visible or is caller)
     if trimmed.contains('@') {
-        if let Some(u) = actors::lookup_user_by_identifier(conn, trimmed)? {
+        if let Some(u) = actors::lookup_user_by_identifier(conn, trimmed).await? {
             let pid = format!("user:{}", u.id);
             if pid == caller.principal_id() || visible_actors.iter().any(|a| a.id == pid) {
                 return Ok(vec![pid]);
@@ -148,7 +144,6 @@ fn resolve_mentions_filter_targets(
         }
         return Ok(Vec::new());
     }
-    // Match against visible actors by handle (and also check caller's own handle)
     let mut ids: Vec<String> = visible_actors
         .iter()
         .filter(|a| a.handle.eq_ignore_ascii_case(trimmed))
@@ -279,7 +274,11 @@ fn matches_by_filter(by_filter: &str, ctx: &FilterContext, snap: &MessageSnapsho
 mod tests {
     use super::*;
 
-    fn snap(channel: &str, labels: &[(&str, &str)], root_labels: Option<&[(&str, &str)]>) -> MessageSnapshot {
+    fn snap(
+        channel: &str,
+        labels: &[(&str, &str)],
+        root_labels: Option<&[(&str, &str)]>,
+    ) -> MessageSnapshot {
         MessageSnapshot {
             id: "msg_2".to_string(),
             channel: channel.to_string(),
@@ -319,7 +318,6 @@ mod tests {
         let p_alt = LabelPredicate::parse("status=open|draft").unwrap();
         let p_bug = LabelPredicate::parse("kind=bug").unwrap();
 
-        // Reply carries kind=bug, root carries status=draft
         let s = snap("www/prod", &[("kind", "bug")], Some(&[("status", "draft")]));
 
         let filter = QueryFilter {
@@ -333,7 +331,6 @@ mod tests {
         let ctx = base_ctx(Some(vec!["user:u2".to_string()]));
         assert!(filter.matches_snapshot(&s, &ctx));
 
-        // Exact status=open does NOT match status=draft
         let filter_open = QueryFilter {
             labels: vec![p_exact],
             ..Default::default()

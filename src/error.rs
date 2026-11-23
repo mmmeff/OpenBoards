@@ -238,10 +238,34 @@ impl fmt::Display for BoardError {
 
 impl std::error::Error for BoardError {}
 
-impl From<rusqlite::Error> for BoardError {
-    fn from(err: rusqlite::Error) -> Self {
+impl From<sqlx::Error> for BoardError {
+    fn from(err: sqlx::Error) -> Self {
         Self::internal(format!("database error: {err}"))
     }
+}
+
+/// Returns true if `err` is a SQLite or PostgreSQL unique-constraint violation.
+pub fn is_unique_violation(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = err {
+        if db_err.is_unique_violation() {
+            return true;
+        }
+        if let Some(code) = db_err.code() {
+            return matches!(code.as_ref(), "23505" | "2067" | "1555");
+        }
+    }
+    false
+}
+
+/// Returns true if `err` is a retryable transaction serialization / deadlock error
+/// (PostgreSQL `40P01` deadlock_detected or `40001` serialization_failure).
+pub fn is_retryable_tx_error(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = err {
+        if let Some(code) = db_err.code() {
+            return matches!(code.as_ref(), "40P01" | "40001");
+        }
+    }
+    false
 }
 
 impl IntoResponse for BoardError {

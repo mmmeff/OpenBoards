@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::db::Database;
-use crate::error::{BoardError, BoardResult};
+use crate::db::{Database, DbRow, Queryable};
+use crate::error::{is_unique_violation, BoardError, BoardResult};
 use crate::id::{
     hash_token, new_app_id, new_bearer_token, new_project_id, new_token_id, new_user_id,
 };
 use crate::permissions::{NarrowingPolicy, Permission, Permissions};
+use crate::sql_args;
 use crate::validate::{validate_avatar_url, validate_profile_name, validate_slug};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,142 +391,155 @@ pub struct ActorView {
 
 /// Ensures a bootstrap `owner` user and initial bearer token exist on startup.
 /// Returns `Some(plaintext_token)` only if a brand-new token was created.
-pub fn bootstrap_owner(db: &Database, configured_token: Option<&str>) -> BoardResult<Option<String>> {
-    db.with_tx(|tx| {
-        let owner_id: String = match tx
-            .query_row(
-                "SELECT id FROM users WHERE role = 'owner' AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1",
-                [],
-                |row| row.get(0),
+pub async fn bootstrap_owner(
+    db: &Database,
+    configured_token: Option<&str>,
+) -> BoardResult<Option<String>> {
+    let mut tx = db.begin_tx().await?;
+    tx.advisory_xact_lock("bootstrap", "owner").await?;
+
+    let owner_id: String = match tx
+        .fetch_optional(
+            "SELECT id FROM users WHERE role = 'owner' AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1",
+            sql_args![],
+        )
+        .await?
+    {
+        Some(row) => row.get_str(0)?,
+        None => {
+            let id = new_user_id();
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO users (id, username, username_lower, email, email_lower, name, role, avatar, created_at)
+                 VALUES (?1, 'admin', 'admin', 'admin@local', 'admin@local', 'Admin', 'owner', NULL, ?2)",
+                sql_args![&id, &now],
             )
-            .optional()?
-        {
-            Some(id) => id,
-            None => {
-                let id = new_user_id();
-                let now = Utc::now().to_rfc3339();
-                tx.execute(
-                    "INSERT INTO users (id, username, username_lower, email, email_lower, name, role, avatar, created_at)
-                     VALUES (?1, 'admin', 'admin', 'admin@local', 'admin@local', 'Admin', 'owner', NULL, ?2)",
-                    params![id, now],
-                )?;
-                id
-            }
-        };
-
-        if let Some(raw_token) = configured_token {
-            if raw_token.trim().is_empty() {
-                return Err(BoardError::bad_request(
-                    "configured admin token cannot be empty",
-                ));
-            }
-            let digest = hash_token(raw_token);
-            let exists: bool = tx
-                .query_row(
-                    "SELECT 1 FROM tokens WHERE token_hash = ?1 AND revoked_at IS NULL",
-                    params![digest],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if !exists {
-                let tok_id = new_token_id();
-                let now = Utc::now().to_rfc3339();
-                tx.execute(
-                    "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
-                     VALUES (?1, ?2, 'user', ?3, NULL, 'bootstrap-owner', ?4)",
-                    params![tok_id, digest, owner_id, now],
-                )?;
-            }
-            return Ok(None);
+            .await?;
+            id
         }
+    };
 
-        let active_tokens: i64 = tx.query_row(
+    if let Some(raw_token) = configured_token {
+        if raw_token.trim().is_empty() {
+            return Err(BoardError::bad_request(
+                "configured admin token cannot be empty",
+            ));
+        }
+        let digest = hash_token(raw_token);
+        let exists = tx
+            .fetch_optional(
+                "SELECT 1 FROM tokens WHERE token_hash = ?1 AND revoked_at IS NULL",
+                sql_args![&digest],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            let tok_id = new_token_id();
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
+                 VALUES (?1, ?2, 'user', ?3, NULL, 'bootstrap-owner', ?4)",
+                sql_args![&tok_id, &digest, &owner_id, &now],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let active_tokens = tx
+        .fetch_one(
             "SELECT COUNT(*) FROM tokens WHERE revoked_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        if active_tokens > 0 {
-            return Ok(None);
-        }
+            sql_args![],
+        )
+        .await?
+        .get_i64(0)?;
+    if active_tokens > 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
 
-        let plaintext = new_bearer_token();
-        let digest = hash_token(&plaintext);
-        let tok_id = new_token_id();
-        let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
-             VALUES (?1, ?2, 'user', ?3, NULL, 'bootstrap-owner', ?4)",
-            params![tok_id, digest, owner_id, now],
-        )?;
-        Ok(Some(plaintext))
-    })
+    let plaintext = new_bearer_token();
+    let digest = hash_token(&plaintext);
+    let tok_id = new_token_id();
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
+         VALUES (?1, ?2, 'user', ?3, NULL, 'bootstrap-owner', ?4)",
+        sql_args![&tok_id, &digest, &owner_id, &now],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(plaintext))
 }
 
 /// Resolves a raw bearer token to its active `Principal`.
-pub fn authenticate_bearer_token(db: &Database, raw_token: &str) -> BoardResult<Principal> {
+pub async fn authenticate_bearer_token(db: &Database, raw_token: &str) -> BoardResult<Principal> {
     let digest = hash_token(raw_token);
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare_cached(
+    let mut conn = db.read_conn();
+    let row = conn
+        .fetch_optional(
             "SELECT principal_kind, principal_id, environment
              FROM tokens
              WHERE token_hash = ?1 AND revoked_at IS NULL",
-        )?;
-        let row: Option<(String, String, Option<String>)> = stmt
-            .query_row(params![digest], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .optional()?;
+            sql_args![&digest],
+        )
+        .await?
+        .ok_or_else(|| BoardError::unauthorized("invalid or revoked bearer token"))?;
 
-        let (kind, pid, env) = row.ok_or_else(|| {
-            BoardError::unauthorized("invalid or revoked bearer token")
-        })?;
+    let kind = row.get_str(0)?;
+    let pid = row.get_str(1)?;
+    let env = row.get_opt_str(2)?;
 
-        match kind.as_str() {
-            "user" => {
-                let user = get_active_user_by_id(conn, &pid)?
-                    .ok_or_else(|| BoardError::unauthorized("user account is revoked or missing"))?;
-                Ok(Principal::User {
-                    id: user.id,
-                    username: user.username,
-                    email: user.email,
-                    name: user.name,
-                    role: user.role,
-                    avatar: user.avatar,
-                })
-            }
-            "project" => {
-                let project = get_active_project_by_id(conn, &pid)?
-                    .ok_or_else(|| BoardError::unauthorized("project is revoked or missing"))?;
-                Ok(Principal::Project {
-                    id: project.id,
-                    name: project.name,
-                    environment: env.unwrap_or_else(|| "production".to_string()),
-                })
-            }
-            "app" => {
-                let app = get_active_app_by_id(conn, &pid)?
-                    .ok_or_else(|| BoardError::unauthorized("app is revoked or missing"))?;
-                Ok(Principal::App {
-                    id: app.id,
-                    slug: app.slug,
-                    name: app.name,
-                    scopes: app.scopes,
-                })
-            }
-            other => Err(BoardError::internal(format!(
-                "corrupted token principal_kind '{other}'"
-            ))),
+    match kind.as_str() {
+        "user" => {
+            let user = get_active_user_by_id(&mut conn, &pid)
+                .await?
+                .ok_or_else(|| BoardError::unauthorized("user account is revoked or missing"))?;
+            Ok(Principal::User {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                name: user.name,
+                role: user.role,
+                avatar: user.avatar,
+            })
         }
-    })
+        "project" => {
+            let project = get_active_project_by_id(&mut conn, &pid)
+                .await?
+                .ok_or_else(|| BoardError::unauthorized("project is revoked or missing"))?;
+            Ok(Principal::Project {
+                id: project.id,
+                name: project.name,
+                environment: env.unwrap_or_else(|| "production".to_string()),
+            })
+        }
+        "app" => {
+            let app = get_active_app_by_id(&mut conn, &pid)
+                .await?
+                .ok_or_else(|| BoardError::unauthorized("app is revoked or missing"))?;
+            Ok(Principal::App {
+                id: app.id,
+                slug: app.slug,
+                name: app.name,
+                scopes: app.scopes,
+            })
+        }
+        other => Err(BoardError::internal(format!(
+            "corrupted token principal_kind '{other}'"
+        ))),
+    }
 }
 
 /// Resolves an active (non-revoked) `Principal` from its canonical principal ID
 /// (`user:<id>`, `project:<id>:<env>`, or `app:<id>`).
-pub fn resolve_active_principal_tx(
-    conn: &Connection,
+pub async fn resolve_active_principal_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     principal_id: &str,
 ) -> BoardResult<Option<Principal>> {
     if let Some(uid) = principal_id.strip_prefix("user:") {
-        let Some(user) = get_active_user_by_id(conn, uid)? else {
+        let Some(user) = get_active_user_by_id(conn, uid).await? else {
             return Ok(None);
         };
         return Ok(Some(Principal::User {
@@ -542,7 +555,7 @@ pub fn resolve_active_principal_tx(
         let Some((pid, env)) = rest.split_once(':') else {
             return Ok(None);
         };
-        let Some(project) = get_active_project_by_id(conn, pid)? else {
+        let Some(project) = get_active_project_by_id(conn, pid).await? else {
             return Ok(None);
         };
         return Ok(Some(Principal::Project {
@@ -552,7 +565,7 @@ pub fn resolve_active_principal_tx(
         }));
     }
     if let Some(aid) = principal_id.strip_prefix("app:") {
-        let Some(app) = get_active_app_by_id(conn, aid)? else {
+        let Some(app) = get_active_app_by_id(conn, aid).await? else {
             return Ok(None);
         };
         return Ok(Some(Principal::App {
@@ -566,54 +579,63 @@ pub fn resolve_active_principal_tx(
 }
 
 /// Implicitly registers a profile (on first write) and records actor activity on `(board_id, channel)`.
-pub fn record_actor_write_tx(
-    conn: &Connection,
+pub async fn record_actor_write_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     channel: &str,
     caller: &CallerContext,
 ) -> BoardResult<()> {
     let now = Utc::now().to_rfc3339();
     if let Some(profile) = &caller.profile {
+        let pid = caller.principal_id();
         conn.execute(
             "INSERT INTO profiles (principal_id, name_lower, name, avatar, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(principal_id, name_lower) DO UPDATE SET
                avatar = COALESCE(excluded.avatar, profiles.avatar),
                updated_at = excluded.updated_at",
-            params![
-                caller.principal_id(),
-                profile.name_lower,
-                profile.name,
-                profile.avatar,
-                now
+            sql_args![
+                &pid,
+                &profile.name_lower,
+                &profile.name,
+                &profile.avatar,
+                &now
             ],
-        )?;
+        )
+        .await?;
     }
 
+    let aid = caller.actor_id();
     conn.execute(
         "INSERT INTO actor_activity (board_id, channel, actor_id, first_seen_at, last_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?4)
          ON CONFLICT(board_id, channel, actor_id) DO UPDATE SET
            last_seen_at = excluded.last_seen_at",
-        params![board_id, channel, caller.actor_id(), now],
-    )?;
+        sql_args![board_id, channel, &aid, &now],
+    )
+    .await?;
 
     Ok(())
 }
 
 /// Public helper for registering an actor's profile and channel activity outside an existing tx.
-pub fn record_actor_write(
+pub async fn record_actor_write(
     db: &Database,
     board_id: &str,
     channel: &str,
     caller: &CallerContext,
 ) -> BoardResult<()> {
-    db.with_tx(|tx| record_actor_write_tx(tx, board_id, channel, caller))
+    let mut tx = db.begin_tx().await?;
+    record_actor_write_tx(&mut tx, board_id, channel, caller).await?;
+    tx.commit().await
 }
 
 /// Resolves any canonical actor ID (`user:<id>`, `user:<id>+<profile>`, `project:<id>:<env>[+<profile>]`, `app:<id>[+<profile>]`)
 /// into an `ActorView`.
-pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Option<ActorView>> {
+pub async fn resolve_actor_view<C: Queryable + ?Sized>(
+    conn: &mut C,
+    actor_id: &str,
+) -> BoardResult<Option<ActorView>> {
     let (principal_part, profile_part) = match actor_id.split_once('+') {
         Some((p, prof)) => (p, Some(prof)),
         None => (actor_id, None),
@@ -621,25 +643,27 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
 
     let (base_kind, base_handle, base_name, base_avatar) =
         if let Some(uid) = principal_part.strip_prefix("user:") {
-            let mut stmt = conn.prepare_cached(
-                "SELECT username, name, avatar FROM users WHERE id = ?1",
-            )?;
-            let row: Option<(String, String, Option<String>)> = stmt
-                .query_row(params![uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            let Some((username, name, avatar)) = row else {
+            let Some(row) = conn
+                .fetch_optional(
+                    "SELECT username, name, avatar FROM users WHERE id = ?1",
+                    sql_args![uid],
+                )
+                .await?
+            else {
                 return Ok(None);
             };
-            ("user", username, name, avatar)
+            ("user", row.get_str(0)?, row.get_str(1)?, row.get_opt_str(2)?)
         } else if let Some(rest) = principal_part.strip_prefix("project:") {
             let Some((pid, env)) = rest.split_once(':') else {
                 return Ok(None);
             };
-            let mut stmt = conn.prepare_cached("SELECT name FROM projects WHERE id = ?1")?;
-            let name: Option<String> = stmt.query_row(params![pid], |r| r.get(0)).optional()?;
-            let Some(name) = name else {
+            let Some(row) = conn
+                .fetch_optional("SELECT name FROM projects WHERE id = ?1", sql_args![pid])
+                .await?
+            else {
                 return Ok(None);
             };
+            let name = row.get_str(0)?;
             let display = if env == "production" {
                 name.clone()
             } else {
@@ -647,28 +671,31 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
             };
             ("project", name, display, None)
         } else if let Some(aid) = principal_part.strip_prefix("app:") {
-            let mut stmt = conn.prepare_cached("SELECT slug, name FROM apps WHERE id = ?1")?;
-            let row: Option<(String, String)> = stmt
-                .query_row(params![aid], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let Some((slug, name)) = row else {
+            let Some(row) = conn
+                .fetch_optional(
+                    "SELECT slug, name FROM apps WHERE id = ?1",
+                    sql_args![aid],
+                )
+                .await?
+            else {
                 return Ok(None);
             };
-            ("app", slug, name, None)
+            ("app", row.get_str(0)?, row.get_str(1)?, None)
         } else {
             return Ok(None);
         };
 
     if let Some(prof_lower) = profile_part {
-        let mut stmt = conn.prepare_cached(
-            "SELECT name, avatar FROM profiles WHERE principal_id = ?1 AND name_lower = ?2",
-        )?;
-        let prof_row: Option<(String, Option<String>)> = stmt
-            .query_row(params![principal_part, prof_lower], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        let (prof_name, prof_avatar) = prof_row.unwrap_or_else(|| (prof_lower.to_string(), None));
+        let prof_row = conn
+            .fetch_optional(
+                "SELECT name, avatar FROM profiles WHERE principal_id = ?1 AND name_lower = ?2",
+                sql_args![principal_part, prof_lower],
+            )
+            .await?;
+        let (prof_name, prof_avatar) = match prof_row {
+            Some(r) => (r.get_str(0)?, r.get_opt_str(1)?),
+            None => (prof_lower.to_string(), None),
+        };
         if prof_lower.contains(":user:") {
             let handle_seg = prof_name
                 .to_ascii_lowercase()
@@ -714,16 +741,17 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
 }
 
 /// Resolves display handles for a batch of actor IDs, looking up each unique actor only once.
-pub fn resolve_actor_handles_batch_tx<'a>(
-    conn: &Connection,
-    actor_ids: impl IntoIterator<Item = &'a str>,
+pub async fn resolve_actor_handles_batch_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    actor_ids: &[&str],
 ) -> BoardResult<HashMap<String, String>> {
     let mut handles = HashMap::new();
-    for actor_id in actor_ids {
+    for &actor_id in actor_ids {
         if handles.contains_key(actor_id) {
             continue;
         }
-        let handle = resolve_actor_view(conn, actor_id)?
+        let handle = resolve_actor_view(conn, actor_id)
+            .await?
             .map(|a| a.handle)
             .unwrap_or_else(|| actor_id.to_string());
         handles.insert(actor_id.to_string(), handle);
@@ -735,25 +763,27 @@ pub fn resolve_actor_handles_batch_tx<'a>(
 /// If `has_wildcard_read` is true, board-level (`channel == ""`) entries are also visible,
 /// while channel-scoped entries still verify `can_read_channel(channel)` so private/closed
 /// channels never leak hidden actors.
-pub fn list_board_actors<F>(
-    conn: &Connection,
+pub async fn list_board_actors<C, F>(
+    conn: &mut C,
     board_id: &str,
     has_wildcard_read: bool,
     mut can_read_channel: F,
 ) -> BoardResult<Vec<ActorView>>
 where
+    C: Queryable + ?Sized,
     F: FnMut(&str) -> bool,
 {
-    let mut stmt = conn.prepare(
-        "SELECT actor_id, channel FROM actor_activity WHERE board_id = ?1 ORDER BY actor_id ASC",
-    )?;
-    let rows = stmt.query_map(params![board_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = conn
+        .fetch_all(
+            "SELECT actor_id, channel FROM actor_activity WHERE board_id = ?1 ORDER BY actor_id ASC",
+            sql_args![board_id],
+        )
+        .await?;
 
     let mut visible_ids: Vec<String> = Vec::new();
     for row in rows {
-        let (actor_id, channel) = row?;
+        let actor_id = row.get_str(0)?;
+        let channel = row.get_str(1)?;
         let visible = if channel.is_empty() {
             has_wildcard_read
         } else {
@@ -766,7 +796,7 @@ where
 
     let mut actors = Vec::with_capacity(visible_ids.len());
     for actor_id in visible_ids {
-        if let Some(view) = resolve_actor_view(conn, &actor_id)? {
+        if let Some(view) = resolve_actor_view(conn, &actor_id).await? {
             actors.push(view);
         }
     }
@@ -785,7 +815,7 @@ pub struct CreateUserInput {
     pub avatar: Option<String>,
 }
 
-pub fn create_user(db: &Database, input: CreateUserInput) -> BoardResult<UserRecord> {
+pub async fn create_user(db: &Database, input: CreateUserInput) -> BoardResult<UserRecord> {
     let username = input.username.trim().to_ascii_lowercase();
     validate_slug("username", &username)?;
     let email = input.email.trim().to_string();
@@ -807,63 +837,69 @@ pub fn create_user(db: &Database, input: CreateUserInput) -> BoardResult<UserRec
     let id = new_user_id();
     let now = Utc::now().to_rfc3339();
 
-    db.with_tx(|tx| {
-        let dup: bool = tx
-            .query_row(
-                "SELECT 1 FROM users WHERE username_lower = ?1 OR email_lower = ?2",
-                params![username, email_lower],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if dup {
+    let mut tx = db.begin_tx().await?;
+    let dup = tx
+        .fetch_optional(
+            "SELECT 1 FROM users WHERE username_lower = ?1 OR email_lower = ?2",
+            sql_args![&username, &email_lower],
+        )
+        .await?
+        .is_some();
+    if dup {
+        return Err(BoardError::conflict(
+            "a user with that username or email already exists",
+        ));
+    }
+
+    if let Err(err) = tx
+        .execute_raw_err(
+            "INSERT INTO users (id, username, username_lower, email, email_lower, name, role, avatar, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            sql_args![
+                &id,
+                &username,
+                &username,
+                &email,
+                &email_lower,
+                &name,
+                role.as_str(),
+                &input.avatar,
+                &now
+            ],
+        )
+        .await
+    {
+        if is_unique_violation(&err) {
             return Err(BoardError::conflict(
                 "a user with that username or email already exists",
             ));
         }
+        return Err(err.into());
+    }
+    tx.commit().await?;
 
-        tx.execute(
-            "INSERT INTO users (id, username, username_lower, email, email_lower, name, role, avatar, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                username,
-                username,
-                email,
-                email_lower,
-                name,
-                role.as_str(),
-                input.avatar,
-                now
-            ],
-        )?;
-
-        Ok(UserRecord {
-            id,
-            username,
-            email,
-            name,
-            role,
-            avatar: input.avatar,
-            revoked_at: None,
-            created_at: now,
-        })
+    Ok(UserRecord {
+        id,
+        username,
+        email,
+        name,
+        role,
+        avatar: input.avatar,
+        revoked_at: None,
+        created_at: now,
     })
 }
 
-pub fn list_users(db: &Database) -> BoardResult<Vec<UserRecord>> {
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
+pub async fn list_users(db: &Database) -> BoardResult<Vec<UserRecord>> {
+    let mut conn = db.read_conn();
+    let rows = conn
+        .fetch_all(
             "SELECT id, username, email, name, role, avatar, revoked_at, created_at
              FROM users ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], map_user_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
+            sql_args![],
+        )
+        .await?;
+    rows.iter().map(map_user_row).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -873,52 +909,61 @@ pub struct UpdateUserInput {
     pub avatar: Option<Option<String>>,
 }
 
-pub fn update_user(db: &Database, id: &str, input: UpdateUserInput) -> BoardResult<UserRecord> {
+pub async fn update_user(
+    db: &Database,
+    id: &str,
+    input: UpdateUserInput,
+) -> BoardResult<UserRecord> {
     if let Some(Some(avatar)) = &input.avatar {
         validate_avatar_url(avatar)?;
     }
-    db.with_tx(|tx| {
-        let mut user = get_user_by_id(tx, id)?
-            .ok_or_else(|| BoardError::not_found(format!("user '{id}' not found")))?;
-        if let Some(name) = input.name {
-            let trimmed = name.trim();
-            if trimmed.is_empty() {
-                return Err(BoardError::bad_request("name cannot be blank"));
-            }
-            user.name = trimmed.to_string();
+    let mut tx = db.begin_tx().await?;
+    let mut user = get_user_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("user '{id}' not found")))?;
+    if let Some(name) = input.name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(BoardError::bad_request("name cannot be blank"));
         }
-        if let Some(role) = input.role {
-            user.role = role;
-        }
-        if let Some(avatar) = input.avatar {
-            user.avatar = avatar;
-        }
-        tx.execute(
-            "UPDATE users SET name = ?1, role = ?2, avatar = ?3 WHERE id = ?4",
-            params![user.name, user.role.as_str(), user.avatar, user.id],
-        )?;
-        Ok(user)
-    })
+        user.name = trimmed.to_string();
+    }
+    if let Some(role) = input.role {
+        user.role = role;
+    }
+    if let Some(avatar) = input.avatar {
+        user.avatar = avatar;
+    }
+    tx.execute(
+        "UPDATE users SET name = ?1, role = ?2, avatar = ?3 WHERE id = ?4",
+        sql_args![&user.name, user.role.as_str(), &user.avatar, &user.id],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(user)
 }
 
-pub fn revoke_user(db: &Database, id: &str) -> BoardResult<UserRecord> {
+pub async fn revoke_user(db: &Database, id: &str) -> BoardResult<UserRecord> {
     let now = Utc::now().to_rfc3339();
-    db.with_tx(|tx| {
-        let mut user = get_user_by_id(tx, id)?
-            .ok_or_else(|| BoardError::not_found(format!("user '{id}' not found")))?;
-        if user.revoked_at.is_none() {
-            tx.execute(
-                "UPDATE users SET revoked_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-            tx.execute(
-                "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'user' AND principal_id = ?2 AND revoked_at IS NULL",
-                params![now, id],
-            )?;
-            user.revoked_at = Some(now);
-        }
-        Ok(user)
-    })
+    let mut tx = db.begin_tx().await?;
+    let mut user = get_user_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("user '{id}' not found")))?;
+    if user.revoked_at.is_none() {
+        tx.execute(
+            "UPDATE users SET revoked_at = ?1 WHERE id = ?2",
+            sql_args![&now, id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'user' AND principal_id = ?2 AND revoked_at IS NULL",
+            sql_args![&now, id],
+        )
+        .await?;
+        user.revoked_at = Some(now);
+    }
+    tx.commit().await?;
+    Ok(user)
 }
 
 #[derive(Debug, Deserialize)]
@@ -926,71 +971,83 @@ pub struct CreateProjectInput {
     pub name: String,
 }
 
-pub fn create_project(db: &Database, input: CreateProjectInput) -> BoardResult<ProjectRecord> {
+pub async fn create_project(
+    db: &Database,
+    input: CreateProjectInput,
+) -> BoardResult<ProjectRecord> {
     let name = input.name.trim().to_ascii_lowercase();
     validate_slug("project name", &name)?;
     let id = new_project_id();
     let now = Utc::now().to_rfc3339();
 
-    db.with_tx(|tx| {
-        let dup: bool = tx
-            .query_row(
-                "SELECT 1 FROM projects WHERE name_lower = ?1",
-                params![name],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if dup {
+    let mut tx = db.begin_tx().await?;
+    let dup = tx
+        .fetch_optional(
+            "SELECT 1 FROM projects WHERE name_lower = ?1",
+            sql_args![&name],
+        )
+        .await?
+        .is_some();
+    if dup {
+        return Err(BoardError::conflict(format!(
+            "project '{name}' already exists"
+        )));
+    }
+    if let Err(err) = tx
+        .execute_raw_err(
+            "INSERT INTO projects (id, name, name_lower, created_at) VALUES (?1, ?2, ?3, ?4)",
+            sql_args![&id, &name, &name, &now],
+        )
+        .await
+    {
+        if is_unique_violation(&err) {
             return Err(BoardError::conflict(format!(
                 "project '{name}' already exists"
             )));
         }
-        tx.execute(
-            "INSERT INTO projects (id, name, name_lower, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, name, now],
-        )?;
-        Ok(ProjectRecord {
-            id,
-            name,
-            revoked_at: None,
-            created_at: now,
-        })
+        return Err(err.into());
+    }
+    tx.commit().await?;
+    Ok(ProjectRecord {
+        id,
+        name,
+        revoked_at: None,
+        created_at: now,
     })
 }
 
-pub fn list_projects(db: &Database) -> BoardResult<Vec<ProjectRecord>> {
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
+pub async fn list_projects(db: &Database) -> BoardResult<Vec<ProjectRecord>> {
+    let mut conn = db.read_conn();
+    let rows = conn
+        .fetch_all(
             "SELECT id, name, revoked_at, created_at FROM projects ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], map_project_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
+            sql_args![],
+        )
+        .await?;
+    rows.iter().map(map_project_row).collect()
 }
 
-pub fn revoke_project(db: &Database, id: &str) -> BoardResult<ProjectRecord> {
+pub async fn revoke_project(db: &Database, id: &str) -> BoardResult<ProjectRecord> {
     let now = Utc::now().to_rfc3339();
-    db.with_tx(|tx| {
-        let mut project = get_project_by_id(tx, id)?
-            .ok_or_else(|| BoardError::not_found(format!("project '{id}' not found")))?;
-        if project.revoked_at.is_none() {
-            tx.execute(
-                "UPDATE projects SET revoked_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-            tx.execute(
-                "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'project' AND principal_id = ?2 AND revoked_at IS NULL",
-                params![now, id],
-            )?;
-            project.revoked_at = Some(now);
-        }
-        Ok(project)
-    })
+    let mut tx = db.begin_tx().await?;
+    let mut project = get_project_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("project '{id}' not found")))?;
+    if project.revoked_at.is_none() {
+        tx.execute(
+            "UPDATE projects SET revoked_at = ?1 WHERE id = ?2",
+            sql_args![&now, id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'project' AND principal_id = ?2 AND revoked_at IS NULL",
+            sql_args![&now, id],
+        )
+        .await?;
+        project.revoked_at = Some(now);
+    }
+    tx.commit().await?;
+    Ok(project)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1000,7 +1057,7 @@ pub struct CreateAppInput {
     pub scopes: Permissions,
 }
 
-pub fn create_app(db: &Database, input: CreateAppInput) -> BoardResult<AppRecord> {
+pub async fn create_app(db: &Database, input: CreateAppInput) -> BoardResult<AppRecord> {
     let slug = input.slug.trim().to_ascii_lowercase();
     validate_slug("app slug", &slug)?;
     let name = input
@@ -1013,46 +1070,51 @@ pub fn create_app(db: &Database, input: CreateAppInput) -> BoardResult<AppRecord
     let id = new_app_id();
     let now = Utc::now().to_rfc3339();
 
-    db.with_tx(|tx| {
-        let dup: bool = tx
-            .query_row(
-                "SELECT 1 FROM apps WHERE slug_lower = ?1",
-                params![slug],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if dup {
-            return Err(BoardError::conflict(format!("app '{slug}' already exists")));
-        }
-        tx.execute(
+    let mut tx = db.begin_tx().await?;
+    let dup = tx
+        .fetch_optional(
+            "SELECT 1 FROM apps WHERE slug_lower = ?1",
+            sql_args![&slug],
+        )
+        .await?
+        .is_some();
+    if dup {
+        return Err(BoardError::conflict(format!("app '{slug}' already exists")));
+    }
+    let scopes_csv = input.scopes.to_csv();
+    if let Err(err) = tx
+        .execute_raw_err(
             "INSERT INTO apps (id, slug, slug_lower, name, scopes, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, slug, slug, name, input.scopes.to_csv(), now],
-        )?;
-        Ok(AppRecord {
-            id,
-            slug,
-            name,
-            scopes: input.scopes,
-            revoked_at: None,
-            created_at: now,
-        })
+            sql_args![&id, &slug, &slug, &name, &scopes_csv, &now],
+        )
+        .await
+    {
+        if is_unique_violation(&err) {
+            return Err(BoardError::conflict(format!("app '{slug}' already exists")));
+        }
+        return Err(err.into());
+    }
+    tx.commit().await?;
+    Ok(AppRecord {
+        id,
+        slug,
+        name,
+        scopes: input.scopes,
+        revoked_at: None,
+        created_at: now,
     })
 }
 
-pub fn list_apps(db: &Database) -> BoardResult<Vec<AppRecord>> {
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
+pub async fn list_apps(db: &Database) -> BoardResult<Vec<AppRecord>> {
+    let mut conn = db.read_conn();
+    let rows = conn
+        .fetch_all(
             "SELECT id, slug, name, scopes, revoked_at, created_at FROM apps ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], map_app_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
+            sql_args![],
+        )
+        .await?;
+    rows.iter().map(map_app_row).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1061,46 +1123,52 @@ pub struct UpdateAppInput {
     pub scopes: Option<Permissions>,
 }
 
-pub fn update_app(db: &Database, id: &str, input: UpdateAppInput) -> BoardResult<AppRecord> {
-    db.with_tx(|tx| {
-        let mut app = get_app_by_id(tx, id)?
-            .ok_or_else(|| BoardError::not_found(format!("app '{id}' not found")))?;
-        if let Some(name) = input.name {
-            let trimmed = name.trim();
-            if trimmed.is_empty() {
-                return Err(BoardError::bad_request("app name cannot be blank"));
-            }
-            app.name = trimmed.to_string();
+pub async fn update_app(db: &Database, id: &str, input: UpdateAppInput) -> BoardResult<AppRecord> {
+    let mut tx = db.begin_tx().await?;
+    let mut app = get_app_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("app '{id}' not found")))?;
+    if let Some(name) = input.name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(BoardError::bad_request("app name cannot be blank"));
         }
-        if let Some(scopes) = input.scopes {
-            app.scopes = scopes;
-        }
-        tx.execute(
-            "UPDATE apps SET name = ?1, scopes = ?2 WHERE id = ?3",
-            params![app.name, app.scopes.to_csv(), app.id],
-        )?;
-        Ok(app)
-    })
+        app.name = trimmed.to_string();
+    }
+    if let Some(scopes) = input.scopes {
+        app.scopes = scopes;
+    }
+    let scopes_csv = app.scopes.to_csv();
+    tx.execute(
+        "UPDATE apps SET name = ?1, scopes = ?2 WHERE id = ?3",
+        sql_args![&app.name, &scopes_csv, &app.id],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(app)
 }
 
-pub fn revoke_app(db: &Database, id: &str) -> BoardResult<AppRecord> {
+pub async fn revoke_app(db: &Database, id: &str) -> BoardResult<AppRecord> {
     let now = Utc::now().to_rfc3339();
-    db.with_tx(|tx| {
-        let mut app = get_app_by_id(tx, id)?
-            .ok_or_else(|| BoardError::not_found(format!("app '{id}' not found")))?;
-        if app.revoked_at.is_none() {
-            tx.execute(
-                "UPDATE apps SET revoked_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-            tx.execute(
-                "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'app' AND principal_id = ?2 AND revoked_at IS NULL",
-                params![now, id],
-            )?;
-            app.revoked_at = Some(now);
-        }
-        Ok(app)
-    })
+    let mut tx = db.begin_tx().await?;
+    let mut app = get_app_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("app '{id}' not found")))?;
+    if app.revoked_at.is_none() {
+        tx.execute(
+            "UPDATE apps SET revoked_at = ?1 WHERE id = ?2",
+            sql_args![&now, id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE tokens SET revoked_at = ?1 WHERE principal_kind = 'app' AND principal_id = ?2 AND revoked_at IS NULL",
+            sql_args![&now, id],
+        )
+        .await?;
+        app.revoked_at = Some(now);
+    }
+    tx.commit().await?;
+    Ok(app)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1111,7 +1179,7 @@ pub struct CreateTokenInput {
     pub label: Option<String>,
 }
 
-pub fn create_token(db: &Database, input: CreateTokenInput) -> BoardResult<CreatedToken> {
+pub async fn create_token(db: &Database, input: CreateTokenInput) -> BoardResult<CreatedToken> {
     let kind = input.principal_kind.trim().to_ascii_lowercase();
     let pid = input.principal_id.trim().to_string();
     let env = match kind.as_str() {
@@ -1145,166 +1213,145 @@ pub fn create_token(db: &Database, input: CreateTokenInput) -> BoardResult<Creat
     let tok_id = new_token_id();
     let now = Utc::now().to_rfc3339();
 
-    db.with_tx(|tx| {
-        let principal_str = match kind.as_str() {
-            "user" => {
-                if get_active_user_by_id(tx, &pid)?.is_none() {
-                    return Err(BoardError::not_found(format!("active user '{pid}' not found")));
-                }
-                format!("user:{pid}")
+    let mut tx = db.begin_tx().await?;
+    let principal_str = match kind.as_str() {
+        "user" => {
+            if get_active_user_by_id(&mut tx, &pid).await?.is_none() {
+                return Err(BoardError::not_found(format!(
+                    "active user '{pid}' not found"
+                )));
             }
-            "project" => {
-                if get_active_project_by_id(tx, &pid)?.is_none() {
-                    return Err(BoardError::not_found(format!(
-                        "active project '{pid}' not found"
-                    )));
-                }
-                format!("project:{pid}:{}", env.as_deref().unwrap_or("production"))
+            format!("user:{pid}")
+        }
+        "project" => {
+            if get_active_project_by_id(&mut tx, &pid).await?.is_none() {
+                return Err(BoardError::not_found(format!(
+                    "active project '{pid}' not found"
+                )));
             }
-            "app" => {
-                if get_active_app_by_id(tx, &pid)?.is_none() {
-                    return Err(BoardError::not_found(format!("active app '{pid}' not found")));
-                }
-                format!("app:{pid}")
+            format!("project:{pid}:{}", env.as_deref().unwrap_or("production"))
+        }
+        "app" => {
+            if get_active_app_by_id(&mut tx, &pid).await?.is_none() {
+                return Err(BoardError::not_found(format!(
+                    "active app '{pid}' not found"
+                )));
             }
-            _ => unreachable!(),
-        };
+            format!("app:{pid}")
+        }
+        _ => unreachable!(),
+    };
 
-        tx.execute(
-            "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![tok_id, digest, kind, pid, env, input.label, now],
-        )?;
+    tx.execute(
+        "INSERT INTO tokens (id, token_hash, principal_kind, principal_id, environment, label, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        sql_args![&tok_id, &digest, &kind, &pid, &env, &input.label, &now],
+    )
+    .await?;
+    tx.commit().await?;
 
-        Ok(CreatedToken {
-            id: tok_id,
-            token: plaintext,
-            principal: principal_str,
-            label: input.label,
-            created_at: now,
-        })
+    Ok(CreatedToken {
+        id: tok_id,
+        token: plaintext,
+        principal: principal_str,
+        label: input.label,
+        created_at: now,
     })
 }
 
-pub fn list_tokens(db: &Database) -> BoardResult<Vec<TokenSummary>> {
-    db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
+pub async fn list_tokens(db: &Database) -> BoardResult<Vec<TokenSummary>> {
+    let mut conn = db.read_conn();
+    let rows = conn
+        .fetch_all(
             "SELECT id, principal_kind, principal_id, environment, label, revoked_at, created_at
              FROM tokens ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let kind: String = r.get(1)?;
-            let pid: String = r.get(2)?;
-            let env: Option<String> = r.get(3)?;
-            let principal = format_principal_str(&kind, &pid, env.as_deref());
-            Ok(TokenSummary {
-                id: r.get(0)?,
-                principal,
-                principal_kind: kind,
-                principal_id: pid,
-                environment: env,
-                label: r.get(4)?,
-                revoked_at: r.get(5)?,
-                created_at: r.get(6)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
+            sql_args![],
+        )
+        .await?;
+    rows.iter().map(map_token_summary_row).collect()
 }
 
-pub fn revoke_token(db: &Database, id: &str) -> BoardResult<TokenSummary> {
+pub async fn revoke_token(db: &Database, id: &str) -> BoardResult<TokenSummary> {
     let now = Utc::now().to_rfc3339();
-    db.with_tx(|tx| {
-        let mut tok: TokenSummary = tx
-            .query_row(
-                "SELECT id, principal_kind, principal_id, environment, label, revoked_at, created_at
-                 FROM tokens WHERE id = ?1",
-                params![id],
-                |r| {
-                    let kind: String = r.get(1)?;
-                    let pid: String = r.get(2)?;
-                    let env: Option<String> = r.get(3)?;
-                    let principal = format_principal_str(&kind, &pid, env.as_deref());
-                    Ok(TokenSummary {
-                        id: r.get(0)?,
-                        principal,
-                        principal_kind: kind,
-                        principal_id: pid,
-                        environment: env,
-                        label: r.get(4)?,
-                        revoked_at: r.get(5)?,
-                        created_at: r.get(6)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| BoardError::not_found(format!("token '{id}' not found")))?;
+    let mut tx = db.begin_tx().await?;
+    let row = tx
+        .fetch_optional(
+            "SELECT id, principal_kind, principal_id, environment, label, revoked_at, created_at
+             FROM tokens WHERE id = ?1",
+            sql_args![id],
+        )
+        .await?
+        .ok_or_else(|| BoardError::not_found(format!("token '{id}' not found")))?;
+    let mut tok = map_token_summary_row(&row)?;
 
-        if tok.revoked_at.is_none() {
-            tx.execute(
-                "UPDATE tokens SET revoked_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-            tok.revoked_at = Some(now);
-        }
-        Ok(tok)
-    })
+    if tok.revoked_at.is_none() {
+        tx.execute(
+            "UPDATE tokens SET revoked_at = ?1 WHERE id = ?2",
+            sql_args![&now, id],
+        )
+        .await?;
+        tok.revoked_at = Some(now);
+    }
+    tx.commit().await?;
+    Ok(tok)
 }
 
 // --- Lookup helpers used by Grants and Explain ---
 
-pub fn lookup_user_by_identifier(conn: &Connection, ident: &str) -> BoardResult<Option<UserRecord>> {
+pub async fn lookup_user_by_identifier<C: Queryable + ?Sized>(
+    conn: &mut C,
+    ident: &str,
+) -> BoardResult<Option<UserRecord>> {
     let trimmed = ident.trim();
     let id_candidate = trimmed.strip_prefix("user:").unwrap_or(trimmed);
     let lower = id_candidate.to_ascii_lowercase();
-    conn.query_row(
-        "SELECT id, username, email, name, role, avatar, revoked_at, created_at
-         FROM users
-         WHERE id = ?1 OR email_lower = ?2 OR username_lower = ?2
-         LIMIT 1",
-        params![id_candidate, lower],
-        map_user_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, username, email, name, role, avatar, revoked_at, created_at
+             FROM users
+             WHERE id = ?1 OR email_lower = ?2 OR username_lower = ?2
+             LIMIT 1",
+            sql_args![id_candidate, &lower],
+        )
+        .await?;
+    row.as_ref().map(map_user_row).transpose()
 }
 
-pub fn lookup_project_by_identifier(
-    conn: &Connection,
+pub async fn lookup_project_by_identifier<C: Queryable + ?Sized>(
+    conn: &mut C,
     ident: &str,
 ) -> BoardResult<Option<ProjectRecord>> {
     let trimmed = ident.trim();
     let lower = trimmed.to_ascii_lowercase();
-    conn.query_row(
-        "SELECT id, name, revoked_at, created_at
-         FROM projects
-         WHERE id = ?1 OR name_lower = ?2
-         LIMIT 1",
-        params![trimmed, lower],
-        map_project_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, name, revoked_at, created_at
+             FROM projects
+             WHERE id = ?1 OR name_lower = ?2
+             LIMIT 1",
+            sql_args![trimmed, &lower],
+        )
+        .await?;
+    row.as_ref().map(map_project_row).transpose()
 }
 
-pub fn lookup_app_by_identifier(conn: &Connection, ident: &str) -> BoardResult<Option<AppRecord>> {
+pub async fn lookup_app_by_identifier<C: Queryable + ?Sized>(
+    conn: &mut C,
+    ident: &str,
+) -> BoardResult<Option<AppRecord>> {
     let trimmed = ident.trim();
     let id_candidate = trimmed.strip_prefix("app:").unwrap_or(trimmed);
     let lower = id_candidate.to_ascii_lowercase();
-    conn.query_row(
-        "SELECT id, slug, name, scopes, revoked_at, created_at
-         FROM apps
-         WHERE id = ?1 OR slug_lower = ?2
-         LIMIT 1",
-        params![id_candidate, lower],
-        map_app_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT id, slug, name, scopes, revoked_at, created_at
+             FROM apps
+             WHERE id = ?1 OR slug_lower = ?2
+             LIMIT 1",
+            sql_args![id_candidate, &lower],
+        )
+        .await?;
+    row.as_ref().map(map_app_row).transpose()
 }
 
 pub fn parse_profile_headers(
@@ -1377,106 +1424,141 @@ fn format_principal_str(kind: &str, pid: &str, env: Option<&str>) -> String {
     }
 }
 
-fn get_user_by_id(conn: &Connection, id: &str) -> BoardResult<Option<UserRecord>> {
-    conn.query_row(
-        "SELECT id, username, email, name, role, avatar, revoked_at, created_at
-         FROM users WHERE id = ?1",
-        params![id],
-        map_user_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_user_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<UserRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, username, email, name, role, avatar, revoked_at, created_at
+             FROM users WHERE id = ?1",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_user_row).transpose()
 }
 
-fn get_active_user_by_id(conn: &Connection, id: &str) -> BoardResult<Option<UserRecord>> {
-    conn.query_row(
-        "SELECT id, username, email, name, role, avatar, revoked_at, created_at
-         FROM users WHERE id = ?1 AND revoked_at IS NULL",
-        params![id],
-        map_user_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_active_user_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<UserRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, username, email, name, role, avatar, revoked_at, created_at
+             FROM users WHERE id = ?1 AND revoked_at IS NULL",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_user_row).transpose()
 }
 
-fn get_project_by_id(conn: &Connection, id: &str) -> BoardResult<Option<ProjectRecord>> {
-    conn.query_row(
-        "SELECT id, name, revoked_at, created_at FROM projects WHERE id = ?1",
-        params![id],
-        map_project_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_project_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<ProjectRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, name, revoked_at, created_at FROM projects WHERE id = ?1",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_project_row).transpose()
 }
 
-fn get_active_project_by_id(conn: &Connection, id: &str) -> BoardResult<Option<ProjectRecord>> {
-    conn.query_row(
-        "SELECT id, name, revoked_at, created_at FROM projects WHERE id = ?1 AND revoked_at IS NULL",
-        params![id],
-        map_project_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_active_project_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<ProjectRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, name, revoked_at, created_at FROM projects WHERE id = ?1 AND revoked_at IS NULL",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_project_row).transpose()
 }
 
-fn get_app_by_id(conn: &Connection, id: &str) -> BoardResult<Option<AppRecord>> {
-    conn.query_row(
-        "SELECT id, slug, name, scopes, revoked_at, created_at FROM apps WHERE id = ?1",
-        params![id],
-        map_app_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_app_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<AppRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, slug, name, scopes, revoked_at, created_at FROM apps WHERE id = ?1",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_app_row).transpose()
 }
 
-fn get_active_app_by_id(conn: &Connection, id: &str) -> BoardResult<Option<AppRecord>> {
-    conn.query_row(
-        "SELECT id, slug, name, scopes, revoked_at, created_at FROM apps WHERE id = ?1 AND revoked_at IS NULL",
-        params![id],
-        map_app_row,
-    )
-    .optional()
-    .map_err(Into::into)
+async fn get_active_app_by_id<C: Queryable + ?Sized>(
+    conn: &mut C,
+    id: &str,
+) -> BoardResult<Option<AppRecord>> {
+    let row = conn
+        .fetch_optional(
+            "SELECT id, slug, name, scopes, revoked_at, created_at FROM apps WHERE id = ?1 AND revoked_at IS NULL",
+            sql_args![id],
+        )
+        .await?;
+    row.as_ref().map(map_app_row).transpose()
 }
 
-fn map_user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
-    let role_str: String = r.get(4)?;
+fn map_user_row(r: &DbRow) -> BoardResult<UserRecord> {
+    let role_str = r.get_str(4)?;
     let role = TeamRole::parse(&role_str).unwrap_or(TeamRole::None);
     Ok(UserRecord {
-        id: r.get(0)?,
-        username: r.get(1)?,
-        email: r.get(2)?,
-        name: r.get(3)?,
+        id: r.get_str(0)?,
+        username: r.get_str(1)?,
+        email: r.get_str(2)?,
+        name: r.get_str(3)?,
         role,
-        avatar: r.get(5)?,
-        revoked_at: r.get(6)?,
-        created_at: r.get(7)?,
+        avatar: r.get_opt_str(5)?,
+        revoked_at: r.get_opt_str(6)?,
+        created_at: r.get_str(7)?,
     })
 }
 
-fn map_project_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
+fn map_project_row(r: &DbRow) -> BoardResult<ProjectRecord> {
     Ok(ProjectRecord {
-        id: r.get(0)?,
-        name: r.get(1)?,
-        revoked_at: r.get(2)?,
-        created_at: r.get(3)?,
+        id: r.get_str(0)?,
+        name: r.get_str(1)?,
+        revoked_at: r.get_opt_str(2)?,
+        created_at: r.get_str(3)?,
     })
 }
 
-fn map_app_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AppRecord> {
-    let scopes_csv: String = r.get(3)?;
+fn map_app_row(r: &DbRow) -> BoardResult<AppRecord> {
+    let scopes_csv = r.get_str(3)?;
     let scopes = if scopes_csv.is_empty() {
         Permissions::NONE
     } else {
         Permissions::parse_spec_str(&scopes_csv).unwrap_or(Permissions::NONE)
     };
     Ok(AppRecord {
-        id: r.get(0)?,
-        slug: r.get(1)?,
-        name: r.get(2)?,
+        id: r.get_str(0)?,
+        slug: r.get_str(1)?,
+        name: r.get_str(2)?,
         scopes,
-        revoked_at: r.get(4)?,
-        created_at: r.get(5)?,
+        revoked_at: r.get_opt_str(4)?,
+        created_at: r.get_str(5)?,
+    })
+}
+
+fn map_token_summary_row(r: &DbRow) -> BoardResult<TokenSummary> {
+    let kind = r.get_str(1)?;
+    let pid = r.get_str(2)?;
+    let env = r.get_opt_str(3)?;
+    let principal = format_principal_str(&kind, &pid, env.as_deref());
+    Ok(TokenSummary {
+        id: r.get_str(0)?,
+        principal,
+        principal_kind: kind,
+        principal_id: pid,
+        environment: env,
+        label: r.get_opt_str(4)?,
+        revoked_at: r.get_opt_str(5)?,
+        created_at: r.get_str(6)?,
     })
 }
 
@@ -1535,13 +1617,9 @@ mod tests {
         assert_eq!(p.name_lower, "fx");
         assert_eq!(p.avatar.as_deref(), Some("https://a.test/x.png"));
 
-        // Matching case-insensitive headers succeed
         assert!(parse_profile_headers(Some("Fx"), Some("fx"), None).is_ok());
-        // Conflicting headers fail
         assert!(parse_profile_headers(Some("fx"), Some("codex"), None).is_err());
-        // Avatar without profile fails
         assert!(parse_profile_headers(None, None, Some("https://a.test/x.png")).is_err());
-        // Invalid profile name fails
         assert!(parse_profile_headers(Some("1bad"), None, None).is_err());
 
         assert!(!parse_sandboxed_header(None).unwrap());
@@ -1551,20 +1629,21 @@ mod tests {
         assert!(parse_sandboxed_header(Some("maybe")).is_err());
     }
 
-    #[test]
-    fn bootstrap_and_token_auth_lifecycle() {
-        let db = Database::open_in_memory().unwrap();
-        let tok = bootstrap_owner(&db, None).unwrap().expect("initial token");
+    #[tokio::test]
+    async fn bootstrap_and_token_auth_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let tok = bootstrap_owner(&db, None)
+            .await
+            .unwrap()
+            .expect("initial token");
         assert!(tok.starts_with("ob_"));
 
-        // Idempotent second bootstrap generates nothing
-        assert!(bootstrap_owner(&db, None).unwrap().is_none());
+        assert!(bootstrap_owner(&db, None).await.unwrap().is_none());
 
-        let principal = authenticate_bearer_token(&db, &tok).unwrap();
+        let principal = authenticate_bearer_token(&db, &tok).await.unwrap();
         assert!(principal.is_owner());
         assert_eq!(principal.handle(), "admin");
 
-        // Create user, project, app, and tokens
         let u = create_user(
             &db,
             CreateUserInput {
@@ -1575,6 +1654,7 @@ mod tests {
                 avatar: None,
             },
         )
+        .await
         .unwrap();
         let u_tok = create_token(
             &db,
@@ -1585,8 +1665,9 @@ mod tests {
                 label: Some("cli".to_string()),
             },
         )
+        .await
         .unwrap();
-        let auth_u = authenticate_bearer_token(&db, &u_tok.token).unwrap();
+        let auth_u = authenticate_bearer_token(&db, &u_tok.token).await.unwrap();
         assert_eq!(auth_u.principal_id(), format!("user:{}", u.id));
         assert_eq!(auth_u.role(), Some(TeamRole::Developer));
 
@@ -1596,6 +1677,7 @@ mod tests {
                 name: "support".to_string(),
             },
         )
+        .await
         .unwrap();
         let p_tok = create_token(
             &db,
@@ -1606,8 +1688,9 @@ mod tests {
                 label: None,
             },
         )
+        .await
         .unwrap();
-        let auth_p = authenticate_bearer_token(&db, &p_tok.token).unwrap();
+        let auth_p = authenticate_bearer_token(&db, &p_tok.token).await.unwrap();
         assert_eq!(auth_p.principal_id(), format!("project:{}:preview", p.id));
         assert_eq!(auth_p.display_name(), "support (preview)");
 
@@ -1619,6 +1702,7 @@ mod tests {
                 scopes: Permissions::READ.union(Permissions::LABEL),
             },
         )
+        .await
         .unwrap();
         let a_tok = create_token(
             &db,
@@ -1629,20 +1713,19 @@ mod tests {
                 label: None,
             },
         )
+        .await
         .unwrap();
-        let auth_a = authenticate_bearer_token(&db, &a_tok.token).unwrap();
+        let auth_a = authenticate_bearer_token(&db, &a_tok.token).await.unwrap();
         assert_eq!(auth_a.principal_id(), format!("app:{}", a.id));
         assert_eq!(
             auth_a.permission_ceiling(),
             Permissions::READ.union(Permissions::LABEL)
         );
 
-        // Revoking token denies authentication
-        revoke_token(&db, &u_tok.id).unwrap();
-        assert!(authenticate_bearer_token(&db, &u_tok.token).is_err());
+        revoke_token(&db, &u_tok.id).await.unwrap();
+        assert!(authenticate_bearer_token(&db, &u_tok.token).await.is_err());
 
-        // Revoking project revokes its tokens
-        revoke_project(&db, &p.id).unwrap();
-        assert!(authenticate_bearer_token(&db, &p_tok.token).is_err());
+        revoke_project(&db, &p.id).await.unwrap();
+        assert!(authenticate_bearer_token(&db, &p_tok.token).await.is_err());
     }
 }

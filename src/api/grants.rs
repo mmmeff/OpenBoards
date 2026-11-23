@@ -45,8 +45,8 @@ async fn list_grants(
     Path(board): Path<String>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let board_grants = grants::load_grants(&state.db, &resolved.id)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let board_grants = grants::load_grants(&state.db, &resolved.id).await?;
     grants::require_list_grants_access(&board_grants, &caller)?;
     Ok(Json(json!({ "grants": board_grants })))
 }
@@ -58,8 +58,8 @@ async fn create_grant(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<CreateGrantInput>,
 ) -> BoardResult<(StatusCode, Json<Value>)> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let grant = grants::create_grant(&state.db, &resolved.id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let grant = grants::create_grant(&state.db, &resolved.id, &caller, input).await?;
     Ok((StatusCode::CREATED, Json(json!({ "grant": grant }))))
 }
 
@@ -70,8 +70,8 @@ async fn update_grant(
     Query(query): Query<EnsureQuery>,
     Json(input): Json<UpdateGrantInput>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let grant = grants::update_grant(&state.db, &resolved.id, &id, &caller, input)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    let grant = grants::update_grant(&state.db, &resolved.id, &id, &caller, input).await?;
     Ok(Json(json!({ "grant": grant })))
 }
 
@@ -81,8 +81,8 @@ async fn revoke_grant(
     Path((board, id)): Path<(String, String)>,
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    grants::revoke_grant(&state.db, &resolved.id, &id, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
+    grants::revoke_grant(&state.db, &resolved.id, &id, &caller).await?;
     Ok(Json(json!({ "ok": true, "revoked": id })))
 }
 
@@ -92,7 +92,7 @@ async fn explain_grant(
     Path(board): Path<String>,
     Query(query): Query<ExplainHttpQuery>,
 ) -> BoardResult<Json<Value>> {
-    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller).await?;
     let explanation = grants::explain_access(
         &state.db,
         &resolved.id,
@@ -105,6 +105,7 @@ async fn explain_grant(
             app: query.app,
             principal: query.principal,
         },
-    )?;
+    )
+    .await?;
     Ok(Json(json!(explanation)))
 }

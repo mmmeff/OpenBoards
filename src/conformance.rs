@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::actors;
 use crate::boards;
 use crate::client::{BoardClient, ClientConfig};
-use crate::config::ServerConfig;
+use crate::config::{DbTarget, ServerConfig, DEFAULT_DB_MAX_CONNECTIONS};
 use crate::db::Database;
 use crate::error::BoardResult;
 use crate::id::new_bearer_token;
@@ -50,18 +50,30 @@ struct EphemeralServer {
 async fn start_ephemeral_server() -> Result<EphemeralServer, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let owner_token = new_bearer_token();
+    let data_dir = tmp.path().to_path_buf();
+    let db_path = data_dir.join("openboards.db");
     let cfg = ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        data_dir: tmp.path().to_path_buf(),
+        data_dir,
         team: "conformance".to_string(),
         admin_token: Some(owner_token.clone()),
         rate_limit_rps: 0,
         rate_limit_burst: 500,
+        db_target: DbTarget::SqlitePath(db_path.clone()),
+        db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
     };
-    let db = Database::open(&cfg.db_path()).map_err(|e| format!("db open: {e}"))?;
-    actors::bootstrap_owner(&db, Some(&owner_token)).map_err(|e| format!("bootstrap: {e}"))?;
-    boards::ensure_default_board(&db).map_err(|e| format!("default board: {e}"))?;
-    schemas::seed_builtin_schemas(&db).map_err(|e| format!("schemas: {e}"))?;
+    let db = Database::open(&db_path)
+        .await
+        .map_err(|e| format!("db open: {e}"))?;
+    actors::bootstrap_owner(&db, Some(&owner_token))
+        .await
+        .map_err(|e| format!("bootstrap: {e}"))?;
+    boards::ensure_default_board(&db)
+        .await
+        .map_err(|e| format!("default board: {e}"))?;
+    schemas::seed_builtin_schemas(&db)
+        .await
+        .map_err(|e| format!("schemas: {e}"))?;
 
     let state = AppState::new(db, cfg);
     let scheduler = schedules::spawn_scheduler_loop(state.clone());
@@ -615,7 +627,9 @@ pub async fn run_conformance(
                     .await
                     .map_err(|e| e.to_string())?;
                 expect(due["schedule"]["status"] == "pending", "expected pending")?;
-                let sum = schedules::fire_due_schedules(&eph.state).map_err(|e| e.to_string())?;
+                let sum = schedules::fire_due_schedules(&eph.state)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 expect(sum.fired >= 1, "expected due schedule to fire")?;
             }
             Ok(())

@@ -99,25 +99,28 @@ async fn poll_events(
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> BoardResult<Json<Value>> {
     let parsed = parse_event_params(pairs)?;
-    let resolved = boards::resolve_board(&state.db, &board, parsed.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, parsed.ensure, &caller).await?;
     let wait_dur = parsed.wait.unwrap_or(Duration::ZERO);
 
-    // Subscribe BEFORE resolving starting seq & querying SQLite to prevent missed wakeups.
     let mut rx = state.events.subscribe(&resolved.id);
 
-    let after_seq = state.db.with_conn(|conn| match &parsed.query.after {
-        Some(c) => events::resolve_event_cursor_tx(conn, &resolved.id, c),
-        None => {
-            if wait_dur.is_zero() {
-                Ok(0)
-            } else {
-                events::current_event_seq_tx(conn, &resolved.id)
+    let after_seq = {
+        let mut conn = state.db.read_conn();
+        match &parsed.query.after {
+            Some(c) => events::resolve_event_cursor_tx(&mut conn, &resolved.id, c).await?,
+            None => {
+                if wait_dur.is_zero() {
+                    0
+                } else {
+                    events::current_event_seq_tx(&mut conn, &resolved.id).await?
+                }
             }
         }
-    })?;
+    };
 
     let page =
-        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)?;
+        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)
+            .await?;
     if !page.events.is_empty() || wait_dur.is_zero() {
         return Ok(Json(json!(page)));
     }
@@ -134,7 +137,7 @@ async fn poll_events(
                             &caller,
                             after_seq,
                             &parsed.query,
-                        )?;
+                        ).await?;
                         if !page.events.is_empty() {
                             return Ok(Json(json!(page)));
                         }
@@ -146,7 +149,7 @@ async fn poll_events(
                             &caller,
                             after_seq,
                             &parsed.query,
-                        )?;
+                        ).await?;
                         return Ok(Json(json!(page)));
                     }
                 }
@@ -158,7 +161,7 @@ async fn poll_events(
                     &caller,
                     after_seq,
                     &parsed.query,
-                )?;
+                ).await?;
                 return Ok(Json(json!(page)));
             }
         }
@@ -173,22 +176,25 @@ async fn wait_event(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let mut parsed = parse_event_params(pairs)?;
     parsed.query.limit = Some(1);
-    let resolved = boards::resolve_board(&state.db, &board, parsed.ensure, &caller)?;
+    let resolved = boards::resolve_board(&state.db, &board, parsed.ensure, &caller).await?;
     let timeout_dur = parsed
         .timeout
         .or(parsed.wait)
         .unwrap_or_else(|| Duration::from_secs_f64(DEFAULT_WAIT_TIMEOUT_SECS));
 
-    // Subscribe BEFORE querying SQLite so concurrent writes cannot slip between query and wait.
     let mut rx = state.events.subscribe(&resolved.id);
 
-    let after_seq = state.db.with_conn(|conn| match &parsed.query.after {
-        Some(c) => events::resolve_event_cursor_tx(conn, &resolved.id, c),
-        None => events::current_event_seq_tx(conn, &resolved.id),
-    })?;
+    let after_seq = {
+        let mut conn = state.db.read_conn();
+        match &parsed.query.after {
+            Some(c) => events::resolve_event_cursor_tx(&mut conn, &resolved.id, c).await?,
+            None => events::current_event_seq_tx(&mut conn, &resolved.id).await?,
+        }
+    };
 
     let page =
-        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)?;
+        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)
+            .await?;
     if let Some(ev) = page.events.into_iter().next() {
         let cursor = ev.cursor.clone();
         return Ok((StatusCode::OK, Json(json!({ "event": ev, "cursor": cursor }))));
@@ -217,7 +223,7 @@ async fn wait_event(
                             &caller,
                             after_seq,
                             &parsed.query,
-                        )?;
+                        ).await?;
                         if let Some(ev) = page.events.into_iter().next() {
                             let cursor = ev.cursor.clone();
                             return Ok((StatusCode::OK, Json(json!({ "event": ev, "cursor": cursor }))));
@@ -231,7 +237,8 @@ async fn wait_event(
     }
 
     let final_page =
-        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)?;
+        events::query_events_after(&state.db, &resolved.id, &caller, after_seq, &parsed.query)
+            .await?;
     if let Some(ev) = final_page.events.into_iter().next() {
         let cursor = ev.cursor.clone();
         return Ok((StatusCode::OK, Json(json!({ "event": ev, "cursor": cursor }))));

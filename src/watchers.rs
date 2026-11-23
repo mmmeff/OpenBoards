@@ -4,19 +4,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::actors::{CallerContext, Principal, ProfileOverlay};
 use crate::boards;
-use crate::db::Database;
+use crate::db::{Database, DbRow, Queryable};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventQuery, EventType, EventView};
 use crate::filter::{LabelPredicate, QueryFilter};
 use crate::grants;
 use crate::id::prefixed_id;
+use crate::sql_args;
 use crate::AppState;
 
 pub const MAX_WATCHERS_PER_DEPLOYMENT: usize = 32;
@@ -475,7 +475,7 @@ pub enum WatcherOwnerScope {
     All,
 }
 
-pub fn resolve_watcher_access_scope(
+pub async fn resolve_watcher_access_scope(
     db: &Database,
     board_id: &str,
     caller: &CallerContext,
@@ -499,7 +499,7 @@ pub fn resolve_watcher_access_scope(
         return Ok(WatcherOwnerScope::Single(own));
     }
 
-    let board_grants = grants::load_grants(db, board_id)?;
+    let board_grants = grants::load_grants(db, board_id).await?;
     if caller.is_unrestricted_owner()
         || grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage()
     {
@@ -618,14 +618,14 @@ struct StoredWatcher {
     updated_at: String,
 }
 
-fn load_delivery_summary_tx(
-    conn: &Connection,
+async fn load_delivery_summary_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
 ) -> BoardResult<WatcherDeliverySummary> {
-    let (total, delivered, retrying, dead_letter, pending): (i64, i64, i64, i64, i64) = conn
-        .query_row(
+    let counts = conn
+        .fetch_one(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END), 0),
@@ -634,84 +634,84 @@ fn load_delivery_summary_tx(
                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0)
              FROM watcher_deliveries
              WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3",
-            params![board_id, owner_principal, watcher_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )?;
+            sql_args![board_id, owner_principal, watcher_id],
+        )
+        .await?;
 
-    let latest: Option<(String, String, Option<String>)> = conn
-        .query_row(
+    let latest = conn
+        .fetch_optional(
             "SELECT updated_at, status, last_error
              FROM watcher_deliveries
              WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3
              ORDER BY event_seq DESC
              LIMIT 1",
-            params![board_id, owner_principal, watcher_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            sql_args![board_id, owner_principal, watcher_id],
         )
-        .optional()?;
+        .await?;
 
     let (last_delivery_at, last_status, last_error) = match latest {
-        Some((ts, st, err)) => (Some(ts), Some(st), err),
+        Some(r) => (Some(r.get_str(0)?), Some(r.get_str(1)?), r.get_opt_str(2)?),
         None => (None, None, None),
     };
 
     Ok(WatcherDeliverySummary {
-        total,
-        delivered,
-        retrying,
-        dead_letter,
-        pending,
+        total: counts.get_i64(0)?,
+        delivered: counts.get_i64(1)?,
+        retrying: counts.get_i64(2)?,
+        dead_letter: counts.get_i64(3)?,
+        pending: counts.get_i64(4)?,
         last_delivery_at,
         last_status,
         last_error,
     })
 }
 
-fn load_recent_deliveries_tx(
-    conn: &Connection,
+async fn load_recent_deliveries_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
 ) -> BoardResult<Vec<WatcherDeliveryView>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, delivery_id, event_seq, event_cursor, status, attempts,
-                last_http_status, last_error, next_attempt_at, created_at, updated_at, completed_at
-         FROM watcher_deliveries
-         WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3
-         ORDER BY event_seq DESC
-         LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(
-        params![board_id, owner_principal, watcher_id, RECENT_DELIVERIES_LIMIT],
-        |r| {
-            let status_code: Option<i64> = r.get(6)?;
-            Ok(WatcherDeliveryView {
-                id: r.get(0)?,
-                delivery_id: r.get(1)?,
-                event_seq: r.get(2)?,
-                event_cursor: r.get(3)?,
-                status: r.get(4)?,
-                attempts: r.get::<_, i64>(5)?.max(0) as u32,
-                last_http_status: status_code.and_then(|c| u16::try_from(c).ok()),
-                last_error: r.get(7)?,
-                next_attempt_at: r.get(8)?,
-                created_at: r.get(9)?,
-                updated_at: r.get(10)?,
-                completed_at: r.get(11)?,
-            })
-        },
-    )?;
+    let rows = conn
+        .fetch_all(
+            "SELECT id, delivery_id, event_seq, event_cursor, status, attempts,
+                    last_http_status, last_error, next_attempt_at, created_at, updated_at, completed_at
+             FROM watcher_deliveries
+             WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3
+             ORDER BY event_seq DESC
+             LIMIT ?4",
+            sql_args![board_id, owner_principal, watcher_id, RECENT_DELIVERIES_LIMIT],
+        )
+        .await?;
 
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let status_code = r.get_opt_i64(6)?;
+        out.push(WatcherDeliveryView {
+            id: r.get_str(0)?,
+            delivery_id: r.get_str(1)?,
+            event_seq: r.get_i64(2)?,
+            event_cursor: r.get_str(3)?,
+            status: r.get_str(4)?,
+            attempts: r.get_i64(5)?.max(0) as u32,
+            last_http_status: status_code.and_then(|c| u16::try_from(c).ok()),
+            last_error: r.get_opt_str(7)?,
+            next_attempt_at: r.get_opt_str(8)?,
+            created_at: r.get_str(9)?,
+            updated_at: r.get_str(10)?,
+            completed_at: r.get_opt_str(11)?,
+        });
     }
     Ok(out)
 }
 
-fn stored_to_view_tx(conn: &Connection, stored: StoredWatcher) -> BoardResult<WatcherView> {
+async fn stored_to_view_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
+    stored: StoredWatcher,
+) -> BoardResult<WatcherView> {
     let deliveries =
-        load_delivery_summary_tx(conn, &stored.board_id, &stored.owner_principal, &stored.id)?;
+        load_delivery_summary_tx(conn, &stored.board_id, &stored.owner_principal, &stored.id)
+            .await?;
     let actor = watcher_actor_id(&stored.owner_principal, &stored.id);
     Ok(WatcherView {
         id: stored.id,
@@ -730,41 +730,40 @@ fn stored_to_view_tx(conn: &Connection, stored: StoredWatcher) -> BoardResult<Wa
     })
 }
 
-fn parse_stored_watcher_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredWatcher> {
-    let filter_json: String = r.get(4)?;
-    let filter: WatcherFilter = serde_json::from_str(&filter_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
-    })?;
+fn parse_stored_watcher_row(r: &DbRow) -> BoardResult<StoredWatcher> {
+    let filter_json = r.get_str(4)?;
+    let filter: WatcherFilter = serde_json::from_str(&filter_json)
+        .map_err(|e| BoardError::internal(format!("corrupted watcher filter JSON: {e}")))?;
     Ok(StoredWatcher {
-        board_id: r.get(0)?,
-        owner_principal: r.get(1)?,
-        id: r.get(2)?,
-        tail_expr: r.get(3)?,
+        board_id: r.get_str(0)?,
+        owner_principal: r.get_str(1)?,
+        id: r.get_str(2)?,
+        tail_expr: r.get_str(3)?,
         filter,
-        webhook_url: r.get(5)?,
-        secret: r.get(6)?,
-        last_cursor: r.get(7)?,
-        created_at: r.get(8)?,
-        updated_at: r.get(9)?,
+        webhook_url: r.get_str(5)?,
+        secret: r.get_opt_str(6)?,
+        last_cursor: r.get_i64(7)?,
+        created_at: r.get_str(8)?,
+        updated_at: r.get_str(9)?,
     })
 }
 
-fn load_stored_watcher_tx(
-    conn: &Connection,
+async fn load_stored_watcher_tx<C: Queryable + ?Sized>(
+    conn: &mut C,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
 ) -> BoardResult<Option<StoredWatcher>> {
-    conn.query_row(
-        "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
-                secret, last_cursor, created_at, updated_at
-         FROM watchers
-         WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
-        params![board_id, owner_principal, watcher_id],
-        parse_stored_watcher_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    let row = conn
+        .fetch_optional(
+            "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
+                    secret, last_cursor, created_at, updated_at
+             FROM watchers
+             WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
+            sql_args![board_id, owner_principal, watcher_id],
+        )
+        .await?;
+    row.as_ref().map(parse_stored_watcher_row).transpose()
 }
 
 fn normalize_secret(secret: Option<String>) -> Option<String> {
@@ -774,7 +773,7 @@ fn normalize_secret(secret: Option<String>) -> Option<String> {
 /// Registers or updates a single watcher for the calling deployment.
 /// Preserves `last_cursor` when updating an existing watcher ID; enforces the 32-watcher cap
 /// per deployment when inserting a new watcher.
-pub fn upsert_watcher(
+pub async fn upsert_watcher(
     db: &Database,
     caller: &CallerContext,
     input: UpsertWatcherInput,
@@ -789,66 +788,75 @@ pub fn upsert_watcher(
         .map_err(|e| BoardError::internal(format!("failed to serialize watcher filter: {e}")))?;
     let secret = normalize_secret(input.secret);
     let now = Utc::now().to_rfc3339();
+    let trimmed_url = input.webhook_url.trim().to_string();
 
-    db.with_tx(|tx| {
-        let existing = load_stored_watcher_tx(tx, &input.board_id, &owner_principal, &input.id)?;
-        let created = if let Some(prev) = existing {
-            tx.execute(
-                "UPDATE watchers
-                 SET tail_expr = ?1, filter_json = ?2, webhook_url = ?3, secret = ?4, updated_at = ?5
-                 WHERE board_id = ?6 AND owner_principal = ?7 AND id = ?8",
-                params![
-                    input.tail_expr,
-                    filter_json,
-                    input.webhook_url.trim(),
-                    secret,
-                    now,
-                    prev.board_id,
-                    prev.owner_principal,
-                    prev.id
-                ],
-            )?;
-            false
-        } else {
-            let count: i64 = tx.query_row(
+    let mut tx = db.begin_tx().await?;
+    tx.advisory_xact_lock("watchers", &owner_principal).await?;
+
+    let existing =
+        load_stored_watcher_tx(&mut tx, &input.board_id, &owner_principal, &input.id).await?;
+    let created = if let Some(prev) = existing {
+        tx.execute(
+            "UPDATE watchers
+             SET tail_expr = ?1, filter_json = ?2, webhook_url = ?3, secret = ?4, updated_at = ?5
+             WHERE board_id = ?6 AND owner_principal = ?7 AND id = ?8",
+            sql_args![
+                &input.tail_expr,
+                &filter_json,
+                &trimmed_url,
+                &secret,
+                &now,
+                &prev.board_id,
+                &prev.owner_principal,
+                &prev.id
+            ],
+        )
+        .await?;
+        false
+    } else {
+        let count = tx
+            .fetch_one(
                 "SELECT COUNT(*) FROM watchers WHERE owner_principal = ?1",
-                params![owner_principal],
-                |r| r.get(0),
-            )?;
-            if count as usize >= MAX_WATCHERS_PER_DEPLOYMENT {
-                return Err(BoardError::new(
-                    ErrorCode::TooManyWatchers,
-                    format!(
-                        "deployment cannot register more than {MAX_WATCHERS_PER_DEPLOYMENT} watchers"
-                    ),
-                ));
-            }
-            let initial_seq = events::current_event_seq_tx(tx, &input.board_id)?;
-            tx.execute(
-                "INSERT INTO watchers (
-                    board_id, owner_principal, id, tail_expr, filter_json,
-                    webhook_url, secret, last_cursor, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                params![
-                    input.board_id,
-                    owner_principal,
-                    input.id,
-                    input.tail_expr,
-                    filter_json,
-                    input.webhook_url.trim(),
-                    secret,
-                    initial_seq,
-                    now
-                ],
-            )?;
-            true
-        };
+                sql_args![&owner_principal],
+            )
+            .await?
+            .get_i64(0)?;
+        if count as usize >= MAX_WATCHERS_PER_DEPLOYMENT {
+            return Err(BoardError::new(
+                ErrorCode::TooManyWatchers,
+                format!(
+                    "deployment cannot register more than {MAX_WATCHERS_PER_DEPLOYMENT} watchers"
+                ),
+            ));
+        }
+        let initial_seq = events::current_event_seq_tx(&mut tx, &input.board_id).await?;
+        tx.execute(
+            "INSERT INTO watchers (
+                board_id, owner_principal, id, tail_expr, filter_json,
+                webhook_url, secret, last_cursor, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            sql_args![
+                &input.board_id,
+                &owner_principal,
+                &input.id,
+                &input.tail_expr,
+                &filter_json,
+                &trimmed_url,
+                &secret,
+                initial_seq,
+                &now
+            ],
+        )
+        .await?;
+        true
+    };
 
-        let stored = load_stored_watcher_tx(tx, &input.board_id, &owner_principal, &input.id)?
-            .expect("upserted watcher must exist");
-        let view = stored_to_view_tx(tx, stored)?;
-        Ok((view, created))
-    })
+    let stored = load_stored_watcher_tx(&mut tx, &input.board_id, &owner_principal, &input.id)
+        .await?
+        .expect("upserted watcher must exist");
+    let view = stored_to_view_tx(&mut tx, stored).await?;
+    tx.commit().await?;
+    Ok((view, created))
 }
 
 /// Atomically syncs/replaces a deployment's complete watcher set:
@@ -856,7 +864,7 @@ pub fn upsert_watcher(
 /// - Updates existing `(board_id, id)` watchers in place while preserving `last_cursor`.
 /// - Inserts new watchers starting at each board's current latest event seq.
 /// - Deletes previously registered watchers omitted from `desired`.
-pub fn sync_deployment_watchers(
+pub async fn sync_deployment_watchers(
     db: &Database,
     caller: &CallerContext,
     desired: Vec<UpsertWatcherInput>,
@@ -889,246 +897,265 @@ pub fn sync_deployment_watchers(
     let owner_principal = caller.principal_id();
     let now = Utc::now().to_rfc3339();
 
-    db.with_tx(|tx| {
-        let mut stmt = tx.prepare(
+    let mut tx = db.begin_tx().await?;
+    tx.advisory_xact_lock("watchers", &owner_principal).await?;
+
+    let existing_rows = tx
+        .fetch_all(
             "SELECT board_id, id FROM watchers WHERE owner_principal = ?1 ORDER BY created_at ASC",
-        )?;
-        let existing_keys: Vec<(String, String)> = stmt
-            .query_map(params![owner_principal], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+            sql_args![&owner_principal],
+        )
+        .await?;
+    let mut existing_keys = Vec::with_capacity(existing_rows.len());
+    for r in existing_rows {
+        existing_keys.push((r.get_str(0)?, r.get_str(1)?));
+    }
 
-        let existing_set: HashSet<(String, String)> = existing_keys.iter().cloned().collect();
-        let mut created = Vec::new();
-        let mut updated = Vec::new();
-        let mut deleted = Vec::new();
+    let existing_set: HashSet<(String, String)> = existing_keys.iter().cloned().collect();
+    let mut created = Vec::new();
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
 
-        for (board_id, id) in &existing_keys {
-            if !seen_keys.contains(&(board_id.clone(), id.clone())) {
-                tx.execute(
-                    "DELETE FROM watchers WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
-                    params![board_id, owner_principal, id],
-                )?;
-                deleted.push(id.clone());
-            }
+    for (board_id, id) in &existing_keys {
+        if !seen_keys.contains(&(board_id.clone(), id.clone())) {
+            tx.execute(
+                "DELETE FROM watchers WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
+                sql_args![board_id, &owner_principal, id],
+            )
+            .await?;
+            deleted.push(id.clone());
+        }
+    }
+
+    let mut views = Vec::with_capacity(desired.len());
+    for entry in desired {
+        let filter_json = serde_json::to_string(&entry.filter).map_err(|e| {
+            BoardError::internal(format!("failed to serialize watcher filter: {e}"))
+        })?;
+        let secret = normalize_secret(entry.secret);
+        let trimmed_url = entry.webhook_url.trim().to_string();
+        let key = (entry.board_id.clone(), entry.id.clone());
+
+        if existing_set.contains(&key) {
+            tx.execute(
+                "UPDATE watchers
+                 SET tail_expr = ?1, filter_json = ?2, webhook_url = ?3, secret = ?4, updated_at = ?5
+                 WHERE board_id = ?6 AND owner_principal = ?7 AND id = ?8",
+                sql_args![
+                    &entry.tail_expr,
+                    &filter_json,
+                    &trimmed_url,
+                    &secret,
+                    &now,
+                    &entry.board_id,
+                    &owner_principal,
+                    &entry.id
+                ],
+            )
+            .await?;
+            updated.push(entry.id.clone());
+        } else {
+            let initial_seq = events::current_event_seq_tx(&mut tx, &entry.board_id).await?;
+            tx.execute(
+                "INSERT INTO watchers (
+                    board_id, owner_principal, id, tail_expr, filter_json,
+                    webhook_url, secret, last_cursor, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                sql_args![
+                    &entry.board_id,
+                    &owner_principal,
+                    &entry.id,
+                    &entry.tail_expr,
+                    &filter_json,
+                    &trimmed_url,
+                    &secret,
+                    initial_seq,
+                    &now
+                ],
+            )
+            .await?;
+            created.push(entry.id.clone());
         }
 
-        let mut views = Vec::with_capacity(desired.len());
-        for entry in desired {
-            let filter_json = serde_json::to_string(&entry.filter).map_err(|e| {
-                BoardError::internal(format!("failed to serialize watcher filter: {e}"))
-            })?;
-            let secret = normalize_secret(entry.secret);
-            let key = (entry.board_id.clone(), entry.id.clone());
+        let stored = load_stored_watcher_tx(&mut tx, &entry.board_id, &owner_principal, &entry.id)
+            .await?
+            .expect("synced watcher must exist");
+        views.push(stored_to_view_tx(&mut tx, stored).await?);
+    }
 
-            if existing_set.contains(&key) {
-                tx.execute(
-                    "UPDATE watchers
-                     SET tail_expr = ?1, filter_json = ?2, webhook_url = ?3, secret = ?4, updated_at = ?5
-                     WHERE board_id = ?6 AND owner_principal = ?7 AND id = ?8",
-                    params![
-                        entry.tail_expr,
-                        filter_json,
-                        entry.webhook_url.trim(),
-                        secret,
-                        now,
-                        entry.board_id,
-                        owner_principal,
-                        entry.id
-                    ],
-                )?;
-                updated.push(entry.id.clone());
-            } else {
-                let initial_seq = events::current_event_seq_tx(tx, &entry.board_id)?;
-                tx.execute(
-                    "INSERT INTO watchers (
-                        board_id, owner_principal, id, tail_expr, filter_json,
-                        webhook_url, secret, last_cursor, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                    params![
-                        entry.board_id,
-                        owner_principal,
-                        entry.id,
-                        entry.tail_expr,
-                        filter_json,
-                        entry.webhook_url.trim(),
-                        secret,
-                        initial_seq,
-                        now
-                    ],
-                )?;
-                created.push(entry.id.clone());
-            }
-
-            let stored = load_stored_watcher_tx(tx, &entry.board_id, &owner_principal, &entry.id)?
-                .expect("synced watcher must exist");
-            views.push(stored_to_view_tx(tx, stored)?);
-        }
-
-        Ok(SyncWatchersResult {
-            watchers: views,
-            created,
-            updated,
-            deleted,
-        })
+    tx.commit().await?;
+    Ok(SyncWatchersResult {
+        watchers: views,
+        created,
+        updated,
+        deleted,
     })
 }
 
-pub fn list_watchers(
+pub async fn list_watchers(
     db: &Database,
     board_id: &str,
     scope: &WatcherOwnerScope,
 ) -> BoardResult<Vec<WatcherView>> {
-    db.with_conn(|conn| {
-        let stored_list: Vec<StoredWatcher> = match scope {
-            WatcherOwnerScope::Single(owner) => {
-                let mut stmt = conn.prepare(
-                    "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
-                            secret, last_cursor, created_at, updated_at
-                     FROM watchers
-                     WHERE board_id = ?1 AND owner_principal = ?2
-                     ORDER BY id ASC",
-                )?;
-                let rows = stmt
-                    .query_map(params![board_id, owner], parse_stored_watcher_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            }
-            WatcherOwnerScope::All => {
-                let mut stmt = conn.prepare(
-                    "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
-                            secret, last_cursor, created_at, updated_at
-                     FROM watchers
-                     WHERE board_id = ?1
-                     ORDER BY owner_principal ASC, id ASC",
-                )?;
-                let rows = stmt
-                    .query_map(params![board_id], parse_stored_watcher_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            }
-        };
-
-        let mut out = Vec::with_capacity(stored_list.len());
-        for s in stored_list {
-            out.push(stored_to_view_tx(conn, s)?);
+    let mut conn = db.read_conn();
+    let rows = match scope {
+        WatcherOwnerScope::Single(owner) => {
+            conn.fetch_all(
+                "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
+                        secret, last_cursor, created_at, updated_at
+                 FROM watchers
+                 WHERE board_id = ?1 AND owner_principal = ?2
+                 ORDER BY id ASC",
+                sql_args![board_id, owner],
+            )
+            .await?
         }
-        Ok(out)
-    })
+        WatcherOwnerScope::All => {
+            conn.fetch_all(
+                "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
+                        secret, last_cursor, created_at, updated_at
+                 FROM watchers
+                 WHERE board_id = ?1
+                 ORDER BY owner_principal ASC, id ASC",
+                sql_args![board_id],
+            )
+            .await?
+        }
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let s = parse_stored_watcher_row(r)?;
+        out.push(stored_to_view_tx(&mut conn, s).await?);
+    }
+    Ok(out)
 }
 
-pub fn get_watcher_detail(
+pub async fn get_watcher_detail(
     db: &Database,
     board_id: &str,
     watcher_id: &str,
     scope: &WatcherOwnerScope,
 ) -> BoardResult<WatcherDetailView> {
-    db.with_conn(|conn| {
-        let stored = match scope {
-            WatcherOwnerScope::Single(owner) => {
-                load_stored_watcher_tx(conn, board_id, owner, watcher_id)?
-            }
-            WatcherOwnerScope::All => {
-                let mut stmt = conn.prepare(
+    let mut conn = db.read_conn();
+    let stored = match scope {
+        WatcherOwnerScope::Single(owner) => {
+            load_stored_watcher_tx(&mut conn, board_id, owner, watcher_id).await?
+        }
+        WatcherOwnerScope::All => {
+            let rows = conn
+                .fetch_all(
                     "SELECT board_id, owner_principal, id, tail_expr, filter_json, webhook_url,
                             secret, last_cursor, created_at, updated_at
                      FROM watchers
                      WHERE board_id = ?1 AND id = ?2
                      ORDER BY created_at ASC",
-                )?;
-                let mut matches: Vec<StoredWatcher> = stmt
-                    .query_map(params![board_id, watcher_id], parse_stored_watcher_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                if matches.len() > 1 {
-                    return Err(BoardError::bad_request(format!(
-                        "multiple deployments have watcher '{watcher_id}'; pass ?owner=<principal> to disambiguate"
-                    )));
-                }
-                matches.pop()
+                    sql_args![board_id, watcher_id],
+                )
+                .await?;
+            let mut matches: Vec<StoredWatcher> = rows
+                .iter()
+                .map(parse_stored_watcher_row)
+                .collect::<BoardResult<Vec<_>>>()?;
+            if matches.len() > 1 {
+                return Err(BoardError::bad_request(format!(
+                    "multiple deployments have watcher '{watcher_id}'; pass ?owner=<principal> to disambiguate"
+                )));
             }
-        };
+            matches.pop()
+        }
+    };
 
-        let stored = stored.ok_or_else(|| {
-            BoardError::new(
-                ErrorCode::WatcherNotFound,
-                format!("watcher '{watcher_id}' not found"),
-            )
-        })?;
+    let stored = stored.ok_or_else(|| {
+        BoardError::new(
+            ErrorCode::WatcherNotFound,
+            format!("watcher '{watcher_id}' not found"),
+        )
+    })?;
 
-        let recent_deliveries = load_recent_deliveries_tx(
-            conn,
-            &stored.board_id,
-            &stored.owner_principal,
-            &stored.id,
-        )?;
-        let watcher = stored_to_view_tx(conn, stored)?;
-        Ok(WatcherDetailView {
-            watcher,
-            recent_deliveries,
-        })
+    let recent_deliveries = load_recent_deliveries_tx(
+        &mut conn,
+        &stored.board_id,
+        &stored.owner_principal,
+        &stored.id,
+    )
+    .await?;
+    let watcher = stored_to_view_tx(&mut conn, stored).await?;
+    Ok(WatcherDetailView {
+        watcher,
+        recent_deliveries,
     })
 }
 
-pub fn delete_watcher(
+pub async fn delete_watcher(
     db: &Database,
     board_id: &str,
     watcher_id: &str,
     scope: &WatcherOwnerScope,
 ) -> BoardResult<()> {
-    db.with_tx(|tx| {
-        let deleted = match scope {
-            WatcherOwnerScope::Single(owner) => tx.execute(
+    let mut tx = db.begin_tx().await?;
+    let deleted = match scope {
+        WatcherOwnerScope::Single(owner) => {
+            tx.execute(
                 "DELETE FROM watchers WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
-                params![board_id, owner, watcher_id],
-            )?,
-            WatcherOwnerScope::All => {
-                let count: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM watchers WHERE board_id = ?1 AND id = ?2",
-                    params![board_id, watcher_id],
-                    |r| r.get(0),
-                )?;
-                if count > 1 {
-                    return Err(BoardError::bad_request(format!(
-                        "multiple deployments have watcher '{watcher_id}'; pass ?owner=<principal> to disambiguate"
-                    )));
-                }
-                tx.execute(
-                    "DELETE FROM watchers WHERE board_id = ?1 AND id = ?2",
-                    params![board_id, watcher_id],
-                )?
-            }
-        };
-
-        if deleted == 0 {
-            return Err(BoardError::new(
-                ErrorCode::WatcherNotFound,
-                format!("watcher '{watcher_id}' not found"),
-            ));
+                sql_args![board_id, owner, watcher_id],
+            )
+            .await?
         }
-        Ok(())
-    })
+        WatcherOwnerScope::All => {
+            let count = tx
+                .fetch_one(
+                    "SELECT COUNT(*) FROM watchers WHERE board_id = ?1 AND id = ?2",
+                    sql_args![board_id, watcher_id],
+                )
+                .await?
+                .get_i64(0)?;
+            if count > 1 {
+                return Err(BoardError::bad_request(format!(
+                    "multiple deployments have watcher '{watcher_id}'; pass ?owner=<principal> to disambiguate"
+                )));
+            }
+            tx.execute(
+                "DELETE FROM watchers WHERE board_id = ?1 AND id = ?2",
+                sql_args![board_id, watcher_id],
+            )
+            .await?
+        }
+    };
+
+    if deleted == 0 {
+        return Err(BoardError::new(
+            ErrorCode::WatcherNotFound,
+            format!("watcher '{watcher_id}' not found"),
+        ));
+    }
+    tx.commit().await
 }
 
-pub fn delete_board_watchers(
+pub async fn delete_board_watchers(
     db: &Database,
     board_id: &str,
     scope: &WatcherOwnerScope,
 ) -> BoardResult<usize> {
-    db.with_tx(|tx| {
-        let count = match scope {
-            WatcherOwnerScope::Single(owner) => tx.execute(
+    let mut tx = db.begin_tx().await?;
+    let count = match scope {
+        WatcherOwnerScope::Single(owner) => {
+            tx.execute(
                 "DELETE FROM watchers WHERE board_id = ?1 AND owner_principal = ?2",
-                params![board_id, owner],
-            )?,
-            WatcherOwnerScope::All => tx.execute(
+                sql_args![board_id, owner],
+            )
+            .await?
+        }
+        WatcherOwnerScope::All => {
+            tx.execute(
                 "DELETE FROM watchers WHERE board_id = ?1",
-                params![board_id],
-            )?,
-        };
-        Ok(count)
-    })
+                sql_args![board_id],
+            )
+            .await?
+        }
+    };
+    tx.commit().await?;
+    Ok(count as usize)
 }
 
 // --- Background Webhook Dispatcher ---
@@ -1178,8 +1205,8 @@ impl DispatchReport {
     }
 }
 
-fn resolve_watcher_caller(
-    conn: &Connection,
+async fn resolve_watcher_caller<C: Queryable + ?Sized>(
+    conn: &mut C,
     owner_principal: &str,
     watcher_id: &str,
 ) -> BoardResult<Option<CallerContext>> {
@@ -1189,16 +1216,16 @@ fn resolve_watcher_caller(
     let Some((pid, env)) = rest.split_once(':') else {
         return Ok(None);
     };
-    let project_name: Option<String> = conn
-        .query_row(
+    let row = conn
+        .fetch_optional(
             "SELECT name FROM projects WHERE id = ?1 AND revoked_at IS NULL",
-            params![pid],
-            |r| r.get(0),
+            sql_args![pid],
         )
-        .optional()?;
-    let Some(name) = project_name else {
+        .await?;
+    let Some(r) = row else {
         return Ok(None);
     };
+    let name = r.get_str(0)?;
 
     Ok(Some(CallerContext {
         principal: Principal::Project {
@@ -1216,57 +1243,56 @@ fn resolve_watcher_caller(
     }))
 }
 
-fn load_event_raw_actor_id(
+async fn load_event_raw_actor_id(
     db: &Database,
     board_id: &str,
     event_seq: i64,
 ) -> BoardResult<Option<String>> {
-    db.with_conn(|conn| {
-        conn.query_row(
+    let mut conn = db.read_conn();
+    let row = conn
+        .fetch_optional(
             "SELECT actor_id FROM events WHERE board_id = ?1 AND seq = ?2",
-            params![board_id, event_seq],
-            |r| r.get::<_, Option<String>>(0),
+            sql_args![board_id, event_seq],
         )
-        .optional()
-        .map(|opt| opt.flatten())
-        .map_err(Into::into)
-    })
+        .await?;
+    match row {
+        Some(r) => r.get_opt_str(0),
+        None => Ok(None),
+    }
 }
 
-fn advance_watcher_cursor(
+async fn advance_watcher_cursor(
     db: &Database,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
     seq: i64,
 ) -> BoardResult<()> {
-    db.with_tx(|tx| {
-        tx.execute(
-            "UPDATE watchers
-             SET last_cursor = MAX(last_cursor, ?1)
-             WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4",
-            params![seq, board_id, owner_principal, watcher_id],
-        )?;
-        Ok(())
-    })
+    let mut tx = db.begin_tx().await?;
+    tx.execute(
+        "UPDATE watchers
+         SET last_cursor = CASE WHEN last_cursor >= ?1 THEN last_cursor ELSE ?1 END
+         WHERE board_id = ?2 AND owner_principal = ?3 AND id = ?4",
+        sql_args![seq, board_id, owner_principal, watcher_id],
+    )
+    .await?;
+    tx.commit().await
 }
 
-fn watcher_still_exists(
+async fn watcher_still_exists(
     db: &Database,
     board_id: &str,
     owner_principal: &str,
     watcher_id: &str,
 ) -> BoardResult<bool> {
-    db.with_conn(|conn| {
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM watchers WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
-                params![board_id, owner_principal, watcher_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false))
-    })
+    let mut conn = db.read_conn();
+    Ok(conn
+        .fetch_optional(
+            "SELECT 1 FROM watchers WHERE board_id = ?1 AND owner_principal = ?2 AND id = ?3",
+            sql_args![board_id, owner_principal, watcher_id],
+        )
+        .await?
+        .is_some())
 }
 
 enum DeliveryOutcome {
@@ -1293,50 +1319,83 @@ async fn deliver_event_with_retries(
     );
     let max_attempts = policy.max_attempts.max(1);
 
-    let (row_id, existing_attempts) = db.with_tx(|tx| {
-        let existing: Option<(String, String, i64)> = tx
-            .query_row(
+    let (row_id, existing_attempts) = {
+        let mut tx = db.begin_tx().await?;
+        let existing = tx
+            .fetch_optional(
                 "SELECT id, status, attempts
                  FROM watcher_deliveries
                  WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3 AND event_seq = ?4",
-                params![
-                    watcher.board_id,
-                    watcher.owner_principal,
-                    watcher.id,
+                sql_args![
+                    &watcher.board_id,
+                    &watcher.owner_principal,
+                    &watcher.id,
                     event_seq
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?;
+            .await?;
 
-        if let Some((id, status, attempts)) = existing {
+        let res = if let Some(r) = existing {
+            let id = r.get_str(0)?;
+            let status = r.get_str(1)?;
+            let attempts = r.get_i64(2)?.max(0) as u32;
             if status == STATUS_DELIVERED || status == STATUS_DEAD_LETTER {
-                return Ok((None, attempts.max(0) as u32));
+                (None, attempts)
+            } else {
+                (Some(id), attempts)
             }
-            return Ok((Some(id), attempts.max(0) as u32));
-        }
-
-        let id = prefixed_id("wdv");
-        let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO watcher_deliveries (
-                id, board_id, owner_principal, watcher_id, event_seq, event_cursor,
-                delivery_id, status, attempts, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9)",
-            params![
-                id,
-                watcher.board_id,
-                watcher.owner_principal,
-                watcher.id,
-                event_seq,
-                event.cursor,
-                delivery_id,
-                STATUS_PENDING,
-                now
-            ],
-        )?;
-        Ok((Some(id), 0))
-    })?;
+        } else {
+            let id = prefixed_id("wdv");
+            let now = Utc::now().to_rfc3339();
+            let inserted = tx
+                .execute(
+                    "INSERT INTO watcher_deliveries (
+                        id, board_id, owner_principal, watcher_id, event_seq, event_cursor,
+                        delivery_id, status, attempts, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9)
+                     ON CONFLICT (board_id, owner_principal, watcher_id, event_seq) DO NOTHING",
+                    sql_args![
+                        &id,
+                        &watcher.board_id,
+                        &watcher.owner_principal,
+                        &watcher.id,
+                        event_seq,
+                        &event.cursor,
+                        &delivery_id,
+                        STATUS_PENDING,
+                        &now
+                    ],
+                )
+                .await?;
+            if inserted == 0 {
+                let r = tx
+                    .fetch_one(
+                        "SELECT id, status, attempts
+                         FROM watcher_deliveries
+                         WHERE board_id = ?1 AND owner_principal = ?2 AND watcher_id = ?3 AND event_seq = ?4",
+                        sql_args![
+                            &watcher.board_id,
+                            &watcher.owner_principal,
+                            &watcher.id,
+                            event_seq
+                        ],
+                    )
+                    .await?;
+                let existing_id = r.get_str(0)?;
+                let status = r.get_str(1)?;
+                let attempts = r.get_i64(2)?.max(0) as u32;
+                if status == STATUS_DELIVERED || status == STATUS_DEAD_LETTER {
+                    (None, attempts)
+                } else {
+                    (Some(existing_id), attempts)
+                }
+            } else {
+                (Some(id), 0)
+            }
+        };
+        tx.commit().await?;
+        res
+    };
 
     let Some(row_id) = row_id else {
         return Ok(DeliveryOutcome::AlreadySettled);
@@ -1365,7 +1424,14 @@ async fn deliver_event_with_retries(
 
     let start_attempt = existing_attempts + 1;
     for attempt in start_attempt..=max_attempts {
-        if !watcher_still_exists(db, &watcher.board_id, &watcher.owner_principal, &watcher.id)? {
+        if !watcher_still_exists(
+            db,
+            &watcher.board_id,
+            &watcher.owner_principal,
+            &watcher.id,
+        )
+        .await?
+        {
             return Ok(DeliveryOutcome::WatcherDeleted);
         }
 
@@ -1401,17 +1467,23 @@ async fn deliver_event_with_retries(
 
         match outcome {
             Ok(code) => {
-                db.with_tx(|tx| {
-                    tx.execute(
-                        "UPDATE watcher_deliveries
-                         SET status = ?1, attempts = ?2, last_http_status = ?3,
-                             last_error = NULL, next_attempt_at = NULL,
-                             updated_at = ?4, completed_at = ?4
-                         WHERE id = ?5",
-                        params![STATUS_DELIVERED, i64::from(attempt), i64::from(code), now_str, row_id],
-                    )?;
-                    Ok(())
-                })?;
+                let mut tx = db.begin_tx().await?;
+                tx.execute(
+                    "UPDATE watcher_deliveries
+                     SET status = ?1, attempts = ?2, last_http_status = ?3,
+                         last_error = NULL, next_attempt_at = NULL,
+                         updated_at = ?4, completed_at = ?4
+                     WHERE id = ?5",
+                    sql_args![
+                        STATUS_DELIVERED,
+                        i64::from(attempt),
+                        i64::from(code),
+                        &now_str,
+                        &row_id
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
                 return Ok(DeliveryOutcome::Delivered);
             }
             Err((status_opt, err_msg)) => {
@@ -1421,44 +1493,44 @@ async fn deliver_event_with_retries(
                         + ChronoDuration::from_std(delay)
                             .unwrap_or_else(|_| ChronoDuration::seconds(30)))
                     .to_rfc3339();
-                    db.with_tx(|tx| {
-                        tx.execute(
-                            "UPDATE watcher_deliveries
-                             SET status = ?1, attempts = ?2, last_http_status = ?3,
-                                 last_error = ?4, next_attempt_at = ?5, updated_at = ?6
-                             WHERE id = ?7",
-                            params![
-                                STATUS_RETRYING,
-                                i64::from(attempt),
-                                status_opt.map(i64::from),
-                                err_msg,
-                                next_at,
-                                now_str,
-                                row_id
-                            ],
-                        )?;
-                        Ok(())
-                    })?;
+                    let mut tx = db.begin_tx().await?;
+                    tx.execute(
+                        "UPDATE watcher_deliveries
+                         SET status = ?1, attempts = ?2, last_http_status = ?3,
+                             last_error = ?4, next_attempt_at = ?5, updated_at = ?6
+                         WHERE id = ?7",
+                        sql_args![
+                            STATUS_RETRYING,
+                            i64::from(attempt),
+                            status_opt.map(i64::from),
+                            &err_msg,
+                            &next_at,
+                            &now_str,
+                            &row_id
+                        ],
+                    )
+                    .await?;
+                    tx.commit().await?;
                     tokio::time::sleep(delay).await;
                 } else {
-                    db.with_tx(|tx| {
-                        tx.execute(
-                            "UPDATE watcher_deliveries
-                             SET status = ?1, attempts = ?2, last_http_status = ?3,
-                                 last_error = ?4, next_attempt_at = NULL,
-                                 updated_at = ?5, completed_at = ?5
-                             WHERE id = ?6",
-                            params![
-                                STATUS_DEAD_LETTER,
-                                i64::from(attempt),
-                                status_opt.map(i64::from),
-                                err_msg,
-                                now_str,
-                                row_id
-                            ],
-                        )?;
-                        Ok(())
-                    })?;
+                    let mut tx = db.begin_tx().await?;
+                    tx.execute(
+                        "UPDATE watcher_deliveries
+                         SET status = ?1, attempts = ?2, last_http_status = ?3,
+                             last_error = ?4, next_attempt_at = NULL,
+                             updated_at = ?5, completed_at = ?5
+                         WHERE id = ?6",
+                        sql_args![
+                            STATUS_DEAD_LETTER,
+                            i64::from(attempt),
+                            status_opt.map(i64::from),
+                            &err_msg,
+                            &now_str,
+                            &row_id
+                        ],
+                    )
+                    .await?;
+                    tx.commit().await?;
                     return Ok(DeliveryOutcome::DeadLetter);
                 }
             }
@@ -1478,18 +1550,24 @@ pub async fn dispatch_watcher_once(
     watcher_id: &str,
     policy: &DeliveryPolicy,
 ) -> BoardResult<DispatchReport> {
-    let loaded = db.with_conn(|conn| {
-        let Some(stored) = load_stored_watcher_tx(conn, board_id, owner_principal, watcher_id)? else {
-            return Ok(None);
-        };
-        let Some(caller) = resolve_watcher_caller(conn, owner_principal, watcher_id)? else {
-            return Ok(None);
-        };
-        let board_name = boards::find_board_tx(conn, board_id)?
-            .map(|b| b.name)
-            .unwrap_or_else(|| board_id.to_string());
-        Ok(Some((stored, caller, board_name)))
-    })?;
+    let loaded = {
+        let mut conn = db.read_conn();
+        match load_stored_watcher_tx(&mut conn, board_id, owner_principal, watcher_id).await? {
+            None => None,
+            Some(stored) => {
+                match resolve_watcher_caller(&mut conn, owner_principal, watcher_id).await? {
+                    None => None,
+                    Some(caller) => {
+                        let board_name = boards::find_board_tx(&mut conn, board_id)
+                            .await?
+                            .map(|b| b.name)
+                            .unwrap_or_else(|| board_id.to_string());
+                        Some((stored, caller, board_name))
+                    }
+                }
+            }
+        }
+    };
 
     let Some((watcher, watcher_caller, board_name)) = loaded else {
         return Ok(DispatchReport::default());
@@ -1507,7 +1585,8 @@ pub async fn dispatch_watcher_once(
             &watcher_caller,
             cursor_seq,
             &event_query,
-        )?;
+        )
+        .await?;
 
         if page.events.is_empty() {
             if let Some(tip_seq) = events::parse_event_cursor_seq(&page.cursor) {
@@ -1518,7 +1597,8 @@ pub async fn dispatch_watcher_once(
                         &watcher.owner_principal,
                         &watcher.id,
                         tip_seq,
-                    )?;
+                    )
+                    .await?;
                 }
             }
             break;
@@ -1529,7 +1609,7 @@ pub async fn dispatch_watcher_once(
                 continue;
             };
 
-            let raw_actor_id = load_event_raw_actor_id(db, &watcher.board_id, ev_seq)?;
+            let raw_actor_id = load_event_raw_actor_id(db, &watcher.board_id, ev_seq).await?;
             let ev_actor_id = raw_actor_id
                 .as_deref()
                 .or_else(|| ev.actor.as_ref().map(|a| a.id.as_str()));
@@ -1542,7 +1622,8 @@ pub async fn dispatch_watcher_once(
                     &watcher.owner_principal,
                     &watcher.id,
                     ev_seq,
-                )?;
+                )
+                .await?;
                 cursor_seq = ev_seq;
                 continue;
             }
@@ -1571,7 +1652,8 @@ pub async fn dispatch_watcher_once(
                 &watcher.owner_principal,
                 &watcher.id,
                 ev_seq,
-            )?;
+            )
+            .await?;
             cursor_seq = ev_seq;
         }
     }
@@ -1586,17 +1668,20 @@ pub async fn dispatch_board_once(
     board_id: &str,
     policy: &DeliveryPolicy,
 ) -> BoardResult<DispatchReport> {
-    let keys: Vec<(String, String)> = db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT owner_principal, id FROM watchers WHERE board_id = ?1 ORDER BY owner_principal ASC, id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![board_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })?;
+    let keys: Vec<(String, String)> = {
+        let mut conn = db.read_conn();
+        let rows = conn
+            .fetch_all(
+                "SELECT owner_principal, id FROM watchers WHERE board_id = ?1 ORDER BY owner_principal ASC, id ASC",
+                sql_args![board_id],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push((r.get_str(0)?, r.get_str(1)?));
+        }
+        out
+    };
 
     let mut total = DispatchReport::default();
     for (owner, id) in keys {
@@ -1612,21 +1697,20 @@ pub async fn dispatch_all_once(
     client: &reqwest::Client,
     policy: &DeliveryPolicy,
 ) -> BoardResult<DispatchReport> {
-    let keys: Vec<(String, String, String)> = db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT board_id, owner_principal, id FROM watchers ORDER BY board_id ASC, owner_principal ASC, id ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })?;
+    let keys: Vec<(String, String, String)> = {
+        let mut conn = db.read_conn();
+        let rows = conn
+            .fetch_all(
+                "SELECT board_id, owner_principal, id FROM watchers ORDER BY board_id ASC, owner_principal ASC, id ASC",
+                sql_args![],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push((r.get_str(0)?, r.get_str(1)?, r.get_str(2)?));
+        }
+        out
+    };
 
     let mut total = DispatchReport::default();
     for (board_id, owner, id) in keys {
@@ -1660,21 +1744,28 @@ async fn dispatch_board_serialized(
     policy: &DeliveryPolicy,
     locks: &WatcherLocks,
 ) {
-    let keys: Vec<(String, String)> = match db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT owner_principal, id FROM watchers WHERE board_id = ?1 ORDER BY owner_principal ASC, id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![board_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }) {
-        Ok(k) => k,
-        Err(err) => {
-            tracing::warn!("failed to list watchers for board {board_id}: {err}");
-            return;
+    let keys: Vec<(String, String)> = {
+        let mut conn = db.read_conn();
+        match conn
+            .fetch_all(
+                "SELECT owner_principal, id FROM watchers WHERE board_id = ?1 ORDER BY owner_principal ASC, id ASC",
+                sql_args![board_id],
+            )
+            .await
+        {
+            Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if let (Ok(o), Ok(id)) = (r.get_str(0), r.get_str(1)) {
+                        out.push((o, id));
+                    }
+                }
+                out
+            }
+            Err(err) => {
+                tracing::warn!("failed to list watchers for board {board_id}: {err}");
+                return;
+            }
         }
     };
 
@@ -1710,22 +1801,22 @@ pub fn spawn_watcher_dispatcher_with_policy(
     policy: DeliveryPolicy,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = state.http.clone();
         let locks = WatcherLocks::default();
         let mut board_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
         loop {
-            let board_ids: Vec<String> = match state.db.with_conn(|conn| {
-                let mut stmt = conn.prepare("SELECT DISTINCT board_id FROM watchers")?;
-                let rows = stmt
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            }) {
-                Ok(ids) => ids,
-                Err(err) => {
-                    tracing::warn!("watcher dispatcher failed to query boards: {err}");
-                    Vec::new()
+            let board_ids: Vec<String> = {
+                let mut conn = state.db.read_conn();
+                match conn
+                    .fetch_all("SELECT DISTINCT board_id FROM watchers", sql_args![])
+                    .await
+                {
+                    Ok(rows) => rows.into_iter().filter_map(|r| r.get_str(0).ok()).collect(),
+                    Err(err) => {
+                        tracing::warn!("watcher dispatcher failed to query boards: {err}");
+                        Vec::new()
+                    }
                 }
             };
 
@@ -1739,7 +1830,6 @@ pub fn spawn_watcher_dispatcher_with_policy(
                     let task_locks = locks.clone();
                     let bid = board_id.clone();
 
-                    // Subscribe BEFORE initial catch-up so concurrent events cannot be missed.
                     let mut rx = task_state.events.subscribe(&bid);
 
                     let handle = tokio::spawn(async move {
@@ -1770,7 +1860,6 @@ pub fn spawn_watcher_dispatcher_with_policy(
                 }
             }
 
-            // Wake immediately when a watcher is registered/synced, or reconcile periodically.
             tokio::select! {
                 _ = state.watcher_wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -1828,23 +1917,19 @@ mod tests {
         );
         assert!(f.all);
 
-        // Channel-less label-only tail
         let f2 = parse_tail_expression("--label state=done").unwrap();
         assert_eq!(f2.channel, None);
         assert_eq!(f2.labels, vec!["state=done"]);
         assert!(!f2.all);
 
-        // Reject --after
         assert!(parse_tail_expression("support --after ev_5").is_err());
         assert!(parse_tail_expression("support --after=msg_123").is_err());
 
-        // Reject implicit / 'me' mentions
         assert!(parse_tail_expression("support --mentions").is_err());
         assert!(parse_tail_expression("support --mentions me").is_err());
         assert!(parse_tail_expression("support --mentions @me").is_err());
         assert!(parse_tail_expression("support --mentions @").is_err());
 
-        // Reject unknown flags & extra positional args
         assert!(parse_tail_expression("support --bogus foo").is_err());
         assert!(parse_tail_expression("support extra").is_err());
         assert!(parse_tail_expression("support --text 'unterminated").is_err());
@@ -1852,20 +1937,17 @@ mod tests {
 
     #[test]
     fn hmac_sha256_matches_rfc4231_test_vectors() {
-        // RFC 4231 Test Case 1
         let key1 = [0x0bu8; 20];
         assert_eq!(
             hmac_sha256_hex(&key1, b"Hi There"),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
 
-        // RFC 4231 Test Case 2
         assert_eq!(
             hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
 
-        // RFC 4231 Test Case 6 (key > 64 bytes)
         let key6 = [0xaau8; 131];
         assert_eq!(
             hmac_sha256_hex(&key6, b"Test Using Larger Than Block-Size Key - Hash Key First"),
