@@ -17,10 +17,12 @@ pub mod permissions;
 pub mod ratelimit;
 pub mod schemas;
 pub mod validate;
+pub mod watchers;
 
 use std::sync::Arc;
 
 use axum::Router;
+use tokio::sync::Notify;
 
 use crate::config::ServerConfig;
 use crate::db::Database;
@@ -34,6 +36,7 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub events: EventHub,
     pub rate_limiter: RateLimiter,
+    pub watcher_wake: Arc<Notify>,
 }
 
 impl AppState {
@@ -44,6 +47,7 @@ impl AppState {
             config: Arc::new(config),
             events: EventHub::new(),
             rate_limiter,
+            watcher_wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -66,6 +70,7 @@ pub async fn serve(config: ServerConfig) -> BoardResult<()> {
 
     let listen = config.listen;
     let state = AppState::new(db, config);
+    let _watcher_dispatcher = watchers::spawn_watcher_dispatcher(state.clone());
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(listen)

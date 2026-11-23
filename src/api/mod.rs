@@ -8,6 +8,7 @@ pub mod grants;
 pub mod labels;
 pub mod messages;
 pub mod schemas;
+pub mod watchers;
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .merge(schemas::routes())
         .merge(attachments::routes())
         .merge(events::routes())
+        .merge(watchers::routes())
         .with_state(state)
 }
 

@@ -288,6 +288,55 @@ const MIGRATIONS: &[Migration] = &[
                 ON events (board_id, message_id);
         "#,
     },
+    Migration {
+        version: 8,
+        name: "008_watchers",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS watchers (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                owner_principal TEXT NOT NULL,
+                id TEXT NOT NULL,
+                tail_expr TEXT NOT NULL,
+                filter_json TEXT NOT NULL,
+                webhook_url TEXT NOT NULL,
+                secret TEXT,
+                last_cursor INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, owner_principal, id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_watchers_owner
+                ON watchers (owner_principal);
+            CREATE INDEX IF NOT EXISTS idx_watchers_board
+                ON watchers (board_id);
+
+            CREATE TABLE IF NOT EXISTS watcher_deliveries (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                owner_principal TEXT NOT NULL,
+                watcher_id TEXT NOT NULL,
+                event_seq INTEGER NOT NULL,
+                event_cursor TEXT NOT NULL,
+                delivery_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_http_status INTEGER,
+                last_error TEXT,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE (board_id, owner_principal, watcher_id, event_seq),
+                FOREIGN KEY (board_id, owner_principal, watcher_id)
+                    REFERENCES watchers (board_id, owner_principal, id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_watcher_deliveries_watcher
+                ON watcher_deliveries (board_id, owner_principal, watcher_id, event_seq);
+            CREATE INDEX IF NOT EXISTS idx_watcher_deliveries_status
+                ON watcher_deliveries (status, next_attempt_at);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

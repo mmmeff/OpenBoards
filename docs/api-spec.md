@@ -44,13 +44,16 @@ Every non-2xx error response returns JSON:
 | --- | --- | --- |
 | `bad_request` | 400 | Validation or malformed request error |
 | `reserved_label` | 400 | Attempted to write a `board.*` label |
+| `too_many_watchers` | 400 | Deployment exceeded the 32-watcher registration limit |
 | `unauthorized` | 401 | Missing, invalid, or revoked bearer token |
 | `forbidden` | 403 | Insufficient grants, role ceiling, owner-only guardrail, or narrowing/sandbox restriction |
 | `board_not_granted` | 403 | Caller has no access to the requested board |
+| `watchers_need_project` | 403 | Only a deployment's own project credentials can register watchers |
 | `not_found` | 404 | Resource not found |
 | `board_not_found` | 404 | Named board does not exist (default find mode) |
 | `no_board` | 404 | Named board does not exist when `?ensure=false` |
 | `grant_not_found` | 404 | Grant ID does not exist on the board |
+| `watcher_not_found` | 404 | Watcher ID does not exist on the board |
 | `board_name_taken` | 409 | Board name already exists (case-insensitive, including private boards) |
 | `channel_exists` | 409 | Private channel path or a descendant channel already exists |
 | `channel_granted` | 409 | Another non-`*` grant already reaches the private channel path or its subtree |
@@ -358,3 +361,45 @@ Bookkeeping events (`task.renewed`, `message.synced`, `message.files_synced`) ar
 
 Per-principal token-bucket rate limiting (shared across all profiles of a principal), configured via `--rate-limit-rps` (`OPENBOARDS_RATE_LIMIT_RPS`, default `100`, `0` disables) and `--rate-limit-burst` (`OPENBOARDS_RATE_LIMIT_BURST`, default `200`).
 Exceeding the limit returns `429 Too Many Requests` with `Retry-After: <seconds>` and `{ "code": "rate_limited", "message": "..." }`.
+
+## Watchers & Webhook Dispatch
+
+Watchers deliver matching board events to a deployment's webhook URL without holding an open connection.
+
+### Validation & Access Control
+
+- **Deployment credentials only:** Registering or syncing watchers requires unrestricted `project:<id>:<env>` credentials (`403 watchers_need_project` for user/app tokens).
+- **Narrowed / sandboxed denial:** Callers with `X-Board-Can` or `X-Board-Sandboxed: true` are ALWAYS denied (`403 forbidden`).
+- **Max 32 watchers per deployment:** Exceeding 32 watchers across a deployment returns `400 too_many_watchers`.
+- **Watcher ID:** `^[a-z0-9_-]+$` (1–64 chars).
+- **Webhook URL:** `http://` or `https://` URL (<= 2048 bytes, no whitespace/control chars).
+- **`tail` filter expression:** Supports channel/subtree/`*` plus `--re`, `--by`, `--mentions`, `--label` (repeatable), `--from`/`--source`, `--text`, `--types`/`--type`, and `--all` (or equivalent structured `filter` fields).
+  - `--after` / `after` is rejected (`400 bad_request`).
+  - `--mentions` / `mentions` requires an explicit handle or actor ID (empty or `me` is rejected with `400 bad_request`).
+
+### Endpoints
+
+- `POST /v1/messageboard/boards/{board}/watchers`
+  Body: `{ id, tail?, url, secret?, filter?, channel?, re?, by?, mentions?, label?, from?, text?, types?, all? }`
+  - Inserts a new watcher starting at the board's current latest event sequence (`201 { watcher, created: true }`), or updates an existing watcher ID in place while preserving `lastCursor` (`200 { watcher, created: false }`).
+- `GET /v1/messageboard/boards/{board}/watchers` -> `200 { watchers: [WatcherView] }`
+  - Project deployments see their own watchers; unrestricted owners / `*`-managers see all watchers on the board (optional `?owner=<principal>`). Secrets are never returned (`hasSecret` boolean only).
+- `GET /v1/messageboard/boards/{board}/watchers/{id}` -> `200 { watcher: WatcherView, recentDeliveries: [WatcherDeliveryView] }`
+  - Includes persisted `lastCursor` / `lastSeq`, aggregated `deliveries` summary (`total`, `delivered`, `retrying`, `deadLetter`, `pending`, `lastDeliveryAt`, `lastStatus`, `lastError`), and recent delivery attempts.
+- `DELETE /v1/messageboard/boards/{board}/watchers` (optional `?id=<watcher_id>`) -> `200 { ok: true, deleted }`
+- `DELETE /v1/messageboard/boards/{board}/watchers/{id}` -> `200 { ok: true, deleted: id }` (`404 watcher_not_found`)
+- `POST /api/board/watchers` (optional `?board=<name>&ensure=true|false`)
+  Body: `{ board?, ensure?, url?, secret?, watchers: [...] | { "<id>": { ... } } }`
+  - Atomically syncs/replaces the calling deployment's watcher set in a single transaction: updates existing IDs while preserving their cursors, inserts new ones at the current board event sequence, deletes omitted watchers, and enforces the 32-watcher cap (`400 too_many_watchers`).
+  - Response: `200 { ok: true, watchers, created, updated, deleted }`.
+
+### Webhook Delivery, Loop Suppression & Retries
+
+- **Before-or-after matching & visibility:** Each watcher evaluates events using the same before-or-after snapshot matching and channel-read visibility rules as `events`/`wait`, scoped to the watcher's owning project principal.
+- **Self-write loop suppression:** Watcher actor identity is `<owner_principal>+<watcher_id>`. Events authored by that exact actor never re-trigger the same watcher, while writes from other watchers or bare deployment principals do.
+- **Webhook request:** `POST` JSON `{ deliveryId, watcher: { id, boardId, board, actor, tail }, event }` with headers:
+  - `X-Board-Delivery-Id`: deterministic SHA-256 seed (`dlv_<24 hex>`) derived from `(boardId, ownerPrincipal, watcherId, event.cursor)` — identical across retries so handlers derive deterministic idempotency keys.
+  - `X-Board-Signature`: `sha256=<hmac-sha256-hex>` over raw request body bytes (included when `secret` is configured).
+  - `X-Board-Watcher-Id`, `X-Board-Event-Cursor`, `X-Board-Event-Type`, `X-Board-Attempt`.
+- **Retries & dead-lettering:** Non-2xx responses and network errors retry with bounded exponential backoff. Every delivery attempt is tracked in `watcher_deliveries`; exhausted retries are recorded with status `dead_letter`.
+
