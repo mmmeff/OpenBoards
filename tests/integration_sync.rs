@@ -787,3 +787,150 @@ async fn github_linear_custom_sync_nosync_root_retries_permissions_and_typing() 
     assert_eq!(st, StatusCode::OK);
     assert_eq!(typ_res["targets"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn spec_audit_github_label_change_events_and_webhook_dedup() {
+    let h = TestHarness::new();
+    let (_pid, proj_tok) = h.create_project_token("ops", "production").await;
+    let (_alice_id, alice_tok) = h.create_user("alice", "member").await;
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/sync/sources",
+            Some(&proj_tok),
+            &[],
+            Some(json!({
+                "key": "gh",
+                "platform": "github",
+                "mappings": { "acme/web": "prs" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // Open PR #7
+    let open_pr = json!({
+        "action": "opened",
+        "repository": { "full_name": "acme/web" },
+        "pull_request": {
+            "number": 7,
+            "title": "Ship fix",
+            "body": "Body",
+            "state": "open",
+            "draft": false,
+            "merged": false,
+            "html_url": "https://github.com/acme/web/pull/7",
+            "head": { "sha": "111aaa" },
+            "user": { "login": "octocat" }
+        }
+    })
+    .to_string();
+    let (st, pr_res) = h
+        .req_raw_str(
+            Method::POST,
+            "/v1/messageboard/boards/General/webhooks/gh",
+            None,
+            &[("x-github-event", "pull_request")],
+            open_pr,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let pr_root = pr_res["messageId"].as_str().unwrap().to_string();
+
+    // Merge PR #7 (no text edit) -> MUST emit `labels.changed` event with `state=merged`
+    let merge_pr = json!({
+        "action": "closed",
+        "repository": { "full_name": "acme/web" },
+        "pull_request": {
+            "number": 7,
+            "title": "Ship fix",
+            "body": "Body",
+            "state": "closed",
+            "draft": false,
+            "merged": true,
+            "html_url": "https://github.com/acme/web/pull/7",
+            "head": { "sha": "222bbb" },
+            "user": { "login": "octocat" }
+        }
+    })
+    .to_string();
+    let (st, _) = h
+        .req_raw_str(
+            Method::POST,
+            "/v1/messageboard/boards/General/webhooks/gh",
+            None,
+            &[("x-github-event", "pull_request")],
+            merge_pr,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, evs) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/events?after={pr_root}&label=state=merged"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        evs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "labels.changed" && e["payload"]["set"]["state"] == "merged"),
+        "expected labels.changed event for merged PR, got {evs}"
+    );
+
+    // Redelivered issue_comment webhook must be deduplicated
+    let comment_hook = json!({
+        "action": "created",
+        "repository": { "full_name": "acme/web" },
+        "issue": { "number": 7 },
+        "comment": {
+            "id": 501,
+            "body": "looks good",
+            "html_url": "https://github.com/acme/web/pull/7#issuecomment-501",
+            "user": { "login": "reviewer" }
+        }
+    })
+    .to_string();
+    let (st, r1) = h
+        .req_raw_str(
+            Method::POST,
+            "/v1/messageboard/boards/General/webhooks/gh",
+            None,
+            &[("x-github-event", "issue_comment")],
+            comment_hook.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(r1["messageId"].is_string());
+
+    let (st, r2) = h
+        .req_raw_str(
+            Method::POST,
+            "/v1/messageboard/boards/General/webhooks/gh",
+            None,
+            &[("x-github-event", "issue_comment")],
+            comment_hook,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(r2["ignored"], "duplicate");
+
+    let (st, thread) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/threads/{pr_root}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(thread["replies"].as_array().unwrap().len(), 1);
+}

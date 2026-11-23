@@ -457,6 +457,22 @@ fn check_idempotency_tx(
         .optional()?;
 
     let Some((scope, ch, root, msg_id)) = row else {
+        // Also reject keys already used for a task batch (`task_batches`) -> 409 duplicate_id
+        let used_in_batch: bool = conn
+            .query_row(
+                "SELECT 1 FROM task_batches
+                 WHERE board_id = ?1 AND caller_actor = ?2 AND idempotency_key = ?3",
+                params![board_id, caller_actor, key],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if used_in_batch {
+            return Err(BoardError::new(
+                ErrorCode::DuplicateId,
+                format!("idempotency key '{key}' was already used for a task batch"),
+            ));
+        }
         return Ok(None);
     };
 
@@ -913,9 +929,6 @@ pub fn edit_message(
     input: EditMessageInput,
 ) -> BoardResult<(MessageView, Vec<MentionResolution>, Vec<i64>)> {
     validate_text_length(&input.text)?;
-    if input.text.is_empty() {
-        return Err(BoardError::bad_request("edited text cannot be empty"));
-    }
 
     db.with_tx(|tx| {
         let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
@@ -958,6 +971,12 @@ pub fn edit_message(
             return Err(BoardError::new(
                 ErrorCode::MessageDeleted,
                 format!("message '{message_id}' has been deleted"),
+            ));
+        }
+
+        if input.text.is_empty() && attachments::load_message_attachments_tx(tx, message_id)?.is_empty() {
+            return Err(BoardError::bad_request(
+                "edited text cannot be empty unless the message has attachments",
             ));
         }
 

@@ -549,6 +549,7 @@ fn matches_channel_filter(channel_filter: &str, channel: &str) -> bool {
 }
 
 fn matches_by_filter(by_filter: &str, caller: &CallerContext, view: &ScheduleView) -> bool {
+    let by_filter = by_filter.trim().trim_start_matches('@');
     if by_filter.eq_ignore_ascii_case("me") {
         if caller.profile.is_some() {
             return view.by.actor == caller.actor_id();
@@ -744,7 +745,11 @@ pub fn cancel_schedule(
 
 /// Fires all pending schedules whose `next_run_at <= now` using `state.db` and `state.events`.
 pub fn fire_due_schedules(state: &AppState) -> BoardResult<FireSummary> {
-    fire_due_schedules_at(&state.db, &state.events, Utc::now())
+    let summary = fire_due_schedules_at(&state.db, &state.events, Utc::now())?;
+    if summary.fired > 0 {
+        state.sync_wake.notify_one();
+    }
+    Ok(summary)
 }
 
 /// Deterministic helper for firing due schedules at a caller-supplied timestamp `now`.

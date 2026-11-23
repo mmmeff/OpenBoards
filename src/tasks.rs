@@ -897,6 +897,12 @@ pub fn create_task(
                 event_seqs.push(seq);
             }
             if posted.replayed {
+                if posted.message.task.is_none() {
+                    return Err(BoardError::new(
+                        ErrorCode::DuplicateId,
+                        "idempotency key was already used for a non-task post",
+                    ));
+                }
                 // Idempotent replay of an already-created task
                 return Ok(CreateTaskResult {
                     task: posted.message,
@@ -1233,6 +1239,21 @@ pub fn create_many_tasks(
                     event_seqs,
                 });
             }
+            let used_in_msg: bool = tx
+                .query_row(
+                    "SELECT 1 FROM idempotency_keys
+                     WHERE board_id = ?1 AND caller_actor = ?2 AND key = ?3",
+                    params![board_id, owner_actor, idem_key],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if used_in_msg {
+                return Err(BoardError::new(
+                    ErrorCode::DuplicateId,
+                    format!("idempotency key '{idem_key}' was already used for a post or reply"),
+                ));
+            }
         }
 
         let board_grants = grants::load_grants_tx(tx, board_id)?;
@@ -1501,6 +1522,19 @@ pub fn list_tasks(
             Some(c) => {
                 if let Some(m) = messages::load_stored_message_tx(conn, board_id, c)? {
                     m.seq
+                } else if let Some(ev_seq) = events::parse_event_cursor_seq(c) {
+                    let msg_seq: Option<i64> = conn
+                        .query_row(
+                            "SELECT m.seq
+                             FROM events e
+                             JOIN messages m ON m.id = e.message_id
+                             WHERE e.board_id = ?1 AND e.seq <= ?2 AND e.event_type = 'message.posted'
+                             ORDER BY e.seq DESC LIMIT 1",
+                            params![board_id, ev_seq],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    msg_seq.unwrap_or(0)
                 } else {
                     return Err(BoardError::bad_request(format!(
                         "invalid tasks cursor '{c}'"

@@ -1013,3 +1013,125 @@ async fn existing_thread_task_assign_release_pagination_tree_limit_and_lease_exp
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(err["code"], "channel_tree_too_large");
 }
+
+#[tokio::test]
+async fn spec_audit_cross_table_idempotency_event_cursor_and_reserved_hint() {
+    let h = TestHarness::new();
+    let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+
+    // 1. reserved_label for `board.task` names `tasks` commands in hint
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "text": "x", "labels": { "board.task": "ready" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], "reserved_label");
+    assert!(
+        err["hint"].as_str().unwrap_or("").contains("tasks"),
+        "expected hint naming tasks commands, got {err}"
+    );
+
+    // 2. Cross-table `duplicate_id`: post key cannot be reused for tasks.create or tasks.createMany
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "text": "plain post", "id": "shared-key-1" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/tasks",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "text": "task reuse", "id": "shared-key-1" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "duplicate_id");
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/tasks/batch",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "id": "shared-key-1", "tasks": [{ "text": "b1" }] })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "duplicate_id");
+
+    // Conversely, a task batch key cannot be reused for a regular post
+    let (st, batch) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/tasks/batch",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "id": "batch-key-2", "tasks": [{ "text": "t1" }, { "text": "t2" }] })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(batch["tasks"].as_array().unwrap().len(), 2);
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "work", "text": "post reuse", "id": "batch-key-2" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "duplicate_id");
+
+    // 3. `tasks?after=ev_<seq>` accepts event cursors seamlessly
+    let (st, evs) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0&types=task.created",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let first_task_ev_cursor = evs["events"][0]["cursor"].as_str().unwrap();
+    let (st, page) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/tasks?state=all&after={first_task_ev_cursor}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(page["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(page["tasks"][0]["message"]["text"], "t2");
+
+    // 4. `wait?timeout=1h` is accepted (matches documented `--timeout 1h` examples)
+    let (st, woken) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/wait?after=0&timeout=1h",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(woken["event"]["cursor"].is_string());
+}

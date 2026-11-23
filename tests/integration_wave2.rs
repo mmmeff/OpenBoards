@@ -1516,3 +1516,86 @@ async fn live_long_poll_wakeup_wait_timeout_and_rate_limiting() {
     let body: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(body["code"], "rate_limited");
 }
+
+#[tokio::test]
+async fn spec_audit_narrowed_upload_attachment_edit_and_by_handle_prefix() {
+    let h = TestHarness::new();
+    let (_uid, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+
+    // 1. Narrowed caller scoped to `dev/` can upload an attachment
+    let (st, _, raw) = h
+        .req_raw(
+            Method::POST,
+            "/v1/messageboard/boards/General/attachments?name=narrow.txt",
+            Some(&alice_tok),
+            &[
+                ("content-type", "text/plain"),
+                ("x-board-can", r#"{"dev/":["read","post"]}"#),
+            ],
+            b"narrowed attachment".to_vec(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let att: Value = serde_json::from_slice(&raw).unwrap();
+    let att_id = att["id"].as_str().unwrap().to_string();
+
+    // 2. Post with attachment, then edit text to empty string succeeds (while text-only edit to empty fails 400)
+    let (st, msg) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[("x-board-as", "fx")],
+            Some(json!({ "channel": "dev", "text": "initial", "attachments": [att_id] })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let mid = msg["id"].as_str().unwrap();
+
+    let (st, edited) = h
+        .req(
+            Method::PATCH,
+            &format!("/v1/messageboard/boards/General/messages/{mid}"),
+            Some(&alice_tok),
+            &[("x-board-as", "fx")],
+            Some(json!({ "text": "" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(edited["message"]["text"], "");
+
+    let (st, plain) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "dev", "text": "no attachments" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let plain_id = plain["id"].as_str().unwrap();
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            &format!("/v1/messageboard/boards/General/messages/{plain_id}"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "text": "" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 3. `--by @alice` (leading `@`) matches both `alice` and `alice/fx`
+    let (st, page) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/messages?channel=dev&by=@alice",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+}

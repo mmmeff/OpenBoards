@@ -741,12 +741,22 @@ pub async fn run_conformance(
             expect(who["profile"] == "sandbox-agent", "proxy did not force profile")?;
             expect(who["sandboxed"] == true, "proxy did not force sandboxed=true")?;
 
-            // Allowed in sandbox-ch
+            // Allowed in sandbox-ch (including uploading an attachment under narrowed policy!)
+            let att = sandboxed
+                .upload_bytes("sbx.txt", Some("text/plain"), b"sandbox blob".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            let att_id = att["id"].as_str().unwrap().to_string();
             let p = sandboxed
-                .post_message(&json!({ "channel": "sandbox-ch", "text": "hello from sandbox" }))
+                .post_message(&json!({
+                    "channel": "sandbox-ch",
+                    "text": "hello from sandbox",
+                    "attachments": [att_id]
+                }))
                 .await
                 .map_err(|e| e.to_string())?;
             expect(p["by"]["profile"] == "sandbox-agent", "post not attributed to sandbox profile")?;
+            expect(p["attachments"].as_array().map(|a| a.len()) == Some(1), "sandbox attachment missing")?;
 
             // Denied outside sandbox-ch/
             let denied_ch = sandboxed

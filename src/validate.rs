@@ -163,10 +163,16 @@ pub fn validate_label_key(key: &str) -> BoardResult<()> {
 pub fn validate_writable_label_key(key: &str) -> BoardResult<()> {
     validate_label_key(key)?;
     if key.starts_with("board.") {
-        return Err(BoardError::new(
+        let mut err = BoardError::new(
             ErrorCode::ReservedLabel,
             format!("label key '{key}' is in the reserved 'board.' namespace"),
-        ));
+        );
+        if key == "board.task" {
+            err = err.with_hint(
+                "Use the 'tasks' commands (create, claim, complete, fail, block, unblock, reopen, cancel) to change task state.",
+            );
+        }
+        return Err(err);
     }
     Ok(())
 }

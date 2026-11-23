@@ -41,7 +41,7 @@ pub struct Cli {
     pub avatar: Option<String>,
 
     /// Team identifier
-    #[arg(long, global = true, env = "OPENBOARDS_TEAM")]
+    #[arg(long, alias = "scope", global = true, env = "OPENBOARDS_TEAM")]
     pub team: Option<String>,
 
     /// Create named board if it does not exist
@@ -135,15 +135,45 @@ pub enum Command {
     Poll(EventFilterArgs),
     /// Follow live board events until Ctrl-C
     Tail(EventFilterArgs),
-    /// Block until the next matching event arrives (exit 2 on timeout)
+    /// Block until the next matching event arrives (exit 1 on timeout, 130 on Ctrl-C)
     Wait(WaitArgs),
     /// Manage tasks, claims, DAG dependencies, and run worker commands
     Tasks {
+        /// Channel or subtree to list tasks from (e.g. `tasks work/`)
+        channel: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long)]
+        by: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long = "for")]
+        assigned_for: Option<String>,
+        #[arg(long)]
+        needs: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
         #[command(subcommand)]
         cmd: Option<TasksCmd>,
     },
-    /// Manage scheduled posts and replies
+    /// Schedule a post or reply for later (or cancel via `schedule cancel <id>`)
+    Schedule(Box<ScheduleSingularArgs>),
+    /// List or inspect scheduled posts and replies
     Schedules {
+        /// Optional schedule ID to inspect (`schedules <id>`)
+        id: Option<String>,
+        #[arg(long)]
+        re: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        by: Option<String>,
+        #[arg(short = 'a', long, default_value_t = false)]
+        all: bool,
         #[command(subcommand)]
         cmd: Option<SchedulesCmd>,
     },
@@ -152,10 +182,16 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<WatchersCmd>,
     },
-    /// Sync a thread with an external platform target
-    Sync { id: String, target: String },
-    /// List configured sync sources
-    Sources,
+    /// Show where a thread is synced, or sync it with an external platform target
+    Sync {
+        id: String,
+        target: Option<String>,
+    },
+    /// List configured sync sources (or `sources <key> read` to inspect records)
+    Sources {
+        key: Option<String>,
+        action: Option<String>,
+    },
     /// Inspect raw inbound sync events for a source key
     Inbox { key: String },
     /// Find the board thread linked to an external URL
@@ -279,6 +315,16 @@ pub enum GrantsCmd {
         add_users: Vec<String>,
         #[arg(long = "remove-user")]
         remove_users: Vec<String>,
+        #[arg(long = "add-project")]
+        add_projects: Vec<String>,
+        #[arg(long = "remove-project")]
+        remove_projects: Vec<String>,
+        #[arg(long = "environment", short = 'e')]
+        environments: Vec<String>,
+        #[arg(long = "add-app")]
+        add_apps: Vec<String>,
+        #[arg(long = "remove-app")]
+        remove_apps: Vec<String>,
         #[arg(long = "can")]
         can: Vec<String>,
     },
@@ -304,6 +350,7 @@ pub enum GrantsCmd {
 #[derive(Debug, Subcommand)]
 pub enum SchemasCmd {
     List,
+    #[command(visible_alias = "inspect")]
     Get {
         id: String,
     },
@@ -311,7 +358,7 @@ pub enum SchemasCmd {
         /// Schema identifier `<name>@<version>`
         id: String,
         #[arg(long)]
-        file: Option<PathBuf>,
+        file: Option<String>,
         #[arg(long)]
         data: Option<String>,
         #[arg(long)]
@@ -321,7 +368,8 @@ pub enum SchemasCmd {
 
 #[derive(Debug, Args)]
 pub struct PostArgs {
-    pub channel: String,
+    /// Channel path, or existing message ID (`msg_...`) to reply in that thread
+    pub target: String,
     pub text: Option<String>,
     #[arg(long)]
     pub file: Option<String>,
@@ -333,6 +381,8 @@ pub struct PostArgs {
     pub schema: Option<String>,
     #[arg(long = "id", alias = "idempotency-key")]
     pub id: Option<String>,
+    #[arg(long = "sync")]
+    pub sync: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub no_sync: bool,
 }
@@ -365,7 +415,7 @@ pub struct ReadArgs {
     pub re: Option<String>,
     #[arg(long)]
     pub by: Option<String>,
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "me")]
     pub mentions: Option<String>,
     #[arg(long = "label")]
     pub labels: Vec<String>,
@@ -432,7 +482,7 @@ pub struct EventFilterArgs {
     pub re: Option<String>,
     #[arg(long)]
     pub by: Option<String>,
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "me")]
     pub mentions: Option<String>,
     #[arg(long = "label")]
     pub labels: Vec<String>,
@@ -460,7 +510,7 @@ pub struct WaitArgs {
     pub re: Option<String>,
     #[arg(long)]
     pub by: Option<String>,
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "me")]
     pub mentions: Option<String>,
     #[arg(long = "label")]
     pub labels: Vec<String>,
@@ -503,6 +553,9 @@ pub enum TasksCmd {
         /// Channel name or existing message ID (`msg_...`)
         target: String,
         text: Option<String>,
+        /// JSON task plan file (or '-' for stdin) to create multiple tasks in `target` channel
+        #[arg(long)]
+        file: Option<String>,
         #[arg(long = "label")]
         labels: Vec<String>,
         #[arg(long = "needs")]
@@ -633,6 +686,36 @@ pub enum TasksCmd {
     },
 }
 
+#[derive(Debug, Args)]
+pub struct ScheduleSingularArgs {
+    /// Channel path, message ID (`msg_...`), or `cancel`
+    pub target: String,
+    /// Message text (or schedule ID when target is `cancel`)
+    pub text: Option<String>,
+    #[arg(long)]
+    pub file: Option<String>,
+    #[arg(long = "attach")]
+    pub attachments: Vec<String>,
+    #[arg(long)]
+    pub schema: Option<String>,
+    #[arg(long = "in")]
+    pub delay_in: Option<String>,
+    #[arg(long)]
+    pub at: Option<String>,
+    #[arg(long)]
+    pub every: Option<String>,
+    #[arg(long = "for")]
+    pub repeat_for: Option<String>,
+    #[arg(long)]
+    pub times: Option<i64>,
+    #[arg(short = 'u', long)]
+    pub until: Option<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub no_sync: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SchedulesCmd {
     List {
@@ -645,27 +728,10 @@ pub enum SchedulesCmd {
         #[arg(short = 'a', long, default_value_t = false)]
         all: bool,
     },
-    Create {
-        /// Channel path or message ID (`msg_...`)
-        target: String,
-        text: String,
-        #[arg(long = "in")]
-        delay_in: Option<String>,
-        #[arg(long)]
-        at: Option<String>,
-        #[arg(long)]
-        every: Option<String>,
-        #[arg(long = "for")]
-        repeat_for: Option<String>,
-        #[arg(long)]
-        times: Option<i64>,
-        #[arg(long)]
-        until: Option<String>,
-        #[arg(long = "label")]
-        labels: Vec<String>,
-        #[arg(long, default_value_t = false)]
-        no_sync: bool,
+    Get {
+        id: String,
     },
+    Create(Box<ScheduleSingularArgs>),
     Cancel {
         id: String,
     },
@@ -960,6 +1026,35 @@ fn parse_kv_pairs(raw: &[String]) -> Result<BTreeMap<String, String>, ClientErro
     Ok(map)
 }
 
+/// Resolves `--attach` arguments: existing `att_...` IDs pass straight through, while local
+/// file paths are uploaded via inline/streaming attachment upload and replaced with their IDs.
+async fn resolve_attachment_args(
+    client: &BoardClient,
+    raw: &[String],
+) -> Result<Vec<String>, ClientError> {
+    let mut ids = Vec::with_capacity(raw.len());
+    for item in raw {
+        if item.starts_with("att_") && !std::path::Path::new(item).exists() {
+            ids.push(item.clone());
+            continue;
+        }
+        let path = std::path::Path::new(item);
+        let bytes = std::fs::read(path)
+            .map_err(|e| ClientError::usage(format!("failed reading attachment '{item}': {e}")))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.bin");
+        let uploaded = client.upload_bytes(filename, None, bytes).await?;
+        let att_id = uploaded["id"]
+            .as_str()
+            .ok_or_else(|| ClientError::transport("upload response missing attachment id"))?
+            .to_string();
+        ids.push(att_id);
+    }
+    Ok(ids)
+}
+
 async fn dispatch_client_command(
     client: BoardClient,
     cmd: Command,
@@ -1176,26 +1271,48 @@ async fn dispatch_client_command(
                     id,
                     add_users,
                     remove_users,
+                    add_projects,
+                    remove_projects,
+                    environments,
+                    add_apps,
+                    remove_apps,
                     can,
                 } => {
                     let mut body = serde_json::Map::new();
-                    if !add_users.is_empty() {
-                        body.insert(
-                            "add".into(),
-                            json!(add_users
-                                .into_iter()
-                                .map(|u| json!({ "kind": "user", "email": u }))
-                                .collect::<Vec<_>>()),
-                        );
+                    let mut add_list: Vec<Value> = add_users
+                        .into_iter()
+                        .map(|u| json!({ "kind": "user", "email": u }))
+                        .collect();
+                    for p in add_projects {
+                        if environments.is_empty() {
+                            add_list.push(json!({ "kind": "project", "project": p }));
+                        } else {
+                            add_list.push(json!({ "kind": "project", "project": p, "environments": environments }));
+                        }
                     }
-                    if !remove_users.is_empty() {
-                        body.insert(
-                            "remove".into(),
-                            json!(remove_users
-                                .into_iter()
-                                .map(|u| json!({ "kind": "user", "email": u }))
-                                .collect::<Vec<_>>()),
-                        );
+                    for a in add_apps {
+                        add_list.push(json!({ "kind": "app", "app": a }));
+                    }
+                    if !add_list.is_empty() {
+                        body.insert("add".into(), Value::Array(add_list));
+                    }
+
+                    let mut remove_list: Vec<Value> = remove_users
+                        .into_iter()
+                        .map(|u| json!({ "kind": "user", "email": u }))
+                        .collect();
+                    for p in remove_projects {
+                        if environments.is_empty() {
+                            remove_list.push(json!({ "kind": "project", "project": p }));
+                        } else {
+                            remove_list.push(json!({ "kind": "project", "project": p, "environments": environments }));
+                        }
+                    }
+                    for a in remove_apps {
+                        remove_list.push(json!({ "kind": "app", "app": a }));
+                    }
+                    if !remove_list.is_empty() {
+                        body.insert("remove".into(), Value::Array(remove_list));
                     }
                     if !can.is_empty() {
                         let mut can_map = serde_json::Map::new();
@@ -1258,8 +1375,7 @@ async fn dispatch_client_command(
                         .parse()
                         .map_err(|_| ClientError::usage("invalid schema version"))?;
                     let raw = match (file, data) {
-                        (Some(p), _) => std::fs::read_to_string(&p)
-                            .map_err(|e| ClientError::usage(format!("failed reading schema file: {e}")))?,
+                        (Some(f), _) => read_text_arg(None, Some(f))?,
                         (None, Some(d)) => d,
                         (None, None) => {
                             return Err(ClientError::usage("provide --file or --data for schema"));
@@ -1282,19 +1398,52 @@ async fn dispatch_client_command(
         }
 
         Command::Post(args) => {
+            if args.no_sync && !args.sync.is_empty() {
+                return Err(ClientError::usage(
+                    "cannot combine --no-sync and --sync",
+                ));
+            }
             let text = read_text_arg(args.text, args.file)?;
             let labels = parse_kv_pairs(&args.labels)?;
-            let val = client
-                .post_message(&json!({
-                    "channel": args.channel,
-                    "text": text,
-                    "labels": labels,
-                    "attachments": args.attachments,
-                    "schema": args.schema,
-                    "id": args.id,
-                    "noSync": args.no_sync
-                }))
-                .await?;
+            let attachments = resolve_attachment_args(&client, &args.attachments).await?;
+            let val = if args.target.starts_with("msg_") {
+                if !args.sync.is_empty() {
+                    return Err(ClientError::usage(
+                        "--sync is only valid when starting a new thread in a channel",
+                    ));
+                }
+                client
+                    .reply_message(
+                        &args.target,
+                        &json!({
+                            "text": text,
+                            "labels": labels,
+                            "attachments": attachments,
+                            "schema": args.schema,
+                            "id": args.id,
+                            "noSync": args.no_sync
+                        }),
+                    )
+                    .await?
+            } else {
+                let posted = client
+                    .post_message(&json!({
+                        "channel": args.target,
+                        "text": text,
+                        "labels": labels,
+                        "attachments": attachments,
+                        "schema": args.schema,
+                        "id": args.id,
+                        "noSync": args.no_sync
+                    }))
+                    .await?;
+                if let Some(mid) = posted["id"].as_str() {
+                    for sync_target in &args.sync {
+                        let _ = client.sync_link_thread(mid, sync_target).await?;
+                    }
+                }
+                posted
+            };
             print_output(&val, json_mode, |v| {
                 v["id"].as_str().unwrap_or("").to_string()
             });
@@ -1304,6 +1453,7 @@ async fn dispatch_client_command(
         Command::Reply(args) => {
             let text = read_text_arg(args.text, args.file)?;
             let labels = parse_kv_pairs(&args.labels)?;
+            let attachments = resolve_attachment_args(&client, &args.attachments).await?;
             let val = client
                 .reply_message(
                     &args.id,
@@ -1311,7 +1461,7 @@ async fn dispatch_client_command(
                         "text": text,
                         "after": args.after,
                         "labels": labels,
-                        "attachments": args.attachments,
+                        "attachments": attachments,
                         "schema": args.schema,
                         "id": args.idem_key,
                         "noSync": args.no_sync
@@ -1326,6 +1476,11 @@ async fn dispatch_client_command(
 
         Command::Read(args) => {
             if let Some(ref t) = args.target {
+                if t.starts_with("http://") || t.starts_with("https://") {
+                    let val = client.sync_linked(t).await?;
+                    print_output(&val, json_mode, format_thread_human);
+                    return Ok(0);
+                }
                 if t.starts_with("msg_") && !args.messages {
                     let val = client.get_thread(t).await?;
                     print_output(&val, json_mode, format_thread_human);
@@ -1576,7 +1731,10 @@ async fn dispatch_client_command(
             if args.all {
                 q.push(("all".into(), "true".into()));
             }
-            let val = client.wait_event(&q).await?;
+            let val = tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(130),
+                res = client.wait_event(&q) => res?,
+            };
             print_output(&val, json_mode, |v| {
                 format!(
                     "{} {} {}",
@@ -1588,15 +1746,67 @@ async fn dispatch_client_command(
             Ok(0)
         }
 
-        Command::Tasks { cmd } => handle_tasks(&client, cmd, json_mode).await,
+        Command::Tasks {
+            channel,
+            state,
+            labels,
+            by,
+            owner,
+            assigned_for,
+            needs,
+            after,
+            limit,
+            cmd,
+        } => {
+            let fallback_list = TasksCmd::List {
+                channel,
+                state,
+                labels,
+                by,
+                owner,
+                assigned_for,
+                needs,
+                after,
+                limit,
+            };
+            handle_tasks(&client, cmd.unwrap_or(fallback_list), json_mode).await
+        }
 
-        Command::Schedules { cmd } => {
-            let val = match cmd.unwrap_or(SchedulesCmd::List {
-                re: None,
-                channel: None,
-                by: None,
-                all: false,
-            }) {
+        Command::Schedule(args) => {
+            if args.target.eq_ignore_ascii_case("cancel") {
+                let id = args.text.ok_or_else(|| {
+                    ClientError::usage("schedule cancel requires a schedule ID")
+                })?;
+                let val = client.cancel_schedule(&id).await?;
+                print_output(&val, json_mode, |v| serde_json::to_string_pretty(v).unwrap());
+                return Ok(0);
+            }
+            let val = create_schedule_from_args(&client, *args).await?;
+            print_output(&val, json_mode, |v| serde_json::to_string_pretty(v).unwrap());
+            Ok(0)
+        }
+
+        Command::Schedules {
+            id,
+            re,
+            channel,
+            by,
+            all,
+            cmd,
+        } => {
+            let resolved_cmd = match cmd {
+                Some(c) => c,
+                None => match id {
+                    Some(sched_id) => SchedulesCmd::Get { id: sched_id },
+                    None => SchedulesCmd::List {
+                        re,
+                        channel,
+                        by,
+                        all,
+                    },
+                },
+            };
+            let val = match resolved_cmd {
                 SchedulesCmd::List {
                     re,
                     channel,
@@ -1618,48 +1828,8 @@ async fn dispatch_client_command(
                     }
                     client.list_schedules(&q).await?
                 }
-                SchedulesCmd::Create {
-                    target,
-                    text,
-                    delay_in,
-                    at,
-                    every,
-                    repeat_for,
-                    times,
-                    until,
-                    labels,
-                    no_sync,
-                } => {
-                    let mut body = json!({
-                        "text": text,
-                        "labels": parse_kv_pairs(&labels)?,
-                        "noSync": no_sync
-                    });
-                    if target.starts_with("msg_") {
-                        body["re"] = json!(target);
-                    } else {
-                        body["channel"] = json!(target);
-                    }
-                    if let Some(v) = delay_in {
-                        body["in"] = json!(v);
-                    }
-                    if let Some(v) = at {
-                        body["at"] = json!(v);
-                    }
-                    if let Some(v) = every {
-                        body["every"] = json!(v);
-                    }
-                    if let Some(v) = repeat_for {
-                        body["for"] = json!(v);
-                    }
-                    if let Some(v) = times {
-                        body["times"] = json!(v);
-                    }
-                    if let Some(v) = until {
-                        body["until"] = json!(v);
-                    }
-                    client.create_schedule(&body).await?
-                }
+                SchedulesCmd::Get { id } => client.get_schedule(&id).await?,
+                SchedulesCmd::Create(args) => create_schedule_from_args(&client, *args).await?,
                 SchedulesCmd::Cancel { id } => client.cancel_schedule(&id).await?,
             };
             print_output(&val, json_mode, |v| serde_json::to_string_pretty(v).unwrap());
@@ -1698,12 +1868,25 @@ async fn dispatch_client_command(
         }
 
         Command::Sync { id, target } => {
-            let val = client.sync_link_thread(&id, &target).await?;
+            let val = match target {
+                Some(t) => client.sync_link_thread(&id, &t).await?,
+                None => client.sync_list_thread_links(&id).await?,
+            };
             print_output(&val, json_mode, |v| serde_json::to_string_pretty(v).unwrap());
             Ok(0)
         }
-        Command::Sources => {
-            let val = client.sync_list_sources().await?;
+        Command::Sources { key, action } => {
+            let val = match (key, action) {
+                (None, None) => client.sync_list_sources().await?,
+                (Some(k), Some(act)) if act.eq_ignore_ascii_case("read") => {
+                    client.sync_records(&k).await?
+                }
+                _ => {
+                    return Err(ClientError::usage(
+                        "usage: sources OR sources <key> read",
+                    ));
+                }
+            };
             print_output(&val, json_mode, |v| serde_json::to_string_pretty(v).unwrap());
             Ok(0)
         }
@@ -1723,6 +1906,45 @@ async fn dispatch_client_command(
             Ok(0)
         }
     }
+}
+
+async fn create_schedule_from_args(
+    client: &BoardClient,
+    args: ScheduleSingularArgs,
+) -> Result<Value, ClientError> {
+    let text = read_text_arg(args.text, args.file)?;
+    let attachments = resolve_attachment_args(client, &args.attachments).await?;
+    let mut body = json!({
+        "text": text,
+        "labels": parse_kv_pairs(&args.labels)?,
+        "attachments": attachments,
+        "schema": args.schema,
+        "noSync": args.no_sync
+    });
+    if args.target.starts_with("msg_") {
+        body["re"] = json!(args.target);
+    } else {
+        body["channel"] = json!(args.target);
+    }
+    if let Some(v) = args.delay_in {
+        body["in"] = json!(v);
+    }
+    if let Some(v) = args.at {
+        body["at"] = json!(v);
+    }
+    if let Some(v) = args.every {
+        body["every"] = json!(v);
+    }
+    if let Some(v) = args.repeat_for {
+        body["for"] = json!(v);
+    }
+    if let Some(v) = args.times {
+        body["times"] = json!(v);
+    }
+    if let Some(v) = args.until {
+        body["until"] = json!(v);
+    }
+    client.create_schedule(&body).await
 }
 
 fn format_thread_human(v: &Value) -> String {
@@ -1852,23 +2074,13 @@ async fn run_tail_loop(
 
 async fn handle_tasks(
     client: &BoardClient,
-    cmd: Option<TasksCmd>,
+    cmd: TasksCmd,
     json_mode: bool,
 ) -> Result<i32, ClientError> {
     let board = client.config.board.clone();
     let profile = client.config.profile.clone();
 
-    match cmd.unwrap_or(TasksCmd::List {
-        channel: None,
-        state: None,
-        labels: Vec::new(),
-        by: None,
-        owner: None,
-        assigned_for: None,
-        needs: None,
-        after: None,
-        limit: None,
-    }) {
+    match cmd {
         TasksCmd::List {
             channel,
             state,
@@ -1934,6 +2146,7 @@ async fn handle_tasks(
         TasksCmd::Create {
             target,
             text,
+            file,
             labels,
             needs,
             assigned_for,
@@ -1942,6 +2155,26 @@ async fn handle_tasks(
             id,
             no_sync,
         } => {
+            if let Some(plan_file) = file {
+                let raw = read_text_arg(None, Some(plan_file))?;
+                let tasks_val: Value = serde_json::from_str(&raw)
+                    .map_err(|e| ClientError::usage(format!("invalid tasks plan JSON: {e}")))?;
+                let val = client
+                    .create_many_tasks(&json!({ "channel": target, "tasks": tasks_val, "id": id }))
+                    .await?;
+                print_output(&val, json_mode, |v| {
+                    v["tasks"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t["id"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default()
+                });
+                return Ok(0);
+            }
             let mut body = json!({
                 "labels": parse_kv_pairs(&labels)?,
                 "needs": needs,
@@ -2032,8 +2265,13 @@ async fn handle_tasks(
                 }
                 if let Some(w) = wait {
                     body["wait"] = json!(w);
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => return Ok(130),
+                        res = client.claim_ready(&body) => res?,
+                    }
+                } else {
+                    client.claim_ready(&body).await?
                 }
-                client.claim_ready(&body).await?
             } else {
                 client
                     .claim_task(&target, &json!({ "lease": lease, "lease_ms": lease_ms }))

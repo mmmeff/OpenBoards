@@ -116,11 +116,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn require_can_upload(db: &Database, board_id: &str, caller: &CallerContext) -> BoardResult<()> {
     let board_grants = grants::load_grants(db, board_id)?;
-    // Must have `post` somewhere on the board
+    // Must have `post` somewhere on the board (checking grant patterns and any narrowing patterns)
     let can_post_anywhere = grants::caller_permissions_at_pattern(&board_grants, caller, "*")
         .can_post_new_thread()
         || board_grants.iter().any(|g| {
             g.can.keys().any(|pat| {
+                grants::caller_permissions_at_pattern(&board_grants, caller, pat)
+                    .can_post_new_thread()
+            })
+        })
+        || caller.narrowing.as_ref().is_some_and(|n| {
+            n.rules.keys().any(|pat| {
                 grants::caller_permissions_at_pattern(&board_grants, caller, pat)
                     .can_post_new_thread()
             })

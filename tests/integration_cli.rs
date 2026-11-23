@@ -173,7 +173,7 @@ async fn cli_commands_json_exit_codes_and_claim_persistence() {
     let labeled: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(labeled["labels"]["status"], "triaged");
 
-    // 3. Exit code 2 on `wait` timeout and `tasks claim --ready` nothing_ready
+    // 3. Exit code 1 on `wait` timeout and `tasks claim --ready` nothing_ready, and exit code 2 on usage error
     let (code, _, stderr) = tokio::task::spawn_blocking({
         let url = srv.url.clone();
         let tok = srv.owner_token.clone();
@@ -189,7 +189,7 @@ async fn cli_commands_json_exit_codes_and_claim_persistence() {
     })
     .await
     .unwrap();
-    assert_eq!(code, 2, "expected exit code 2 on wait timeout, stderr={stderr}");
+    assert_eq!(code, 1, "expected exit code 1 on wait timeout, stderr={stderr}");
     let err: Value = serde_json::from_str(&stderr).unwrap();
     assert_eq!(err["reason"], "timeout");
 
@@ -201,9 +201,27 @@ async fn cli_commands_json_exit_codes_and_claim_persistence() {
     })
     .await
     .unwrap();
-    assert_eq!(code, 2, "expected exit code 2 on nothing_ready, stderr={stderr}");
+    assert_eq!(code, 1, "expected exit code 1 on nothing_ready, stderr={stderr}");
     let err: Value = serde_json::from_str(&stderr).unwrap();
     assert_eq!(err["reason"], "nothing_ready");
+
+    // Usage error (--sync combined with --no-sync) -> exit code 2
+    let (code, _, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        move || {
+            run_cli_cmd(
+                &url,
+                &tok,
+                &cdir,
+                &["post", "dev", "bad", "--sync", "slack:#ops", "--no-sync", "--json"],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 2, "expected exit code 2 on usage error, stderr={stderr}");
 
     // 4. Task create -> claim (persisted locally) -> complete (auto-loads saved claim!)
     let (code, stdout, _) = tokio::task::spawn_blocking({
@@ -548,4 +566,168 @@ async fn serve_local_persists_token_and_serves_requests() {
     let _ = child.kill().await;
     let _ = child.wait().await;
     let _ = json!({}); // keep serde_json used
+}
+
+#[tokio::test]
+async fn cli_spec_audit_ergonomics_mentions_attach_shorthands_and_schedules() {
+    let srv = start_live_server().await;
+    let claims = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+
+    // 1. `post <channel> --attach <local-file>` uploads local file and attaches it (empty text allowed!)
+    let local_file = scratch.path().join("trace.txt");
+    std::fs::write(&local_file, "stack trace bytes").unwrap();
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let fpath = local_file.to_str().unwrap().to_string();
+        move || run_cli_cmd(&url, &tok, &cdir, &["post", "dev", "--attach", &fpath, "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "post --attach failed: {stderr}");
+    let posted: Value = serde_json::from_str(&stdout).unwrap();
+    let root_id = posted["id"].as_str().unwrap().to_string();
+    assert_eq!(posted["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(posted["attachments"][0]["name"], "trace.txt");
+
+    // 2. `post <msg_id> "reply"` replies in the thread & bare `--mentions` defaults to `me`
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let rid = root_id.clone();
+        move || run_cli_cmd(&url, &tok, &cdir, &["post", &rid, "ping @admin", "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "post <msg_id> failed: {stderr}");
+    let reply: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(reply["re"], root_id);
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        move || run_cli_cmd(&url, &tok, &cdir, &["read", "--mentions", "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "read --mentions failed: {stderr}");
+    let mentioned: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(!mentioned["threads"].as_array().unwrap().is_empty());
+
+    // 3. `schemas inspect git-commit@1` alias
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        move || run_cli_cmd(&url, &tok, &cdir, &["schemas", "inspect", "git-commit@1", "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "schemas inspect failed: {stderr}");
+    let sch: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(sch["schema"]["id"], "git-commit@1");
+
+    // 4. `tasks create <channel> --file plan.json` and `tasks <channel> --state all` shorthand
+    let plan_file = scratch.path().join("plan.json");
+    std::fs::write(
+        &plan_file,
+        r#"[
+            {"key":"a","text":"step a"},
+            {"key":"b","text":"step b","needs":[{"key":"a"}]}
+        ]"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let ppath = plan_file.to_str().unwrap().to_string();
+        move || {
+            run_cli_cmd(
+                &url,
+                &tok,
+                &cdir,
+                &["tasks", "create", "build", "--file", &ppath, "--idempotency-key", "plan-1", "--json"],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "tasks create --file failed: {stderr}");
+    let batch: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(batch["tasks"].as_array().unwrap().len(), 2);
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        move || run_cli_cmd(&url, &tok, &cdir, &["tasks", "build", "--state", "all", "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "tasks <channel> shorthand failed: {stderr}");
+    let listed: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 2);
+
+    // 5. Singular `schedule <channel> "<text>" --in 1h`, `schedules <id>`, `schedule cancel <id>`
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        move || run_cli_cmd(&url, &tok, &cdir, &["schedule", "dev", "reminder", "--in", "1h", "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "schedule failed: {stderr}");
+    let sched_id = serde_json::from_str::<Value>(&stdout).unwrap()["schedule"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let sid = sched_id.clone();
+        move || run_cli_cmd(&url, &tok, &cdir, &["schedules", &sid, "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "schedules <id> failed: {stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["schedule"]["id"],
+        sched_id
+    );
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let sid = sched_id.clone();
+        move || run_cli_cmd(&url, &tok, &cdir, &["schedule", "cancel", &sid, "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "schedule cancel failed: {stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["canceled"],
+        true
+    );
+
+    // 6. `sync <id>` (optional target) and `sources`
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let url = srv.url.clone();
+        let tok = srv.owner_token.clone();
+        let cdir = claims.path().to_path_buf();
+        let rid = root_id.clone();
+        move || run_cli_cmd(&url, &tok, &cdir, &["sync", &rid, "--json"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "sync <id> failed: {stderr}");
+    assert!(serde_json::from_str::<Value>(&stdout).unwrap()["targets"].is_array());
 }

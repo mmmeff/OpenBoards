@@ -691,10 +691,16 @@ pub fn get_source_records(
     db.with_conn(|conn| {
         let board_grants = grants::load_grants_tx(conn, board_id)?;
         let can_manage_all = caller.is_unrestricted_owner()
-            || grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage();
+            || (grants::caller_permissions_at_pattern(&board_grants, caller, "*").can_manage()
+                && !board_grants.iter().any(|g| {
+                    g.can.keys().any(|pat| {
+                        !grants::caller_permissions_at_pattern(&board_grants, caller, pat)
+                            .can_manage()
+                    })
+                }));
         if !can_manage_all {
             return Err(BoardError::forbidden(
-                "reading sync source records requires 'manage' permission at '*'",
+                "reading sync source records requires 'manage' permission in every channel ('*')",
             ));
         }
         let src = resolve_source_by_key_tx(conn, board_id, key_spec, Some(caller))?
@@ -2310,8 +2316,10 @@ fn process_linear_inbound_tx(
 
             if action == "update" {
                 if let Some((root_id, _)) = find_linked_root_tx(tx, src, team_key, issue_id)? {
-                    for (k, v) in &issue_labels {
-                        let _ = labels::set_system_label_tx(tx, &src.board_id, &root_id, k, v);
+                    if let Some(seq) =
+                        apply_synced_labels_tx(tx, src, &root_id, &issue_labels, false)?
+                    {
+                        seqs.push(seq);
                     }
                     if !text.is_empty() {
                         if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
@@ -2434,7 +2442,11 @@ fn process_github_inbound_tx(
             collect_github_tags_and_assignees(issue, &mut gh_labels);
 
             if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
-                apply_github_root_labels_tx(tx, &src.board_id, &root_id, &gh_labels)?;
+                if let Some(seq) =
+                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true)?
+                {
+                    seqs.push(seq);
+                }
                 if action == "edited" {
                     if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
                         seqs.push(seq);
@@ -2496,7 +2508,11 @@ fn process_github_inbound_tx(
             collect_github_tags_and_assignees(pr, &mut gh_labels);
 
             if let Some((root_id, _)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
-                apply_github_root_labels_tx(tx, &src.board_id, &root_id, &gh_labels)?;
+                if let Some(seq) =
+                    apply_synced_labels_tx(tx, src, &root_id, &gh_labels, true)?
+                {
+                    seqs.push(seq);
+                }
                 if action == "edited" {
                     if let Some(seq) = apply_synced_edit_tx(tx, src, &root_id, &text)? {
                         seqs.push(seq);
@@ -2542,13 +2558,16 @@ fn process_github_inbound_tx(
 
             if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
                 if matches!(rev_state.as_str(), "approved" | "changes_requested") {
-                    let _ = labels::set_system_label_tx(
-                        tx,
-                        &src.board_id,
-                        &root_id,
-                        "review",
-                        &rev_state,
-                    );
+                    let mut rev_labels = BTreeMap::new();
+                    rev_labels.insert("review".to_string(), rev_state.clone());
+                    if let Some(seq) =
+                        apply_synced_labels_tx(tx, src, &root_id, &rev_labels, false)?
+                    {
+                        seqs.push(seq);
+                    }
+                }
+                if find_mapped_message_tx(tx, src, &rev_id)?.is_some() {
+                    return Ok((json!({ "ok": true, "ignored": "duplicate" }), seqs));
                 }
                 let reply_text = if rev_body.is_empty() {
                     format!("Review: {rev_state}")
@@ -2601,6 +2620,9 @@ fn process_github_inbound_tx(
                     return Ok((json!({ "ok": true, "deleted": mid }), seqs));
                 }
             } else if let Some((root_id, board_ch)) = find_linked_root_tx(tx, src, repo, &p_tid)? {
+                if find_mapped_message_tx(tx, src, &cid)?.is_some() {
+                    return Ok((json!({ "ok": true, "ignored": "duplicate" }), seqs));
+                }
                 let (view, mut s) = insert_synced_message_tx(
                     tx,
                     src,
@@ -2646,21 +2668,72 @@ fn collect_github_tags_and_assignees(obj: &Value, out: &mut BTreeMap<String, Str
     }
 }
 
-fn apply_github_root_labels_tx(
+/// Updates synced root labels and emits a `labels.changed` event whenever labels change,
+/// so `wait`/`tail`/watchers observing e.g. `--label state=merged` or `--label review=approved` wake up.
+fn apply_synced_labels_tx(
     tx: &Connection,
-    board_id: &str,
+    src: &StoredSyncSource,
     root_id: &str,
     new_labels: &BTreeMap<String, String>,
-) -> BoardResult<()> {
-    // Clear stale tag.* and assignee.* labels before applying current snapshot
-    tx.execute(
-        "DELETE FROM message_labels WHERE message_id = ?1 AND (key LIKE 'tag.%' OR key LIKE 'assignee.%')",
-        params![root_id],
-    )?;
-    for (k, v) in new_labels {
-        let _ = labels::set_system_label_tx(tx, board_id, root_id, k, v);
+    replace_tags_and_assignees: bool,
+) -> BoardResult<Option<i64>> {
+    let Some(stored) = messages::load_stored_message_tx(tx, &src.board_id, root_id)? else {
+        return Ok(None);
+    };
+    if stored.deleted_at.is_some() {
+        return Ok(None);
     }
-    Ok(())
+    let before_labels = labels::load_message_labels_tx(tx, root_id)?;
+    let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+
+    let mut unset = Vec::new();
+    if replace_tags_and_assignees {
+        for k in before_labels.keys() {
+            if (k.starts_with("tag.") || k.starts_with("assignee.")) && !new_labels.contains_key(k)
+            {
+                tx.execute(
+                    "DELETE FROM message_labels WHERE message_id = ?1 AND key = ?2",
+                    params![root_id, k],
+                )?;
+                unset.push(k.clone());
+            }
+        }
+    }
+
+    let mut set = BTreeMap::new();
+    for (k, v) in new_labels {
+        if before_labels.get(k) != Some(v)
+            && labels::set_system_label_tx(tx, &src.board_id, root_id, k, v).is_ok()
+        {
+            set.insert(k.clone(), v.clone());
+        }
+    }
+
+    if set.is_empty() && unset.is_empty() {
+        return Ok(None);
+    }
+
+    let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+    let after_msg = messages::hydrate_message_view_tx(tx, &stored)?;
+    let ev = events::append_event_tx(
+        tx,
+        EventAppend {
+            board_id: &src.board_id,
+            event_type: EventType::LabelsChanged,
+            channel: Some(&stored.channel),
+            message_id: Some(root_id),
+            actor_id: Some(&src.owner_principal),
+            payload: json!({
+                "set": set,
+                "unset": unset,
+                "from": src.key
+            }),
+            before_snapshot: Some(&before_snap),
+            after_snapshot: Some(&after_snap),
+            after_message: Some(&after_msg),
+        },
+    )?;
+    Ok(Some(ev.seq))
 }
 
 // --- Custom Normalized Adapter ---

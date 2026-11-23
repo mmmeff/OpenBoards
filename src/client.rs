@@ -103,8 +103,8 @@ impl ClientError {
 
     pub fn usage(msg: impl Into<String>) -> Self {
         Self {
-            status: 400,
-            code: "bad_request".to_string(),
+            status: 0,
+            code: "usage_error".to_string(),
             message: msg.into(),
             hint: None,
             raw_body: None,
@@ -112,30 +112,11 @@ impl ClientError {
     }
 
     /// CLI exit codes matching `docs/vercel-board/cli-reference.md`:
-    /// - `2`: usage errors, conflicts, `nothing_ready`, `timeout`
-    /// - `1`: all other errors
+    /// - `2`: usage errors (invalid arguments/options, missing board)
+    /// - `1`: command failures, conflicts, `nothing_ready`, `timeout`, auth/permission errors
     pub fn exit_code(&self) -> i32 {
         match self.code.as_str() {
-            "bad_request"
-            | "timeout"
-            | "nothing_ready"
-            | "board_name_taken"
-            | "channel_exists"
-            | "channel_granted"
-            | "duplicate_id"
-            | "newer_message"
-            | "revision_conflict"
-            | "label_conflict"
-            | "claim_lost"
-            | "task_claimed"
-            | "task_waiting"
-            | "task_blocked"
-            | "task_finished"
-            | "task_assigned"
-            | "task_already_exists"
-            | "schema_immutable"
-            | "already_synced" => 2,
-            _ if self.status == 408 || self.status == 409 => 2,
+            "usage_error" => 2,
             _ => 1,
         }
     }
@@ -996,6 +977,18 @@ impl BoardClient {
         .await
     }
 
+    pub async fn get_schedule(&self, id: &str) -> Result<Value, ClientError> {
+        self.request_json(
+            Method::GET,
+            &self.board_path(&format!("schedules/{id}")),
+            &[],
+            None,
+            true,
+            true,
+        )
+        .await
+    }
+
     pub async fn cancel_schedule(&self, id: &str) -> Result<Value, ClientError> {
         self.request_json(
             Method::DELETE,
@@ -1324,7 +1317,7 @@ mod tests {
                 raw_body: None,
             }
             .exit_code(),
-            2
+            1
         );
         assert_eq!(
             ClientError {
@@ -1335,7 +1328,7 @@ mod tests {
                 raw_body: None,
             }
             .exit_code(),
-            2
+            1
         );
         assert_eq!(
             ClientError {

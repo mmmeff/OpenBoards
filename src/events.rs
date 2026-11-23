@@ -17,7 +17,7 @@ use crate::messages::{MessageView, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 
 pub const MAX_POLL_WAIT_SECS: f64 = 300.0;
 pub const DEFAULT_WAIT_TIMEOUT_SECS: f64 = 1800.0;
-pub const MAX_WAIT_TIMEOUT_SECS: f64 = 1800.0;
+pub const MAX_WAIT_TIMEOUT_SECS: f64 = 86_400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
@@ -533,6 +533,11 @@ pub fn parse_duration_param(raw: &str, max_secs: f64) -> BoardResult<Duration> {
             .parse()
             .map_err(|_| BoardError::bad_request(format!("invalid duration '{raw}'")))?;
         v * 3600.0
+    } else if let Some(d) = trimmed.strip_suffix('d') {
+        let v: f64 = d
+            .parse()
+            .map_err(|_| BoardError::bad_request(format!("invalid duration '{raw}'")))?;
+        v * 86_400.0
     } else {
         trimmed
             .parse::<f64>()

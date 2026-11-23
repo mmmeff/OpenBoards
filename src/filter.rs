@@ -251,6 +251,7 @@ impl QueryFilter {
 }
 
 fn matches_by_filter(by_filter: &str, ctx: &FilterContext, snap: &MessageSnapshot) -> bool {
+    let by_filter = by_filter.trim().trim_start_matches('@');
     if by_filter.eq_ignore_ascii_case("me") {
         if ctx.caller_has_profile {
             return snap.by_actor == ctx.caller_actor_id;
