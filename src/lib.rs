@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod ratelimit;
 pub mod schedules;
 pub mod schemas;
+pub mod sync;
 pub mod tasks;
 pub mod validate;
 pub mod watchers;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub events: EventHub,
     pub rate_limiter: RateLimiter,
     pub watcher_wake: Arc<Notify>,
+    pub sync_wake: Arc<Notify>,
 }
 
 impl AppState {
@@ -55,6 +57,7 @@ impl AppState {
             events: EventHub::new(),
             rate_limiter,
             watcher_wake: Arc::new(Notify::new()),
+            sync_wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -113,6 +116,7 @@ async fn serve_inner(config: ServerConfig, print_local_exports: bool) -> BoardRe
     let _scheduler_handle = schedules::spawn_scheduler_loop(state.clone());
     let _lease_reaper_handle = tasks::spawn_lease_reaper_loop(state.clone());
     let _watcher_dispatcher = watchers::spawn_watcher_dispatcher(state.clone());
+    let _sync_worker = sync::spawn_sync_worker(state.clone());
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(listen)

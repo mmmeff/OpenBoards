@@ -17,6 +17,7 @@ use crate::labels;
 use crate::mentions::{self, MentionResolution};
 use crate::schedules;
 use crate::schemas;
+use crate::sync;
 use crate::tasks::{self, TaskView};
 use crate::validate::{validate_channel_path, validate_text_length};
 
@@ -697,6 +698,7 @@ pub fn post_message_in_tx(
             after_message: Some(&view),
         },
     )?;
+    let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "post", None)?;
     Ok(PostedMessageResult {
         message: view,
         mentions: resolved_mentions.mentions,
@@ -892,6 +894,7 @@ pub fn reply_message(
                 after_message: Some(&view),
             },
         )?;
+        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, &msg_id, "reply", None)?;
         Ok(PostedMessageResult {
             message: view,
             mentions: resolved_mentions.mentions,
@@ -998,6 +1001,7 @@ pub fn edit_message(
                 seqs.push(task_seq);
             }
         }
+        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, message_id, "edit", None)?;
         let final_view = hydrate_message_view_tx(tx, &updated)?;
         Ok((final_view, resolved_mentions.mentions, seqs))
     })
@@ -1100,6 +1104,7 @@ pub fn delete_message(
                 seqs.push(task_seq);
             }
         }
+        let _ = sync::enqueue_outbound_for_message_tx(tx, board_id, message_id, "delete", None)?;
 
         Ok(seqs)
     })
@@ -1183,6 +1188,14 @@ pub fn react_message(
                     after_snapshot: Some(&snap),
                     after_message: Some(&view),
                 },
+            )?;
+            let kind = if input.remove { "unreact" } else { "react" };
+            let _ = sync::enqueue_outbound_for_message_tx(
+                tx,
+                board_id,
+                message_id,
+                kind,
+                Some(serde_json::json!({ "emoji": emoji })),
             )?;
             Some(ev.seq)
         } else {

@@ -300,6 +300,10 @@ impl CallerContext {
         !self.is_restricted()
     }
 
+    pub fn can_access_sync(&self) -> bool {
+        self.can_access_sync_records()
+    }
+
     /// Intersects `perms` with any per-request `X-Board-Can` narrowing for `channel`.
     pub fn apply_narrowing(&self, channel: &str, perms: Permissions) -> Permissions {
         match &self.narrowing {
@@ -674,13 +678,39 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
             )
             .optional()?;
         let (prof_name, prof_avatar) = prof_row.unwrap_or_else(|| (prof_lower.to_string(), None));
-        Ok(Some(ActorView {
-            id: actor_id.to_string(),
-            kind: "profile".to_string(),
-            handle: format!("{base_handle}/{prof_lower}"),
-            name: prof_name,
-            avatar: prof_avatar,
-        }))
+        if prof_lower.contains(":user:") {
+            let handle_seg = prof_name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>();
+            let handle_seg = if handle_seg.is_empty() {
+                prof_lower.to_string()
+            } else {
+                handle_seg
+            };
+            Ok(Some(ActorView {
+                id: actor_id.to_string(),
+                kind: "synced".to_string(),
+                handle: format!("{base_handle}/{handle_seg}"),
+                name: prof_name,
+                avatar: prof_avatar,
+            }))
+        } else {
+            Ok(Some(ActorView {
+                id: actor_id.to_string(),
+                kind: "profile".to_string(),
+                handle: format!("{base_handle}/{prof_lower}"),
+                name: prof_name,
+                avatar: prof_avatar,
+            }))
+        }
     } else {
         Ok(Some(ActorView {
             id: actor_id.to_string(),

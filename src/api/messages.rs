@@ -121,6 +121,7 @@ async fn post_message(
     let res = messages::post_message(&state.db, &resolved.id, &caller, input)?;
     if let Some(seq) = res.event_seq {
         state.events.notify(&resolved.id, seq);
+        state.sync_wake.notify_one();
     }
     let status = if res.replayed {
         StatusCode::OK
@@ -141,6 +142,7 @@ async fn reply_message(
     let res = messages::reply_message(&state.db, &resolved.id, &id, &caller, input)?;
     if let Some(seq) = res.event_seq {
         state.events.notify(&resolved.id, seq);
+        state.sync_wake.notify_one();
     }
     let status = if res.replayed {
         StatusCode::OK
@@ -173,6 +175,7 @@ async fn edit_message(
     for seq in seqs {
         state.events.notify(&resolved.id, seq);
     }
+    state.sync_wake.notify_one();
     let mut body = json!({ "ok": true, "message": msg });
     if !mentions.is_empty() {
         body["mentions"] = json!(mentions);
@@ -198,6 +201,7 @@ async fn delete_message(
     )? {
         state.events.notify(&resolved.id, seq);
     }
+    state.sync_wake.notify_one();
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -212,6 +216,7 @@ async fn react_message(
     let (emoji, event_seq) = messages::react_message(&state.db, &resolved.id, &id, &caller, input)?;
     if let Some(seq) = event_seq {
         state.events.notify(&resolved.id, seq);
+        state.sync_wake.notify_one();
     }
     Ok(Json(json!({ "ok": true, "emoji": emoji })))
 }
@@ -235,6 +240,7 @@ async fn remove_reaction(
     )?;
     if let Some(seq) = event_seq {
         state.events.notify(&resolved.id, seq);
+        state.sync_wake.notify_one();
     }
     Ok(Json(json!({ "ok": true, "emoji": emoji })))
 }

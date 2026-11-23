@@ -16,7 +16,7 @@ use crate::db::Database;
 use crate::error::BoardResult;
 use crate::id::new_bearer_token;
 use crate::proxy::{build_proxy_router, ProxyConfig};
-use crate::{build_router, schedules, schemas, tasks, watchers, AppState};
+use crate::{build_router, schedules, schemas, sync, tasks, watchers, AppState};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
@@ -44,6 +44,7 @@ struct EphemeralServer {
     _scheduler_handle: tokio::task::JoinHandle<()>,
     _reaper_handle: tokio::task::JoinHandle<()>,
     _watcher_handle: tokio::task::JoinHandle<()>,
+    _sync_handle: tokio::task::JoinHandle<()>,
 }
 
 async fn start_ephemeral_server() -> Result<EphemeralServer, String> {
@@ -66,6 +67,7 @@ async fn start_ephemeral_server() -> Result<EphemeralServer, String> {
     let scheduler = schedules::spawn_scheduler_loop(state.clone());
     let reaper = tasks::spawn_lease_reaper_loop(state.clone());
     let dispatcher = watchers::spawn_watcher_dispatcher(state.clone());
+    let sync_worker = sync::spawn_sync_worker(state.clone());
     let app = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -85,6 +87,7 @@ async fn start_ephemeral_server() -> Result<EphemeralServer, String> {
         _scheduler_handle: scheduler,
         _reaper_handle: reaper,
         _watcher_handle: dispatcher,
+        _sync_handle: sync_worker,
     })
 }
 
@@ -763,6 +766,143 @@ pub async fn run_conformance(
             expect(denied_grant.code == "forbidden", "expected 403 forbidden")?;
 
             proxy_srv.abort();
+            Ok(())
+        })
+        .await,
+    );
+
+    // 14. Sync Engine (Slack/GitHub inbound, outbound noSync/no-labels, already_synced, linked, typing, sandboxed denial)
+    checks.push(
+        run_check("14_sync_engine_adapters_and_guardrails", || async {
+            let Ok(ref ptok) = project_tok else {
+                return Ok(());
+            };
+            let b_proj = b_owner.with_token(ptok.clone());
+
+            type OutStore = Arc<Mutex<Vec<Value>>>;
+            let delivered: OutStore = Arc::new(Mutex::new(Vec::new()));
+            let out_app = Router::new()
+                .route(
+                    "/out",
+                    post(|State(store): State<OutStore>, axum::Json(body): axum::Json<Value>| async move {
+                        store.lock().unwrap().push(body);
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({ "platformMessageId": "pm_1", "platformUrl": "https://slack.test/p1" })),
+                        )
+                    }),
+                )
+                .with_state(delivered.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| e.to_string())?;
+            let out_addr = listener.local_addr().map_err(|e| e.to_string())?;
+            let out_srv = tokio::spawn(async move {
+                let _ = axum::serve(listener, out_app).await;
+            });
+
+            // Register Slack bidirectional source
+            let _ = b_proj
+                .sync_create_source(&json!({
+                    "key": "slack",
+                    "platform": "slack",
+                    "mappings": { "#sync-ch": "sync-ch" },
+                    "webhookSecret": "slk_sec",
+                    "outboundUrl": format!("http://{out_addr}/out")
+                }))
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // Sandboxed caller is denied sync access
+            let sbx = b_proj.with_extra_header("x-board-sandboxed", "true");
+            let sbx_err = sbx
+                .sync_list_sources()
+                .await
+                .expect_err("sandboxed caller must be denied sync");
+            expect(sbx_err.code == "forbidden", "expected 403 forbidden for sandboxed sync")?;
+
+            // Inbound signed Slack webhook creates board thread + synced user profile
+            let hook_body = json!({
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "channel": "#sync-ch",
+                    "ts": "1700000.1",
+                    "user": "U0456",
+                    "user_name": "Malte",
+                    "text": "*hello* from Slack",
+                    "permalink": "https://acme.slack.com/archives/C1/p17000001"
+                }
+            })
+            .to_string();
+            let ts_hdr = "1700000000";
+            let sig = watchers::hmac_sha256_hex(
+                b"slk_sec",
+                format!("v0:{ts_hdr}:{hook_body}").as_bytes(),
+            );
+            let http = reqwest::Client::new();
+            let resp = http
+                .post(format!("{base_url}/v1/messageboard/boards/{test_board}/webhooks/slack"))
+                .header("content-type", "application/json")
+                .header("x-slack-request-timestamp", ts_hdr)
+                .header("x-slack-signature", format!("v0={sig}"))
+                .body(hook_body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            expect(resp.status().is_success(), "slack webhook failed")?;
+            let hook_json: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let synced_root = hook_json["messageId"].as_str().unwrap().to_string();
+
+            // `linked(url)` resolves the synced board thread
+            let linked = b_owner
+                .sync_linked("https://acme.slack.com/archives/C1/p17000001")
+                .await
+                .map_err(|e| e.to_string())?;
+            expect(linked["message"]["id"] == synced_root, "linked(url) returned wrong thread")?;
+            expect(linked["message"]["text"] == "**hello** from Slack", "mrkdwn->GFM failed")?;
+
+            // Typing > 50 chars fails 400
+            let long_typing = b_owner
+                .sync_typing(&synced_root, Some(&"x".repeat(51)))
+                .await
+                .expect_err("typing > 50 chars must fail");
+            expect(long_typing.code == "bad_request", "expected 400 for >50 char typing")?;
+
+            // Duplicate platform thread link fails `409 already_synced`
+            let other = b_owner
+                .post_message(&json!({ "channel": "sync-ch", "text": "other", "noSync": true }))
+                .await
+                .map_err(|e| e.to_string())?;
+            let other_id = other["id"].as_str().unwrap().to_string();
+            let dup = b_proj
+                .sync_link_thread(&other_id, "slack:#sync-ch:1700000.1")
+                .await
+                .expect_err("duplicate link must fail already_synced");
+            expect(dup.code == "already_synced", "expected 409 already_synced")?;
+
+            // Board reply with label -> outbound delivers text without labels
+            let _ = b_owner
+                .reply_message(
+                    &synced_root,
+                    &json!({ "text": "**reply**", "labels": { "internal": "secret" } }),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if !delivered.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            out_srv.abort();
+
+            let items = delivered.lock().unwrap();
+            expect(!items.is_empty(), "expected outbound slack delivery")?;
+            expect(items[0]["text"] == "*reply*", "GFM->mrkdwn conversion failed")?;
+            expect(items[0].get("labels").is_none(), "labels must never sync externally")?;
             Ok(())
         })
         .await,

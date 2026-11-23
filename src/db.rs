@@ -427,6 +427,95 @@ const MIGRATIONS: &[Migration] = &[
                 ON watcher_deliveries (status, next_attempt_at);
         "#,
     },
+    Migration {
+        version: 11,
+        name: "011_sync",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS sync_sources (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                owner_principal TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                mappings_json TEXT NOT NULL,
+                webhook_secret TEXT,
+                outbound_url TEXT,
+                outbound_token TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (board_id, project_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_sources_board
+                ON sync_sources (board_id);
+            CREATE INDEX IF NOT EXISTS idx_sync_sources_key
+                ON sync_sources (key);
+
+            CREATE TABLE IF NOT EXISTS thread_sync_links (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                thread_root_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sync_sources(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL,
+                platform_channel TEXT NOT NULL,
+                platform_thread_id TEXT NOT NULL,
+                platform_url TEXT,
+                direction TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (board_id, source_id, platform_channel, platform_thread_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_thread_sync_links_root
+                ON thread_sync_links (board_id, thread_root_id);
+            CREATE INDEX IF NOT EXISTS idx_thread_sync_links_url
+                ON thread_sync_links (board_id, platform_url);
+
+            CREATE TABLE IF NOT EXISTS message_sync_map (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sync_sources(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                platform_message_id TEXT NOT NULL,
+                platform_url TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, source_id, message_id),
+                UNIQUE (board_id, source_id, platform_message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_inbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sync_sources(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                headers_json TEXT NOT NULL,
+                body_json TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_inbox_source
+                ON sync_inbox (board_id, source_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS sync_deliveries (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sync_sources(id) ON DELETE CASCADE,
+                link_id TEXT NOT NULL REFERENCES thread_sync_links(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_http_status INTEGER,
+                last_error TEXT,
+                next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_deliveries_pending
+                ON sync_deliveries (status, next_attempt_at);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

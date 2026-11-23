@@ -1062,7 +1062,19 @@ impl BoardClient {
         .await
     }
 
-    // --- Sync (wired to match Concept 11 wire contract) ---
+    // --- Sync ---
+
+    pub async fn sync_create_source(&self, body: &Value) -> Result<Value, ClientError> {
+        self.request_json(
+            Method::POST,
+            &self.board_path("sync/sources"),
+            &[],
+            Some(body),
+            true,
+            true,
+        )
+        .await
+    }
 
     pub async fn sync_list_sources(&self) -> Result<Value, ClientError> {
         self.request_json(
@@ -1076,10 +1088,46 @@ impl BoardClient {
         .await
     }
 
+    pub async fn sync_delete_source(&self, key: &str) -> Result<Value, ClientError> {
+        self.request_json(
+            Method::DELETE,
+            &self.board_path(&format!("sync/sources/{}", url_encode(key))),
+            &[],
+            None,
+            true,
+            true,
+        )
+        .await
+    }
+
     pub async fn sync_inbox(&self, key: &str) -> Result<Value, ClientError> {
         self.request_json(
             Method::GET,
             &self.board_path(&format!("sync/sources/{}/inbox", url_encode(key))),
+            &[],
+            None,
+            true,
+            true,
+        )
+        .await
+    }
+
+    pub async fn sync_records(&self, key: &str) -> Result<Value, ClientError> {
+        self.request_json(
+            Method::GET,
+            &self.board_path(&format!("sync/sources/{}/records", url_encode(key))),
+            &[],
+            None,
+            true,
+            true,
+        )
+        .await
+    }
+
+    pub async fn sync_list_thread_links(&self, thread_id: &str) -> Result<Value, ClientError> {
+        self.request_json(
+            Method::GET,
+            &self.board_path(&format!("threads/{thread_id}/sync")),
             &[],
             None,
             true,

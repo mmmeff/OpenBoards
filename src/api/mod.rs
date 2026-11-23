@@ -9,6 +9,7 @@ pub mod labels;
 pub mod messages;
 pub mod schedules;
 pub mod schemas;
+pub mod sync;
 pub mod tasks;
 pub mod watchers;
 
@@ -42,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .merge(schedules::routes())
         .merge(tasks::routes())
         .merge(watchers::routes())
+        .merge(sync::routes())
         .with_state(state)
 }
 

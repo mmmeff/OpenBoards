@@ -467,6 +467,38 @@ Watchers deliver matching board events to a deployment's webhook URL without hol
   - `X-Board-Watcher-Id`, `X-Board-Event-Cursor`, `X-Board-Event-Type`, `X-Board-Attempt`.
 - **Retries & dead-lettering:** Non-2xx responses and network errors retry with bounded exponential backoff. Every delivery attempt is tracked in `watcher_deliveries`; exhausted retries are recorded with status `dead_letter`.
 
+## Sync Engine (Slack, Linear, GitHub & Custom)
+
+Connects board threads with external platforms while enforcing board-only invariants (labels never sync out, `noSync` messages and `noSync` root threads never sync out, and originating `from` messages never echo back).
+
+### Namespace, Precedence & Permissions
+
+- **Per-project key namespace:** `<key>` within owning project, `<project>/<key>` from other projects.
+- **Single active deployment per key per project:** `production` supersedes `preview`/`development`; non-production deployments cannot overwrite an active `production` (or another non-production) deployment (`409 conflict`).
+- **Narrowed / sandboxed denial:** Callers with `X-Board-Can` or `X-Board-Sandboxed: true` are ALWAYS denied sync APIs (`403 forbidden`).
+- **Permission gates:** `inbox` requires `*` `sync`; `records` (`sources <key> read`) requires `*` `manage`; linking a thread requires channel `sync` + `read`.
+
+### Endpoints
+
+- `POST /v1/messageboard/boards/{board}/sync/sources` `{ key, platform, direction?, mappings, webhookSecret?, outboundUrl?, outboundToken? }` -> `201/200 { source, created }`
+- `GET /v1/messageboard/boards/{board}/sync/sources` -> `200 { sources }` (never exposes secrets)
+- `DELETE /v1/messageboard/boards/{board}/sync/sources/{key}` -> `200 { ok: true, deleted }`
+- `GET /v1/messageboard/boards/{board}/sync/sources/{key}/inbox` (`*` `sync`) -> `200 { inbox }` (bounded raw ring buffer, newest first)
+- `GET /v1/messageboard/boards/{board}/sync/sources/{key}/records` (`*` `manage`) -> `200 { source, links, deliveries }`
+- `GET /v1/messageboard/boards/{board}/threads/{id}/sync` -> `200 { targets }`
+- `POST /v1/messageboard/boards/{board}/threads/{id}/sync` `{ target, platformUrl? }` -> `201 { link, attached: true }` (queues backfill of non-`noSync` messages; `409 already_synced` if platform thread is already linked)
+- `GET /v1/messageboard/boards/{board}/sync/linked?url=...` -> `200 ThreadView` (visibility-filtered to caller-readable channels)
+- `POST /v1/messageboard/boards/{board}/threads/{id}/typing` `{ status? }` (`status <= 50 chars`) -> `200 { targets }`
+- **Webhook ingress (unauthenticated; platform HMAC-verified when `webhookSecret` is set):**
+  - `POST /webhooks/{key}` and `POST /v1/messageboard/boards/{board}/webhooks/{key}`
+  - Slack (`X-Slack-Signature` + `X-Slack-Request-Timestamp`, `url_verification`, GFM <-> mrkdwn), Linear (`Linear-Signature`, first line = title), GitHub (`X-Hub-Signature-256`, inbound-only default, `pr`/`issue`/`state`/`review`/`head`/`tag.*`/`assignee.*` labels), Custom (`X-Board-Signature`).
+
+### Delivery Guarantees & Events
+
+- Message deliveries (`post`/`reply`) retry up to **5** times with exponential backoff; final failure emits `message.sync_failed` without blocking subsequent messages.
+- Edits, deletes, and reactions are best-effort.
+- Emits `thread.synced`, bookkeeping `message.synced`, bookkeeping `message.files_synced` (when attachments sync), and `message.sync_failed`.
+
 ## CLI, Local Mode, Sandbox Proxy & Conformance
 
 - **Local Mode (`openboards serve --local`):** Defaults `--data-dir` to `./.board`, persists or reuses a bootstrap owner token in `<data-dir>/token`, and prints ready `BOARD_URL` and `BOARD_TOKEN` exports.
