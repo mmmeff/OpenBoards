@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::actors::{self, CallerContext};
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult, ErrorCode};
+use crate::events::{self, EventAppend, EventType};
 use crate::grants::{self, Grant, GrantPrincipal};
 use crate::permissions::Permissions;
 use crate::validate::validate_channel_path;
@@ -31,6 +32,8 @@ pub struct CreateChannelResult {
     pub created: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<Grant>>,
+    #[serde(skip_serializing)]
+    pub event_seq: Option<i64>,
 }
 
 /// Lists channels on `board_id` that `caller` has `read` permission for.
@@ -105,6 +108,7 @@ pub fn create_channel(
                     channel: existing,
                     created: false,
                     grants: None,
+                    event_seq: None,
                 });
             }
 
@@ -115,6 +119,20 @@ pub fn create_channel(
                 params![board_id, input.path, actor_id, now],
             )?;
             actors::record_actor_write_tx(tx, board_id, &input.path, caller)?;
+            let ev = events::append_event_tx(
+                tx,
+                EventAppend {
+                    board_id,
+                    event_type: EventType::ChannelCreated,
+                    channel: Some(&input.path),
+                    message_id: None,
+                    actor_id: Some(&actor_id),
+                    payload: serde_json::json!({ "channel": input.path, "private": false }),
+                    before_snapshot: None,
+                    after_snapshot: None,
+                    after_message: None,
+                },
+            )?;
 
             Ok(CreateChannelResult {
                 channel: ChannelView {
@@ -124,6 +142,7 @@ pub fn create_channel(
                 },
                 created: true,
                 grants: None,
+                event_seq: Some(ev.seq),
             })
         });
     }
@@ -218,6 +237,20 @@ pub fn create_channel(
             params![board_id, input.path, actor_id, now],
         )?;
         actors::record_actor_write_tx(tx, board_id, &input.path, caller)?;
+        let ev = events::append_event_tx(
+            tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::ChannelCreated,
+                channel: Some(&input.path),
+                message_id: None,
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({ "channel": input.path, "private": true }),
+                before_snapshot: None,
+                after_snapshot: None,
+                after_message: None,
+            },
+        )?;
 
         Ok(CreateChannelResult {
             channel: ChannelView {
@@ -227,6 +260,7 @@ pub fn create_channel(
             },
             created: true,
             grants: Some(vec![self_grant, deny_grant]),
+            event_seq: Some(ev.seq),
         })
     })
 }

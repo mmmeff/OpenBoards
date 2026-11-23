@@ -6,6 +6,7 @@ pub mod channels;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod events;
 pub mod filter;
 pub mod grants;
 pub mod id;
@@ -13,6 +14,7 @@ pub mod labels;
 pub mod mentions;
 pub mod messages;
 pub mod permissions;
+pub mod ratelimit;
 pub mod schemas;
 pub mod validate;
 
@@ -23,18 +25,25 @@ use axum::Router;
 use crate::config::ServerConfig;
 use crate::db::Database;
 use crate::error::BoardResult;
+use crate::events::EventHub;
+use crate::ratelimit::RateLimiter;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub config: Arc<ServerConfig>,
+    pub events: EventHub,
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
     pub fn new(db: Database, config: ServerConfig) -> Self {
+        let rate_limiter = RateLimiter::new(config.rate_limit_rps, config.rate_limit_burst);
         Self {
             db,
             config: Arc::new(config),
+            events: EventHub::new(),
+            rate_limiter,
         }
     }
 }

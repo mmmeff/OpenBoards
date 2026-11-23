@@ -41,6 +41,8 @@ pub enum ErrorCode {
     BatchTooLarge,
     AlreadySynced,
     WatchersNeedProject,
+    Timeout,
+    RateLimited,
 }
 
 impl ErrorCode {
@@ -76,6 +78,8 @@ impl ErrorCode {
             Self::BatchTooLarge => "batch_too_large",
             Self::AlreadySynced => "already_synced",
             Self::WatchersNeedProject => "watchers_need_project",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate_limited",
         }
     }
 
@@ -110,6 +114,8 @@ impl ErrorCode {
             | Self::SchemaImmutable
             | Self::ClaimLost
             | Self::AlreadySynced => StatusCode::CONFLICT,
+            Self::Timeout => StatusCode::REQUEST_TIMEOUT,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -121,6 +127,7 @@ pub struct BoardError {
     pub status: StatusCode,
     pub message: String,
     pub hint: Option<String>,
+    pub retry_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +145,7 @@ impl BoardError {
             code,
             message: message.into(),
             hint: None,
+            retry_after_secs: None,
         }
     }
 
@@ -148,6 +156,11 @@ impl BoardError {
 
     pub fn with_status(mut self, status: StatusCode) -> Self {
         self.status = status;
+        self
+    }
+
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after_secs = Some(secs);
         self
     }
 
@@ -200,7 +213,14 @@ impl From<rusqlite::Error> for BoardError {
 
 impl IntoResponse for BoardError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body())).into_response()
+        let mut resp = (self.status, Json(self.body())).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+        resp
     }
 }
 

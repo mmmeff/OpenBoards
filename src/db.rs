@@ -261,6 +261,33 @@ const MIGRATIONS: &[Migration] = &[
                 ON message_attachments (board_id, attachment_id);
         "#,
     },
+    Migration {
+        version: 7,
+        name: "007_events",
+        sql: r#"
+            ALTER TABLE boards ADD COLUMN next_event_seq INTEGER NOT NULL DEFAULT 1;
+
+            CREATE TABLE IF NOT EXISTS events (
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                cursor TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                channel TEXT,
+                message_id TEXT,
+                actor_id TEXT,
+                bookkeeping INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                before_snapshot_json TEXT,
+                after_snapshot_json TEXT,
+                after_message_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (board_id, seq),
+                UNIQUE (board_id, cursor)
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_board_msg
+                ON events (board_id, message_id);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

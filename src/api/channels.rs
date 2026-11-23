@@ -38,6 +38,9 @@ async fn create_channel(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let res = channels::create_channel(&state.db, &resolved.id, &caller, input)?;
+    if let Some(seq) = res.event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     let status = if res.created {
         StatusCode::CREATED
     } else {

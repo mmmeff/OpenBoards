@@ -12,12 +12,17 @@ use openboards::{build_router, AppState};
 
 struct TestHarness {
     _tmp: tempfile::TempDir,
+    state: AppState,
     app: axum::Router,
     owner_token: String,
 }
 
 impl TestHarness {
     fn new() -> Self {
+        Self::with_rate_limit(0, 100)
+    }
+
+    fn with_rate_limit(rps: u32, burst: u32) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
         let db = Database::open_in_memory().unwrap();
@@ -30,11 +35,14 @@ impl TestHarness {
                 data_dir: tmp.path().to_path_buf(),
                 team: "acme".to_string(),
                 admin_token: Some(owner_token.clone()),
+                rate_limit_rps: rps,
+                rate_limit_burst: burst,
             },
         );
-        let app = build_router(state);
+        let app = build_router(state.clone());
         Self {
             _tmp: tmp,
+            state,
             app,
             owner_token,
         }
@@ -1087,4 +1095,424 @@ async fn attachments_inline_streaming_limits_and_tombstone_visibility() {
         .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(bytes, payload);
+}
+
+#[tokio::test]
+async fn event_log_total_order_msg_cursor_before_after_visibility_and_bookkeeping() {
+    let h = TestHarness::new();
+    let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+    let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
+
+    // 1. Explicit channel creation emits channel.created
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/channels",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "path": "dev" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // 2. Post with status=open, edit, react, label open->closed, label closed->open, delete
+    let (st, root) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "dev",
+                "text": "initial",
+                "labels": { "status": "open" }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let root_id = root["id"].as_str().unwrap().to_string();
+
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "text": "edited" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/reactions"),
+            Some(&bob_tok),
+            &[],
+            Some(json!({ "emoji": "eyes" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/labels"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "set": { "status": "closed" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}/labels"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "set": { "status": "open" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = h
+        .req(
+            Method::DELETE,
+            &format!("/v1/messageboard/boards/General/messages/{root_id}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Total order check for unrestricted caller
+    let (st, page) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let types: Vec<&str> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "channel.created",
+            "message.posted",
+            "message.edited",
+            "reaction.added",
+            "labels.changed",
+            "labels.changed",
+            "message.deleted",
+        ]
+    );
+
+    // Using `msg_...` ID as `after` cursor starts right after its `message.posted` event
+    let (st, page_after_msg) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/events?after={root_id}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let types_after: Vec<&str> = page_after_msg["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types_after,
+        vec![
+            "message.edited",
+            "reaction.added",
+            "labels.changed",
+            "labels.changed",
+            "message.deleted",
+        ]
+    );
+
+    // Before-and-after label filter matching: `?label=status=open` sees BOTH leaving (`open->closed`)
+    // AND re-entering (`closed->open`) AND deleting (`open->tombstone`)!
+    let (st, filtered) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0&label=status=open",
+            Some(&bob_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let ftypes: Vec<&str> = filtered["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ftypes,
+        vec![
+            "message.posted",
+            "message.edited",
+            "reaction.added",
+            "labels.changed", // open -> closed (before matched!)
+            "labels.changed", // closed -> open (after matched!)
+            "message.deleted", // open -> deleted (before matched!)
+        ]
+    );
+
+    // Private channel & `channel.created` visibility:
+    // Alice creates private channel `secret` and posts inside it.
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/channels",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "path": "secret", "private": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "secret", "text": "top secret" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // Bob can no longer read every channel (`secret` is closed to him), so Bob sees NEITHER
+    // `channel.created` NOR the `secret` message event!
+    let (st, bob_ev) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0",
+            Some(&bob_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let bob_events = bob_ev["events"].as_array().unwrap();
+    assert!(bob_events.iter().all(|e| e["type"] != "channel.created"));
+    assert!(bob_events
+        .iter()
+        .all(|e| e["message"]["channel"].as_str() != Some("secret")));
+
+    // Alice CAN read every channel (she owns `secret` + `g1`), so Alice sees `channel.created` and `secret`
+    let (st, alice_ev) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let alice_events = alice_ev["events"].as_array().unwrap();
+    assert!(alice_events.iter().any(|e| e["type"] == "channel.created"));
+    assert!(alice_events
+        .iter()
+        .any(|e| e["message"]["channel"].as_str() == Some("secret")));
+
+    // Bookkeeping events hidden unless `all=true`
+    let board = boards::ensure_default_board(&h.state.db).unwrap();
+    h.state
+        .db
+        .with_tx(|tx| {
+            let stored = openboards::messages::load_stored_message_tx(tx, &board.id, &root_id)?
+                .unwrap();
+            let snap = openboards::messages::build_message_snapshot_tx(tx, &stored)?;
+            let view = openboards::messages::hydrate_message_view_tx(tx, &stored)?;
+            openboards::events::append_event_tx(
+                tx,
+                openboards::events::EventAppend {
+                    board_id: &board.id,
+                    event_type: openboards::events::EventType::TaskRenewed,
+                    channel: Some("dev"),
+                    message_id: Some(&root_id),
+                    actor_id: None,
+                    payload: json!({ "epoch": 1 }),
+                    before_snapshot: Some(&snap),
+                    after_snapshot: Some(&snap),
+                    after_message: Some(&view),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (st, without_all) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0&types=task.renewed",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(without_all["events"].as_array().unwrap().is_empty());
+
+    let (st, with_all) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/events?after=0&types=task.renewed&all=true",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(with_all["events"].as_array().unwrap().len(), 1);
+    assert_eq!(with_all["events"][0]["type"], "task.renewed");
+}
+
+#[tokio::test]
+async fn live_long_poll_wakeup_wait_timeout_and_rate_limiting() {
+    let h = TestHarness::new();
+    let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+
+    // 1. Wait timeout returns 408 timeout with cursor
+    let (st, body) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/wait?channel=dev&timeout=50ms",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(body["code"], "timeout");
+    assert!(body["cursor"].is_string());
+
+    // 2. Concurrent live wakeup on /wait (5s timeout, woken in ~30ms by a post!)
+    let app_clone = h.app.clone();
+    let tok_clone = alice_tok.clone();
+    let wait_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/messageboard/boards/General/wait?channel=dev&timeout=5s")
+            .header("authorization", format!("Bearer {tok_clone}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_clone.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, val)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let started = std::time::Instant::now();
+    let (st, posted) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "dev", "text": "wake up!" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let posted_id = posted["id"].as_str().unwrap().to_string();
+
+    let (wait_st, wait_body) = wait_task.await.unwrap();
+    assert_eq!(wait_st, StatusCode::OK);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(wait_body["event"]["type"], "message.posted");
+    assert_eq!(wait_body["event"]["message"]["id"], posted_id);
+    let next_cursor = wait_body["cursor"].as_str().unwrap().to_string();
+
+    // 3. Concurrent live wakeup on /events?wait=5s&after=<next_cursor>
+    let app_clone = h.app.clone();
+    let tok_clone = alice_tok.clone();
+    let poll_uri = format!("/v1/messageboard/boards/General/events?channel=dev&after={next_cursor}&wait=5s");
+    let poll_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(poll_uri)
+            .header("authorization", format!("Bearer {tok_clone}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_clone.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, val)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{posted_id}/replies"),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "text": "live reply" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (poll_st, poll_body) = poll_task.await.unwrap();
+    assert_eq!(poll_st, StatusCode::OK);
+    let evs = poll_body["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["message"]["text"], "live reply");
+
+    // 4. Per-principal rate limiting: burst=2 shared across profiles; returns 429 + Retry-After
+    let rl = TestHarness::with_rate_limit(1, 2);
+    // Create Alice while using owner bucket (2 requests -> create user + create token consumes owner's 2)
+    let (_uid, bob_tok) = rl.create_user_with_token("bob", "bob@acme.com", "member").await;
+
+    // Bob bare (1st) + Bob with profile fx (2nd) succeed; Bob with profile codex (3rd) hits 429!
+    let (st, _, _) = rl
+        .req_raw(Method::GET, "/whoami", Some(&bob_tok), &[], Vec::new())
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _, _) = rl
+        .req_raw(
+            Method::GET,
+            "/whoami",
+            Some(&bob_tok),
+            &[("x-board-as", "fx")],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, hdrs, raw) = rl
+        .req_raw(
+            Method::GET,
+            "/whoami",
+            Some(&bob_tok),
+            &[("x-board-as", "codex")],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert!(hdrs.get("retry-after").is_some());
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(body["code"], "rate_limited");
 }

@@ -29,6 +29,8 @@ impl TestHarness {
                 data_dir: std::path::PathBuf::from("."),
                 team: "acme".to_string(),
                 admin_token: Some(owner_token.clone()),
+                rate_limit_rps: 0,
+                rate_limit_burst: 100,
             },
         );
         let app = build_router(state.clone());

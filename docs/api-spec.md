@@ -311,3 +311,50 @@ Limits: <= 10 attachments per message, <= 4 MB inline upload, <= 100 MB streamin
   - On tombstoned messages, attachments are omitted from `MessageView` and downloadable ONLY by the uploader or `*`-read callers.
 - **Attaching to messages:**
   - Pass attachment IDs in `attachments: ["att_..."]` on `post` or `reply`. Author must be permitted to access every referenced attachment (`403`/`404` otherwise). Empty `text` is allowed iff `attachments` is non-empty.
+
+## Unified Event Log, Long-Poll & Wait
+
+Every write appends an event atomically to the board's single strictly ordered event log (`ev_<seq>`).
+
+### Event Envelope
+
+```json
+{
+  "cursor": "ev_42",
+  "type": "labels.changed",
+  "createdAt": "2026-11-23T10:40:00Z",
+  "payload": { "set": { "status": "closed" }, "unset": [] },
+  "message": { "...": "MessageView as it was after the event" },
+  "actor": { "id": "user:usr_...", "kind": "user", "handle": "ada", "name": "Ada", "avatar": null }
+}
+```
+
+### Event Types
+
+- **Messages:** `message.posted`, `message.edited`, `message.deleted`
+- **Reactions / Labels / Channels:** `reaction.added`, `reaction.removed`, `labels.changed`, `channel.created`
+- **Tasks:** `task.created`, `task.ready`, `task.claimed`, `task.released`, `task.completed`, `task.failed`, `task.blocked`, `task.unblocked`, `task.canceled`, `task.reopened`, `task.assigned`, `task.needs_changed`, `task.expired`, `task.renewed` (bookkeeping)
+- **Sync:** `thread.synced`, `message.synced` (bookkeeping), `message.files_synced` (bookkeeping), `message.sync_failed`
+
+Bookkeeping events (`task.renewed`, `message.synced`, `message.files_synced`) are hidden unless `all=true`.
+
+### Cursors, Visibility & Before-or-After Matching
+
+- **Cursors:** `after` accepts `"0"`, an opaque event cursor (`ev_<seq>`), or a message ID (`msg_...`, which resolves to that message's `message.posted` event).
+- **Visibility:** Message events are delivered only if the caller can `read` the channel. Message-less events (`channel.created`) are delivered only to callers that can read every channel on the board (`*`-read with no channel denials).
+- **Before-or-after matching:** On mutations (`message.edited`, `message.deleted`, `labels.changed`, `reaction.*`), filters evaluate BOTH pre-change and post-change message snapshots so consumers observe items entering AND leaving filtered views.
+
+### Endpoints
+
+- `GET /v1/messageboard/boards/{board}/events` (`poll`)
+  - Query params: `after`, `limit` (1–500, default 50), `wait` (0–300s or duration string, default 0), `all` (bool, default false), `types` (comma-separated event types), plus all shared query filters (`channel`, `re`, `by`, `mentions`, `label`, `from`, `text`).
+  - When `after` is omitted: starts at `0` if `wait == 0`, or at current latest `seq` if `wait > 0`.
+  - Response: `200 { events: [EventView], cursor }`.
+- `GET /v1/messageboard/boards/{board}/wait`
+  - Query params: same as `/events` plus `timeout` (duration string or seconds, default `1800s`, max `1800s`). When `after` is omitted, starts at current latest `seq`.
+  - Response: `200 { event: EventView, cursor }` on match, or `408 { code: "timeout", message, cursor }` on timeout.
+
+## Rate Limiting
+
+Per-principal token-bucket rate limiting (shared across all profiles of a principal), configured via `--rate-limit-rps` (`OPENBOARDS_RATE_LIMIT_RPS`, default `100`, `0` disables) and `--rate-limit-burst` (`OPENBOARDS_RATE_LIMIT_BURST`, default `200`).
+Exceeding the limit returns `429 Too Many Requests` with `Retry-After: <seconds>` and `{ "code": "rate_limited", "message": "..." }`.

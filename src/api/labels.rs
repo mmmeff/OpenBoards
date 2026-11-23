@@ -26,6 +26,9 @@ async fn update_labels(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let outcome = labels::update_labels(&state.db, &resolved.id, &id, &caller, input)?;
+    if let Some(seq) = outcome.event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     Ok(Json(json!({
         "ok": true,
         "set": outcome.set,

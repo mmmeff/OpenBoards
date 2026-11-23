@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::actors::CallerContext;
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult, ErrorCode};
+use crate::events::{self, EventAppend, EventType};
 use crate::grants;
+use crate::messages;
 use crate::validate::{validate_label_key, validate_label_value, validate_writable_label_key};
 
 #[derive(Debug, Default, Deserialize)]
@@ -24,6 +26,8 @@ pub struct LabelsChangedOutcome {
     pub set: BTreeMap<String, String>,
     pub unset: Vec<String>,
     pub labels: BTreeMap<String, String>,
+    #[serde(skip_serializing)]
+    pub event_seq: Option<i64>,
 }
 
 /// Validates a map of user-supplied labels (rejects `board.*` with `400 reserved_label`).
@@ -122,20 +126,13 @@ pub fn update_labels(
     }
 
     db.with_tx(|tx| {
-        let msg_row: Option<(String, Option<String>)> = tx
-            .query_row(
-                "SELECT channel, deleted_at FROM messages WHERE board_id = ?1 AND id = ?2",
-                params![board_id, message_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-
-        let (channel, deleted_at) = msg_row.ok_or_else(|| {
+        let stored = messages::load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
             BoardError::new(
                 ErrorCode::MessageNotFound,
                 format!("message '{message_id}' not found"),
             )
         })?;
+        let channel = stored.channel.clone();
 
         let board_grants = grants::load_grants_tx(tx, board_id)?;
         let perms = grants::caller_permissions_on_channel(&board_grants, caller, &channel);
@@ -150,7 +147,7 @@ pub fn update_labels(
                 "labeling messages in '{channel}' requires 'label' permission"
             )));
         }
-        if deleted_at.is_some() {
+        if stored.deleted_at.is_some() {
             return Err(BoardError::new(
                 ErrorCode::MessageDeleted,
                 format!("cannot label deleted message '{message_id}'"),
@@ -170,6 +167,8 @@ pub fn update_labels(
             }
         }
 
+        let before_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+
         let mut actually_unset = Vec::new();
         for key in &input.unset {
             if !input.set.contains_key(key) {
@@ -188,10 +187,37 @@ pub fn update_labels(
         }
 
         let labels = load_message_labels_tx(tx, message_id)?;
+        let event_seq = if !input.set.is_empty() || !actually_unset.is_empty() {
+            let after_snap = messages::build_message_snapshot_tx(tx, &stored)?;
+            let after_msg = messages::hydrate_message_view_tx(tx, &stored)?;
+            let actor_id = caller.actor_id();
+            let ev = events::append_event_tx(
+                tx,
+                EventAppend {
+                    board_id,
+                    event_type: EventType::LabelsChanged,
+                    channel: Some(&channel),
+                    message_id: Some(message_id),
+                    actor_id: Some(&actor_id),
+                    payload: serde_json::json!({
+                        "set": input.set,
+                        "unset": actually_unset
+                    }),
+                    before_snapshot: Some(&before_snap),
+                    after_snapshot: Some(&after_snap),
+                    after_message: Some(&after_msg),
+                },
+            )?;
+            Some(ev.seq)
+        } else {
+            None
+        };
+
         Ok(LabelsChangedOutcome {
             set: input.set,
             unset: actually_unset,
             labels,
+            event_seq,
         })
     })
 }

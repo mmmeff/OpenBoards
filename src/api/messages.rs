@@ -119,6 +119,9 @@ async fn post_message(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let res = messages::post_message(&state.db, &resolved.id, &caller, input)?;
+    if let Some(seq) = res.event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     let status = if res.replayed {
         StatusCode::OK
     } else {
@@ -136,6 +139,9 @@ async fn reply_message(
 ) -> BoardResult<(StatusCode, Json<Value>)> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let res = messages::reply_message(&state.db, &resolved.id, &id, &caller, input)?;
+    if let Some(seq) = res.event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     let status = if res.replayed {
         StatusCode::OK
     } else {
@@ -163,7 +169,8 @@ async fn edit_message(
     Json(input): Json<EditMessageInput>,
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (msg, mentions) = messages::edit_message(&state.db, &resolved.id, &id, &caller, input)?;
+    let (msg, mentions, seq) = messages::edit_message(&state.db, &resolved.id, &id, &caller, input)?;
+    state.events.notify(&resolved.id, seq);
     let mut body = json!({ "ok": true, "message": msg });
     if !mentions.is_empty() {
         body["mentions"] = json!(mentions);
@@ -180,13 +187,15 @@ async fn delete_message(
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
     let revision = body.and_then(|Json(b)| b.revision).or(query.revision);
-    let _ = messages::delete_message(
+    if let Some(seq) = messages::delete_message(
         &state.db,
         &resolved.id,
         &id,
         &caller,
         DeleteMessageInput { revision },
-    )?;
+    )? {
+        state.events.notify(&resolved.id, seq);
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -198,7 +207,10 @@ async fn react_message(
     Json(input): Json<ReactInput>,
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (emoji, _changed) = messages::react_message(&state.db, &resolved.id, &id, &caller, input)?;
+    let (emoji, event_seq) = messages::react_message(&state.db, &resolved.id, &id, &caller, input)?;
+    if let Some(seq) = event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     Ok(Json(json!({ "ok": true, "emoji": emoji })))
 }
 
@@ -209,7 +221,7 @@ async fn remove_reaction(
     Query(query): Query<EnsureQuery>,
 ) -> BoardResult<Json<Value>> {
     let resolved = boards::resolve_board(&state.db, &board, query.ensure, &caller)?;
-    let (emoji, _changed) = messages::react_message(
+    let (emoji, event_seq) = messages::react_message(
         &state.db,
         &resolved.id,
         &id,
@@ -219,6 +231,9 @@ async fn remove_reaction(
             remove: true,
         },
     )?;
+    if let Some(seq) = event_seq {
+        state.events.notify(&resolved.id, seq);
+    }
     Ok(Json(json!({ "ok": true, "emoji": emoji })))
 }
 

@@ -9,6 +9,7 @@ use crate::actors::{self, CallerContext};
 use crate::attachments;
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult, ErrorCode};
+use crate::events::{self, EventAppend, EventType};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
 use crate::grants;
 use crate::id::new_message_id;
@@ -102,6 +103,8 @@ pub struct PostedMessageResult {
     pub mentions: Vec<MentionResolution>,
     #[serde(skip_serializing)]
     pub replayed: bool,
+    #[serde(skip_serializing)]
+    pub event_seq: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,17 +255,10 @@ fn next_msg_seq_tx(conn: &Connection, board_id: &str) -> BoardResult<i64> {
 }
 
 fn current_board_cursor_tx(conn: &Connection, board_id: &str) -> BoardResult<String> {
-    let last: Option<String> = conn
-        .query_row(
-            "SELECT id FROM messages WHERE board_id = ?1 ORDER BY seq DESC LIMIT 1",
-            params![board_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(last.unwrap_or_else(|| "0".to_string()))
+    events::current_event_cursor_tx(conn, board_id)
 }
 
-fn load_stored_message_tx(
+pub fn load_stored_message_tx(
     conn: &Connection,
     board_id: &str,
     message_id: &str,
@@ -582,6 +578,7 @@ pub fn post_message(
                     message: existing,
                     mentions: Vec::new(),
                     replayed: true,
+                    event_seq: None,
                 });
             }
         }
@@ -663,11 +660,27 @@ pub fn post_message(
 
         let stored = load_stored_message_tx(tx, board_id, &msg_id)?
             .expect("inserted message must exist");
+        let snap = build_message_snapshot_tx(tx, &stored)?;
         let view = hydrate_message_view_tx(tx, &stored)?;
+        let ev = events::append_event_tx(
+            tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::MessagePosted,
+                channel: Some(&input.channel),
+                message_id: Some(&msg_id),
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({ "channel": input.channel, "re": Value::Null }),
+                before_snapshot: None,
+                after_snapshot: Some(&snap),
+                after_message: Some(&view),
+            },
+        )?;
         Ok(PostedMessageResult {
             message: view,
             mentions: resolved_mentions.mentions,
             replayed: false,
+            event_seq: Some(ev.seq),
         })
     })
 }
@@ -743,6 +756,7 @@ pub fn reply_message(
                     message: existing,
                     mentions: Vec::new(),
                     replayed: true,
+                    event_seq: None,
                 });
             }
         }
@@ -838,11 +852,31 @@ pub fn reply_message(
 
         let stored = load_stored_message_tx(tx, board_id, &msg_id)?
             .expect("inserted reply must exist");
+        let snap = build_message_snapshot_tx(tx, &stored)?;
         let view = hydrate_message_view_tx(tx, &stored)?;
+        let ev = events::append_event_tx(
+            tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::MessagePosted,
+                channel: Some(&target.channel),
+                message_id: Some(&msg_id),
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({
+                    "channel": target.channel,
+                    "re": root_id,
+                    "replyTo": reply_to
+                }),
+                before_snapshot: None,
+                after_snapshot: Some(&snap),
+                after_message: Some(&view),
+            },
+        )?;
         Ok(PostedMessageResult {
             message: view,
             mentions: resolved_mentions.mentions,
             replayed: false,
+            event_seq: Some(ev.seq),
         })
     })
 }
@@ -854,7 +888,7 @@ pub fn edit_message(
     message_id: &str,
     caller: &CallerContext,
     input: EditMessageInput,
-) -> BoardResult<(MessageView, Vec<MentionResolution>)> {
+) -> BoardResult<(MessageView, Vec<MentionResolution>, i64)> {
     validate_text_length(&input.text)?;
     if input.text.is_empty() {
         return Err(BoardError::bad_request("edited text cannot be empty"));
@@ -904,6 +938,7 @@ pub fn edit_message(
             ));
         }
 
+        let before_snap = build_message_snapshot_tx(tx, &msg)?;
         let parsed_blocks =
             schemas::parse_and_validate_blocks_tx(tx, &input.text, input.schema.as_deref())?;
         let visible_actors = visible_actors_for_caller_tx(tx, board_id, &board_grants, caller)?;
@@ -920,8 +955,24 @@ pub fn edit_message(
         schemas::store_message_blocks_tx(tx, board_id, message_id, &parsed_blocks)?;
 
         let updated = load_stored_message_tx(tx, board_id, message_id)?.unwrap();
+        let after_snap = build_message_snapshot_tx(tx, &updated)?;
         let view = hydrate_message_view_tx(tx, &updated)?;
-        Ok((view, resolved_mentions.mentions))
+        let actor_id = caller.actor_id();
+        let ev = events::append_event_tx(
+            tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::MessageEdited,
+                channel: Some(&msg.channel),
+                message_id: Some(message_id),
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({ "revision": next_rev }),
+                before_snapshot: Some(&before_snap),
+                after_snapshot: Some(&after_snap),
+                after_message: Some(&view),
+            },
+        )?;
+        Ok((view, resolved_mentions.mentions, ev.seq))
     })
 }
 
@@ -935,7 +986,7 @@ pub fn delete_message(
     message_id: &str,
     caller: &CallerContext,
     input: DeleteMessageInput,
-) -> BoardResult<bool> {
+) -> BoardResult<Option<i64>> {
     db.with_tx(|tx| {
         let msg = load_stored_message_tx(tx, board_id, message_id)?.ok_or_else(|| {
             BoardError::new(
@@ -975,9 +1026,10 @@ pub fn delete_message(
         }
 
         if msg.deleted_at.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
 
+        let before_snap = build_message_snapshot_tx(tx, &msg)?;
         let now = Utc::now().to_rfc3339();
         let next_rev = msg.revision + 1;
         tx.execute(
@@ -996,7 +1048,26 @@ pub fn delete_message(
         labels::delete_message_labels_tx(tx, message_id)?;
         schemas::delete_message_blocks_tx(tx, message_id)?;
 
-        Ok(true)
+        let updated = load_stored_message_tx(tx, board_id, message_id)?.unwrap();
+        let after_snap = build_message_snapshot_tx(tx, &updated)?;
+        let view = hydrate_message_view_tx(tx, &updated)?;
+        let actor_id = caller.actor_id();
+        let ev = events::append_event_tx(
+            tx,
+            EventAppend {
+                board_id,
+                event_type: EventType::MessageDeleted,
+                channel: Some(&msg.channel),
+                message_id: Some(message_id),
+                actor_id: Some(&actor_id),
+                payload: serde_json::json!({ "revision": next_rev }),
+                before_snapshot: Some(&before_snap),
+                after_snapshot: Some(&after_snap),
+                after_message: Some(&view),
+            },
+        )?;
+
+        Ok(Some(ev.seq))
     })
 }
 
@@ -1007,7 +1078,7 @@ pub fn react_message(
     message_id: &str,
     caller: &CallerContext,
     input: ReactInput,
-) -> BoardResult<(String, bool)> {
+) -> BoardResult<(String, Option<i64>)> {
     let emoji = normalize_emoji(&input.emoji)?;
 
     db.with_tx(|tx| {
@@ -1056,7 +1127,34 @@ pub fn react_message(
             )?;
             n > 0
         };
-        Ok((emoji, changed))
+
+        let event_seq = if changed {
+            let snap = build_message_snapshot_tx(tx, &msg)?;
+            let view = hydrate_message_view_tx(tx, &msg)?;
+            let ev_type = if input.remove {
+                EventType::ReactionRemoved
+            } else {
+                EventType::ReactionAdded
+            };
+            let ev = events::append_event_tx(
+                tx,
+                EventAppend {
+                    board_id,
+                    event_type: ev_type,
+                    channel: Some(&msg.channel),
+                    message_id: Some(message_id),
+                    actor_id: Some(&actor_id),
+                    payload: serde_json::json!({ "emoji": emoji }),
+                    before_snapshot: Some(&snap),
+                    after_snapshot: Some(&snap),
+                    after_message: Some(&view),
+                },
+            )?;
+            Some(ev.seq)
+        } else {
+            None
+        };
+        Ok((emoji, event_seq))
     })
 }
 
@@ -1178,6 +1276,21 @@ fn resolve_msg_seq_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) ->
     }
     if let Some(row) = load_stored_message_tx(conn, board_id, cursor)? {
         return Ok(row.seq);
+    }
+    if let Some(ev_seq) = events::parse_event_cursor_seq(cursor) {
+        // Resolve event cursor to the highest message seq posted at or before `ev_seq`
+        let msg_seq: Option<i64> = conn
+            .query_row(
+                "SELECT m.seq
+                 FROM events e
+                 JOIN messages m ON m.id = e.message_id
+                 WHERE e.board_id = ?1 AND e.seq <= ?2 AND e.event_type = 'message.posted'
+                 ORDER BY e.seq DESC LIMIT 1",
+                params![board_id, ev_seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(msg_seq.unwrap_or(0));
     }
     Err(BoardError::bad_request(format!(
         "invalid cursor or message ID '{cursor}'"

@@ -3,6 +3,7 @@ pub mod admin;
 pub mod attachments;
 pub mod boards;
 pub mod channels;
+pub mod events;
 pub mod grants;
 pub mod labels;
 pub mod messages;
@@ -34,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .merge(labels::routes())
         .merge(schemas::routes())
         .merge(attachments::routes())
+        .merge(events::routes())
         .with_state(state)
 }
 
@@ -75,6 +77,7 @@ impl FromRequestParts<AppState> for CallerContext {
             })?;
 
         let principal = authenticate_bearer_token(&state.db, raw_token)?;
+        state.rate_limiter.check(&principal.principal_id())?;
 
         let profile = parse_profile_headers(
             header_str(parts, "x-board-profile")?,
