@@ -72,13 +72,13 @@ jobs:
         include:
           - slug: darwin-arm64
             target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             bin: ob
             archive: tar.gz
             native: true
           - slug: darwin-x64
             target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             bin: ob
             archive: tar.gz
             native: false
