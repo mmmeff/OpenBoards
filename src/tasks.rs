@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::actors::{self, CallerContext};
-use crate::db::Database;
+use crate::db::{sql_placeholders, Database};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventHub, EventType};
 use crate::filter::{FilterContext, LabelPredicate, QueryFilter};
@@ -392,17 +392,14 @@ fn load_task_needs_tx(conn: &Connection, task_id: &str) -> BoardResult<Vec<Strin
 
 /// Hydrates `Option<TaskView>` for a root message (never exposes `claim_token`).
 pub fn load_task_view_tx(conn: &Connection, message_id: &str) -> BoardResult<Option<TaskView>> {
-    let row: Option<StoredTaskRow> = conn
-        .query_row(
-            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
-                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
-                    result, fail_reason, cancel_reason
-             FROM tasks
-             WHERE message_id = ?1",
-            params![message_id],
-            map_task_row,
-        )
-        .optional()?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                result, fail_reason, cancel_reason
+         FROM tasks
+         WHERE message_id = ?1",
+    )?;
+    let row: Option<StoredTaskRow> = stmt.query_row(params![message_id], map_task_row).optional()?;
     let Some(t) = row else {
         return Ok(None);
     };
@@ -421,6 +418,80 @@ pub fn load_task_view_tx(conn: &Connection, message_id: &str) -> BoardResult<Opt
         fail_reason: t.fail_reason,
         cancel_reason: t.cancel_reason,
     }))
+}
+
+pub fn load_task_views_batch_tx(
+    conn: &Connection,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, TaskView>> {
+    let mut out: HashMap<String, TaskView> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+
+    let mut stored_tasks: Vec<StoredTaskRow> = Vec::new();
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT message_id, board_id, channel, seq, state, owner_actor, assigned_for,
+                    claimed_by, claim_epoch, claim_token, claim_until, block_reason, block_kind,
+                    result, fail_reason, cancel_reason
+             FROM tasks
+             WHERE message_id IN ({})",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), map_task_row)?;
+        for row in rows {
+            stored_tasks.push(row?);
+        }
+    }
+
+    if stored_tasks.is_empty() {
+        return Ok(out);
+    }
+
+    let task_ids: Vec<&str> = stored_tasks.iter().map(|t| t.message_id.as_str()).collect();
+    let mut needs_map: HashMap<String, Vec<String>> = HashMap::new();
+    for chunk in task_ids.chunks(400) {
+        let sql = format!(
+            "SELECT task_id, needs_task_id
+             FROM task_needs
+             WHERE task_id IN ({})
+             ORDER BY task_id ASC, needs_task_id ASC",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (tid, nid) = row?;
+            needs_map.entry(tid).or_default().push(nid);
+        }
+    }
+
+    for t in stored_tasks {
+        let needs = needs_map.remove(&t.message_id).unwrap_or_default();
+        out.insert(
+            t.message_id,
+            TaskView {
+                state: t.state,
+                owner: t.owner_actor,
+                assigned_for: t.assigned_for,
+                claimed_by: t.claimed_by,
+                epoch: t.claim_epoch,
+                until: t.claim_until,
+                needs,
+                block_reason: t.block_reason,
+                block_kind: t.block_kind,
+                result: t.result,
+                fail_reason: t.fail_reason,
+                cancel_reason: t.cancel_reason,
+            },
+        );
+    }
+
+    Ok(out)
 }
 
 fn resolve_assigned_for(owner_actor: &str, raw_for: Option<&str>) -> BoardResult<Option<String>> {

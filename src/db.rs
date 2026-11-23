@@ -1,8 +1,9 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::{BoardError, BoardResult};
 
@@ -516,16 +517,60 @@ const MIGRATIONS: &[Migration] = &[
                 ON sync_deliveries (status, next_attempt_at);
         "#,
     },
+    Migration {
+        version: 12,
+        name: "012_thread_summaries",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS threads (
+                root_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                root_seq INTEGER NOT NULL,
+                last_seq INTEGER NOT NULL,
+                last_id TEXT NOT NULL,
+                last_reply_id TEXT,
+                reply_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_threads_board_last_seq
+                ON threads (board_id, last_seq DESC);
+            CREATE INDEX IF NOT EXISTS idx_threads_board_channel_last_seq
+                ON threads (board_id, channel, last_seq DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_board_channel_re_seq
+                ON messages (board_id, channel, re, seq);
+
+            INSERT OR IGNORE INTO threads (
+                root_id, board_id, channel, root_seq, last_seq, last_id, last_reply_id, reply_count
+            )
+            SELECT
+                r.id,
+                r.board_id,
+                r.channel,
+                r.seq,
+                COALESCE(
+                    (SELECT MAX(m.seq) FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id),
+                    r.seq
+                ),
+                COALESCE(
+                    (SELECT m.id FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id ORDER BY m.seq DESC LIMIT 1),
+                    r.id
+                ),
+                (SELECT m.id FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id ORDER BY m.seq DESC LIMIT 1),
+                (SELECT COUNT(*) FROM messages m WHERE m.board_id = r.board_id AND m.re = r.id)
+            FROM messages r
+            WHERE r.re IS NULL;
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.
 ///
-/// ponytail: single Mutex<Connection> keeps SQLite access simple with zero pool crate overhead.
-/// Ceiling: concurrent read throughput under heavy read load; upgrade path is a separate
-/// read-only connection pool (e.g. r2d2/deadpool) while keeping serialized writes.
+/// File-backed databases use a serialized write connection paired with a small pool of
+/// read-only WAL connections so concurrent reads scale across CPU cores without blocking writes.
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    read_conns: Option<Arc<Vec<Mutex<Connection>>>>,
+    next_reader: Arc<AtomicUsize>,
 }
 
 impl Database {
@@ -541,7 +586,28 @@ impl Database {
             }
         }
         let conn = Connection::open(path)?;
-        Self::init(conn, true)
+        let db = Self::init(conn, true)?;
+
+        let reader_count = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let rc = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            rc.pragma_update(None, "query_only", "ON")?;
+            rc.pragma_update(None, "foreign_keys", "ON")?;
+            rc.pragma_update(None, "busy_timeout", 5000)?;
+            readers.push(Mutex::new(rc));
+        }
+
+        Ok(Self {
+            conn: db.conn,
+            read_conns: Some(Arc::new(readers)),
+            next_reader: db.next_reader,
+        })
     }
 
     pub fn open_in_memory() -> BoardResult<Self> {
@@ -559,6 +625,8 @@ impl Database {
         run_migrations(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_conns: None,
+            next_reader: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -566,6 +634,19 @@ impl Database {
     where
         F: FnOnce(&Connection) -> BoardResult<T>,
     {
+        if let Some(readers) = &self.read_conns {
+            let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % readers.len();
+            for offset in 0..readers.len() {
+                let idx = (start + offset) % readers.len();
+                if let Ok(guard) = readers[idx].try_lock() {
+                    return f(&guard);
+                }
+            }
+            let guard = readers[start]
+                .lock()
+                .map_err(|_| BoardError::internal("read database mutex poisoned"))?;
+            return f(&guard);
+        }
         let guard = self
             .conn
             .lock()
@@ -597,6 +678,21 @@ impl Database {
             Ok(version)
         })
     }
+}
+
+/// Builds a comma-separated placeholder list (`?,?,...`) for `IN (...)` batch queries.
+pub fn sql_placeholders(count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    let mut s = String::with_capacity(count * 2 - 1);
+    for i in 0..count {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
 }
 
 fn run_migrations(conn: &mut Connection) -> BoardResult<()> {
@@ -661,6 +757,16 @@ mod tests {
         // Reopening is idempotent
         let db2 = Database::open(&db_path).unwrap();
         assert_eq!(db2.schema_version().unwrap(), expected_version);
+
+        // Read-only WAL pool enforces query_only = ON
+        let write_err = db2.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO server_meta (key, value) VALUES ('ro_test', '1')",
+                [],
+            )?;
+            Ok(())
+        });
+        assert!(write_err.is_err());
     }
 
     #[test]

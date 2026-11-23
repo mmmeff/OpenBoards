@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::actors::CallerContext;
-use crate::db::Database;
+use crate::db::{sql_placeholders, Database};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::grants;
 use crate::messages::ParsedBlock;
@@ -451,7 +453,7 @@ pub fn load_message_blocks_tx(
     conn: &Connection,
     message_id: &str,
 ) -> BoardResult<Vec<ParsedBlock>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT schema_name, schema_version, data_json
          FROM message_blocks
          WHERE message_id = ?1
@@ -474,6 +476,45 @@ pub fn load_message_blocks_tx(
             version,
             data,
         });
+    }
+    Ok(out)
+}
+
+pub fn load_messages_blocks_batch_tx(
+    conn: &Connection,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, Vec<ParsedBlock>>> {
+    let mut out: HashMap<String, Vec<ParsedBlock>> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT message_id, schema_name, schema_version, data_json
+             FROM message_blocks
+             WHERE message_id IN ({})
+             ORDER BY message_id ASC, idx ASC",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (mid, schema, version, data_json) = row?;
+            let data: Value = serde_json::from_str(&data_json)
+                .map_err(|e| BoardError::internal(format!("corrupted block JSON: {e}")))?;
+            out.entry(mid).or_default().push(ParsedBlock {
+                schema,
+                version,
+                data,
+            });
+        }
     }
     Ok(out)
 }

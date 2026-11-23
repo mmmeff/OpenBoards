@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::actors::CallerContext;
-use crate::db::Database;
+use crate::db::{sql_placeholders, Database};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventType};
 use crate::grants;
@@ -43,7 +43,7 @@ pub fn load_message_labels_tx(
     conn: &Connection,
     message_id: &str,
 ) -> BoardResult<BTreeMap<String, String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT key, value FROM message_labels WHERE message_id = ?1 ORDER BY key ASC",
     )?;
     let rows = stmt.query_map(params![message_id], |r| {
@@ -55,6 +55,38 @@ pub fn load_message_labels_tx(
         map.insert(k, v);
     }
     Ok(map)
+}
+
+pub fn load_messages_labels_batch_tx(
+    conn: &Connection,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, BTreeMap<String, String>>> {
+    let mut out: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT message_id, key, value
+             FROM message_labels
+             WHERE message_id IN ({})
+             ORDER BY message_id ASC, key ASC",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (mid, k, v) = row?;
+            out.entry(mid).or_default().insert(k, v);
+        }
+    }
+    Ok(out)
 }
 
 pub fn insert_labels_tx(

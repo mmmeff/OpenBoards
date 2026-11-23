@@ -1963,6 +1963,14 @@ fn insert_synced_message_tx(
             now
         ],
     )?;
+    messages::record_thread_message_tx(
+        tx,
+        &src.board_id,
+        board_channel,
+        &msg_id,
+        seq,
+        thread_root,
+    )?;
 
     if !initial_labels.is_empty() {
         for (k, v) in initial_labels {

@@ -483,7 +483,7 @@ pub fn insert_grant_tx(
 }
 
 pub fn load_grants_tx(conn: &Connection, board_id: &str) -> BoardResult<Vec<Grant>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, seq, principals_json, can_json, created_by, created_at, updated_at
          FROM grants
          WHERE board_id = ?1

@@ -32,17 +32,16 @@ pub fn ensure_default_board_tx(conn: &Connection) -> BoardResult<BoardView> {
 
 pub fn find_board_tx(conn: &Connection, name_or_id: &str) -> BoardResult<Option<BoardView>> {
     let lower = name_or_id.to_ascii_lowercase();
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, name, created_at FROM boards WHERE id = ?1 OR name_lower = ?2 LIMIT 1",
-        params![name_or_id, lower],
-        |r| {
-            Ok(BoardView {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                created_at: r.get(2)?,
-            })
-        },
-    )
+    )?;
+    stmt.query_row(params![name_or_id, lower], |r| {
+        Ok(BoardView {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            created_at: r.get(2)?,
+        })
+    })
     .optional()
     .map_err(Into::into)
 }
@@ -76,6 +75,23 @@ pub fn resolve_board(
     ensure: Option<bool>,
     caller: &CallerContext,
 ) -> BoardResult<BoardView> {
+    // Fast read-only path avoids starting a SQLite write transaction when the board already exists.
+    if let Some(board) = db.with_conn(|conn| {
+        let Some(existing) = find_board_tx(conn, name_or_id)? else {
+            return Ok(None);
+        };
+        let board_grants = grants::load_grants_tx(conn, &existing.id)?;
+        if !grants::caller_has_any_board_access(&board_grants, caller) {
+            return Err(BoardError::new(
+                ErrorCode::BoardNotGranted,
+                format!("caller has no access to board '{}'", existing.name),
+            ));
+        }
+        Ok(Some(existing))
+    })? {
+        return Ok(board);
+    }
+
     let board = db.with_tx(|tx| {
         if let Some(existing) = find_board_tx(tx, name_or_id)? {
             return Ok(existing);

@@ -654,7 +654,7 @@ pub fn list_pending_thread_schedules_tx(
     board_id: &str,
     root_id: &str,
 ) -> BoardResult<Vec<ScheduleView>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, board_id, channel, re, text, labels_json, attachments_json, schema_id,
                 no_sync, creator_actor, creator_principal, creator_profile, creator_avatar,
                 every_secs, max_times, until_at, next_run_at, runs_completed, last_run_at,

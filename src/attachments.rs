@@ -1,16 +1,17 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::StatusCode;
 use chrono::Utc;
 use http_body_util::BodyExt;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::actors::CallerContext;
-use crate::db::Database;
+use crate::db::{sql_placeholders, Database};
 use crate::error::{BoardError, BoardResult};
 use crate::grants::{self, Grant};
 use crate::id::new_attachment_id;
@@ -505,7 +506,7 @@ pub fn load_message_attachments_tx(
     conn: &Connection,
     message_id: &str,
 ) -> BoardResult<Vec<AttachmentRef>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.name, a.content_type, a.size
          FROM message_attachments ma
          JOIN attachments a ON a.id = ma.attachment_id
@@ -523,6 +524,43 @@ pub fn load_message_attachments_tx(
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn load_messages_attachments_batch_tx(
+    conn: &Connection,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, Vec<AttachmentRef>>> {
+    let mut out: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT ma.message_id, a.id, a.name, a.content_type, a.size
+             FROM message_attachments ma
+             JOIN attachments a ON a.id = ma.attachment_id
+             WHERE ma.message_id IN ({})
+             ORDER BY ma.message_id ASC, ma.idx ASC",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                AttachmentRef {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    content_type: r.get(3)?,
+                    size: r.get::<_, i64>(4)? as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (mid, att) = row?;
+            out.entry(mid).or_default().push(att);
+        }
     }
     Ok(out)
 }

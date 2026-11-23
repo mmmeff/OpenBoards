@@ -195,11 +195,9 @@ pub fn resolve_event_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) 
 }
 
 pub fn current_event_seq_tx(conn: &Connection, board_id: &str) -> BoardResult<i64> {
-    let seq: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE board_id = ?1",
-        params![board_id],
-        |r| r.get(0),
-    )?;
+    let mut stmt =
+        conn.prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE board_id = ?1")?;
+    let seq: i64 = stmt.query_row(params![board_id], |r| r.get(0))?;
     Ok(seq)
 }
 

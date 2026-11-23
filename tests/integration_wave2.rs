@@ -1599,3 +1599,270 @@ async fn spec_audit_narrowed_upload_attachment_edit_and_by_handle_prefix() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(page["messages"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn list_threads_indexed_pagination_subtrees_label_inheritance_hydration_and_permissions() {
+    let h = TestHarness::new();
+    let (_uid_a, alice_tok) = h
+        .create_user_with_token("alice", "alice@acme.com", "member")
+        .await;
+    let (_uid_b, bob_tok) = h
+        .create_user_with_token("bob", "bob@acme.com", "member")
+        .await;
+
+    // 1. Seed 5 threads in `dev`, then bump the oldest thread (#1) with two replies
+    let mut dev_ids = Vec::new();
+    for i in 1..=5 {
+        let (st, msg) = h
+            .req(
+                Method::POST,
+                "/v1/messageboard/boards/General/messages",
+                Some(&alice_tok),
+                &[],
+                Some(json!({
+                    "channel": "dev",
+                    "text": format!("thread-{i}"),
+                    "labels": if i == 2 { json!({ "env": "prod" }) } else { json!({}) }
+                })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        dev_ids.push(msg["id"].as_str().unwrap().to_string());
+    }
+
+    // Add reaction and attachment to thread-1 root, plus 2 replies bumping thread-1 to newest activity
+    let (st, _, raw) = h
+        .req_raw(
+            Method::POST,
+            "/v1/messageboard/boards/General/attachments?name=spec.txt",
+            Some(&alice_tok),
+            &[("content-type", "text/plain")],
+            b"hello".to_vec(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let att_id = serde_json::from_slice::<Value>(&raw).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{}/reactions", dev_ids[0]),
+            Some(&bob_tok),
+            &[],
+            Some(json!({ "emoji": "eyes" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, r1) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{}/replies", dev_ids[0]),
+            Some(&bob_tok),
+            &[],
+            Some(json!({ "text": "reply-1", "labels": { "step": "review" } })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert!(r1["id"].as_str().is_some());
+
+    let (st, r2) = h
+        .req(
+            Method::POST,
+            &format!("/v1/messageboard/boards/General/messages/{}/replies", dev_ids[0]),
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "text": "reply-2", "attachments": [att_id] })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let r2_id = r2["id"].as_str().unwrap().to_string();
+
+    // Expected activity order in `dev`: [t2, t3, t4, t5, t1] (oldest -> newest)
+    let (st, p1) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev&limit=2",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let p1_threads = p1["threads"].as_array().unwrap();
+    assert_eq!(p1_threads.len(), 2);
+    assert_eq!(p1_threads[0]["message"]["id"], dev_ids[4]);
+    assert_eq!(p1_threads[0]["replies"], 0);
+    assert!(p1_threads[0]["last"].is_null());
+    assert_eq!(p1_threads[1]["message"]["id"], dev_ids[0]);
+    assert_eq!(p1_threads[1]["replies"], 2);
+    assert_eq!(p1_threads[1]["last"]["id"], r2_id);
+    assert_eq!(p1_threads[1]["last"]["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(p1_threads[1]["message"]["reactions"]["eyes"].as_array().unwrap().len(), 1);
+    let older1 = p1["older"].as_str().expect("page 1 should have older cursor");
+
+    // Walk backward with `before=older1`
+    let (st, p2) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/threads?channel=dev&limit=2&before={older1}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let p2_threads = p2["threads"].as_array().unwrap();
+    assert_eq!(p2_threads.len(), 2);
+    assert_eq!(p2_threads[0]["message"]["id"], dev_ids[2]);
+    assert_eq!(p2_threads[1]["message"]["id"], dev_ids[3]);
+    let older2 = p2["older"].as_str().expect("page 2 should have older cursor");
+
+    // Final oldest page has 1 item and `older: null`
+    let (st, p3) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/threads?channel=dev&limit=2&before={older2}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let p3_threads = p3["threads"].as_array().unwrap();
+    assert_eq!(p3_threads.len(), 1);
+    assert_eq!(p3_threads[0]["message"]["id"], dev_ids[1]);
+    assert_eq!(p3_threads[0]["message"]["labels"]["env"], "prod");
+    assert!(p3["older"].is_null());
+
+    // Forward walk using `after`
+    let (st, fwd) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/threads?channel=dev&limit=2&after={}", dev_ids[2]),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let fwd_threads = fwd["threads"].as_array().unwrap();
+    assert_eq!(fwd_threads.len(), 2);
+    assert_eq!(fwd_threads[0]["message"]["id"], dev_ids[3]);
+    assert_eq!(fwd_threads[1]["message"]["id"], dev_ids[4]);
+    assert!(fwd["older"].is_null());
+
+    // 2. Subtree range boundary test: `dev/` matches `dev`, `dev/api`, `dev/0` and NOT `dev-ops`, `dev0`, `devops`, `dev_2`
+    for ch in ["dev/api", "dev/0", "dev-ops", "dev0", "devops", "dev_2"] {
+        let (st, _) = h
+            .req(
+                Method::POST,
+                "/v1/messageboard/boards/General/messages",
+                Some(&alice_tok),
+                &[],
+                Some(json!({ "channel": ch, "text": format!("in {ch}") })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+    let (st, sub) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev/&limit=50",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let sub_channels: Vec<&str> = sub["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["message"]["channel"].as_str().unwrap())
+        .collect();
+    assert_eq!(sub_channels.len(), 7); // 5 in `dev` + `dev/api` + `dev/0`
+    assert!(sub_channels.iter().all(|c| *c == "dev" || c.starts_with("dev/")));
+
+    // 3. Filtered `GET /threads`: root label and reply label matching
+    let (st, by_root_label) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev/&label=env=prod",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(by_root_label["threads"].as_array().unwrap().len(), 1);
+    assert_eq!(by_root_label["threads"][0]["message"]["id"], dev_ids[1]);
+
+    let (st, by_reply_label) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev&label=step=review",
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(by_reply_label["threads"].as_array().unwrap().len(), 1);
+    assert_eq!(by_reply_label["threads"][0]["message"]["id"], dev_ids[0]);
+    assert_eq!(by_reply_label["threads"][0]["replies"], 2);
+
+    // 4. Private channel visibility: Bob cannot see Alice's private channel `dev/secret`
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/channels",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "path": "dev/secret", "private": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "dev/secret", "text": "classified" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, bob_secret) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev/secret",
+            Some(&bob_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(bob_secret["threads"].as_array().unwrap().is_empty());
+
+    let (st, bob_sub) = h
+        .req(
+            Method::GET,
+            "/v1/messageboard/boards/General/threads?channel=dev/&limit=2",
+            Some(&bob_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let bob_sub_threads = bob_sub["threads"].as_array().unwrap();
+    assert_eq!(bob_sub_threads.len(), 2);
+    assert!(bob_sub_threads
+        .iter()
+        .all(|t| t["message"]["channel"] != "dev/secret"));
+    assert!(bob_sub["older"].is_string());
+}

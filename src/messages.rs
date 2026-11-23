@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actors::{self, CallerContext};
 use crate::attachments;
-use crate::db::Database;
+use crate::db::{sql_placeholders, Database};
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::events::{self, EventAppend, EventType};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
@@ -268,16 +268,75 @@ pub fn load_stored_message_tx(
     board_id: &str,
     message_id: &str,
 ) -> BoardResult<Option<StoredMessageRow>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                 by_profile, from_source, no_sync, revision, deleted_at, created_at
          FROM messages
          WHERE board_id = ?1 AND id = ?2",
-        params![board_id, message_id],
-        map_stored_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    )?;
+    stmt.query_row(params![board_id, message_id], map_stored_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Maintains the `threads` summary index atomically whenever a root message or reply is inserted.
+pub fn record_thread_message_tx(
+    conn: &Connection,
+    board_id: &str,
+    channel: &str,
+    msg_id: &str,
+    seq: i64,
+    re_root_id: Option<&str>,
+) -> BoardResult<()> {
+    if let Some(root_id) = re_root_id {
+        let mut stmt = conn.prepare_cached(
+            "UPDATE threads
+             SET last_seq = ?1,
+                 last_id = ?2,
+                 last_reply_id = ?2,
+                 reply_count = reply_count + 1
+             WHERE root_id = ?3",
+        )?;
+        stmt.execute(params![seq, msg_id, root_id])?;
+    } else {
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO threads (
+                root_id, board_id, channel, root_seq, last_seq, last_id, last_reply_id, reply_count
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?1, NULL, 0)",
+        )?;
+        stmt.execute(params![msg_id, board_id, channel, seq])?;
+    }
+    Ok(())
+}
+
+fn load_stored_messages_batch_tx(
+    conn: &Connection,
+    board_id: &str,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, StoredMessageRow>> {
+    let mut out = HashMap::with_capacity(message_ids.len());
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
+                    by_profile, from_source, no_sync, revision, deleted_at, created_at
+             FROM messages
+             WHERE board_id = ? AND id IN ({})",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut bind: Vec<&str> = Vec::with_capacity(chunk.len() + 1);
+        bind.push(board_id);
+        bind.extend_from_slice(chunk);
+        let rows = stmt.query_map(params_from_iter(bind), map_stored_row)?;
+        for row in rows {
+            let r = row?;
+            out.insert(r.id.clone(), r);
+        }
+    }
+    Ok(out)
 }
 
 fn map_stored_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessageRow> {
@@ -410,7 +469,7 @@ pub fn build_message_snapshot_tx(
 }
 
 fn load_reactions_tx(conn: &Connection, message_id: &str) -> BoardResult<BTreeMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT emoji, actor_id FROM message_reactions WHERE message_id = ?1 ORDER BY emoji ASC, actor_id ASC",
     )?;
     let rows = stmt.query_map(params![message_id], |r| {
@@ -422,6 +481,127 @@ fn load_reactions_tx(conn: &Connection, message_id: &str) -> BoardResult<BTreeMa
         map.entry(emoji).or_default().push(actor_id);
     }
     Ok(map)
+}
+
+fn load_reactions_batch_tx(
+    conn: &Connection,
+    message_ids: &[&str],
+) -> BoardResult<HashMap<String, BTreeMap<String, Vec<String>>>> {
+    let mut out: HashMap<String, BTreeMap<String, Vec<String>>> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in message_ids.chunks(400) {
+        let sql = format!(
+            "SELECT message_id, emoji, actor_id
+             FROM message_reactions
+             WHERE message_id IN ({})
+             ORDER BY message_id ASC, emoji ASC, actor_id ASC",
+            sql_placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (mid, emoji, actor_id) = row?;
+            out.entry(mid)
+                .or_default()
+                .entry(emoji)
+                .or_default()
+                .push(actor_id);
+        }
+    }
+    Ok(out)
+}
+
+/// Batch-hydrates a slice of `StoredMessageRow`s using bulk `IN (...)` queries instead of
+/// per-row N+1 lookups. Preserves input ordering and exact `MessageView` semantics.
+pub fn hydrate_message_views_batch_tx(
+    conn: &Connection,
+    rows: &[StoredMessageRow],
+) -> BoardResult<Vec<MessageView>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let handles = actors::resolve_actor_handles_batch_tx(
+        conn,
+        rows.iter().map(|r| r.by_actor.as_str()),
+    )?;
+
+    let active_ids: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.deleted_at.is_none())
+        .map(|r| r.id.as_str())
+        .collect();
+    let root_ids: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.re.is_none())
+        .map(|r| r.id.as_str())
+        .collect();
+
+    let mut labels_map = labels::load_messages_labels_batch_tx(conn, &active_ids)?;
+    let mut reactions_map = load_reactions_batch_tx(conn, &active_ids)?;
+    let mut attachments_map = attachments::load_messages_attachments_batch_tx(conn, &active_ids)?;
+    let mut blocks_map = schemas::load_messages_blocks_batch_tx(conn, &active_ids)?;
+    let mut tasks_map = tasks::load_task_views_batch_tx(conn, &root_ids)?;
+
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let deleted = row.deleted_at.is_some();
+        let handle = handles
+            .get(&row.by_actor)
+            .cloned()
+            .unwrap_or_else(|| row.by_actor.clone());
+        let (labels, reactions, attachments, blocks) = if deleted {
+            (BTreeMap::new(), BTreeMap::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                labels_map.remove(&row.id).unwrap_or_default(),
+                reactions_map.remove(&row.id).unwrap_or_default(),
+                attachments_map.remove(&row.id).unwrap_or_default(),
+                blocks_map.remove(&row.id).unwrap_or_default(),
+            )
+        };
+        let task = if row.re.is_none() {
+            tasks_map.remove(&row.id)
+        } else {
+            None
+        };
+        views.push(MessageView {
+            id: row.id.clone(),
+            channel: row.channel.clone(),
+            text: if deleted {
+                String::new()
+            } else {
+                row.text.clone()
+            },
+            re: row.re.clone(),
+            reply_to: row.reply_to.clone(),
+            by: MessageAuthor {
+                actor: row.by_actor.clone(),
+                principal: row.by_principal.clone(),
+                profile: row.by_profile.clone(),
+                handle,
+            },
+            labels,
+            reactions,
+            attachments,
+            blocks,
+            from: row.from_source.clone(),
+            no_sync: row.no_sync,
+            revision: row.revision,
+            created_at: row.created_at.clone(),
+            deleted,
+            task,
+        });
+    }
+    Ok(views)
 }
 
 fn visible_actors_for_caller_tx(
@@ -661,6 +841,7 @@ pub fn post_message_in_tx(
             now
         ],
     )?;
+    record_thread_message_tx(tx, board_id, &input.channel, &msg_id, seq, None)?;
 
     store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
     if !input.attachments.is_empty() {
@@ -853,6 +1034,7 @@ pub fn reply_message(
                 now
             ],
         )?;
+        record_thread_message_tx(tx, board_id, &target.channel, &msg_id, seq, Some(&root_id))?;
 
         store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
         if !input.attachments.is_empty() {
@@ -1310,9 +1492,8 @@ pub fn get_thread(
                 format!("thread root '{root_id}' not found"),
             )
         })?;
-        let root_view = hydrate_message_view_tx(conn, &root_stored)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
                     by_profile, from_source, no_sync, revision, deleted_at, created_at
              FROM messages
@@ -1320,11 +1501,15 @@ pub fn get_thread(
              ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![board_id, root_id], map_stored_row)?;
-        let mut replies = Vec::new();
+        let mut all_rows = Vec::with_capacity(8);
+        all_rows.push(root_stored);
         for row in rows {
-            let r = row?;
-            replies.push(hydrate_message_view_tx(conn, &r)?);
+            all_rows.push(row?);
         }
+
+        let mut hydrated = hydrate_message_views_batch_tx(conn, &all_rows)?;
+        let root_view = hydrated.remove(0);
+        let replies = hydrated;
 
         let cursor = current_board_cursor_tx(conn, board_id)?;
         let pending_schedules = schedules::list_pending_thread_schedules_tx(conn, board_id, &root_id)?
@@ -1341,6 +1526,202 @@ pub fn get_thread(
             schedules: pending_schedules,
         })
     })
+}
+
+enum ChannelSqlFilter<'a> {
+    All,
+    Exact(&'a str),
+    Subtree {
+        exact: &'a str,
+        low: String,
+        high: String,
+    },
+}
+
+fn channel_sql_filter(channel: Option<&str>) -> ChannelSqlFilter<'_> {
+    match channel {
+        None | Some("*") => ChannelSqlFilter::All,
+        Some(raw) => {
+            if let Some(prefix) = raw.strip_suffix('/') {
+                ChannelSqlFilter::Subtree {
+                    exact: prefix,
+                    low: format!("{prefix}/"),
+                    high: format!("{prefix}0"),
+                }
+            } else {
+                ChannelSqlFilter::Exact(raw)
+            }
+        }
+    }
+}
+
+fn cached_can_read_channel(
+    cache: &mut HashMap<String, bool>,
+    board_grants: &[grants::Grant],
+    caller: &CallerContext,
+    channel: &str,
+) -> bool {
+    if let Some(&allowed) = cache.get(channel) {
+        return allowed;
+    }
+    let allowed = grants::caller_permissions_on_channel(board_grants, caller, channel).can_read();
+    cache.insert(channel.to_string(), allowed);
+    allowed
+}
+
+/// Evaluates `filter` against `row` while skipping unnecessary DB queries for unused filter axes.
+fn row_matches_filter_tx(
+    conn: &Connection,
+    row: &StoredMessageRow,
+    filter: &QueryFilter,
+    ctx: &FilterContext,
+    handle_cache: &mut HashMap<String, String>,
+    root_labels_cache: &mut HashMap<String, BTreeMap<String, String>>,
+) -> BoardResult<bool> {
+    if !filter.matches_channel(&row.channel) {
+        return Ok(false);
+    }
+    if let Some(re_filter) = &filter.re {
+        let root = row.re.as_deref().unwrap_or(&row.id);
+        if root != re_filter {
+            return Ok(false);
+        }
+    }
+    if let Some(from_filter) = &filter.from {
+        if from_filter.eq_ignore_ascii_case("board") {
+            if row.from_source.is_some() {
+                return Ok(false);
+            }
+        } else if row.from_source.as_deref() != Some(from_filter.as_str()) {
+            return Ok(false);
+        }
+    }
+    let deleted = row.deleted_at.is_some();
+    let effective_text = if deleted { "" } else { row.text.as_str() };
+    if let Some(needle) = &filter.text {
+        let needle_lower = needle.to_ascii_lowercase();
+        if !effective_text.to_ascii_lowercase().contains(&needle_lower) {
+            return Ok(false);
+        }
+    }
+
+    let by_handle = if filter.by.is_some() {
+        if let Some(h) = handle_cache.get(&row.by_actor) {
+            h.clone()
+        } else {
+            let h = actors::resolve_actor_view(conn, &row.by_actor)?
+                .map(|a| a.handle)
+                .unwrap_or_else(|| row.by_actor.clone());
+            handle_cache.insert(row.by_actor.clone(), h.clone());
+            h
+        }
+    } else {
+        String::new()
+    };
+
+    let (msg_labels, root_labels) = if !filter.labels.is_empty() {
+        let own = if deleted {
+            BTreeMap::new()
+        } else {
+            labels::load_message_labels_tx(conn, &row.id)?
+        };
+        let root_l = match &row.re {
+            Some(root_id) => {
+                if let Some(cached) = root_labels_cache.get(root_id) {
+                    Some(cached.clone())
+                } else {
+                    let loaded = labels::load_message_labels_tx(conn, root_id)?;
+                    root_labels_cache.insert(root_id.clone(), loaded.clone());
+                    Some(loaded)
+                }
+            }
+            None => {
+                root_labels_cache
+                    .entry(row.id.clone())
+                    .or_insert_with(|| own.clone());
+                None
+            }
+        };
+        (own, root_l)
+    } else {
+        (BTreeMap::new(), None)
+    };
+
+    let mention_ids = if filter.mentions.is_some() && !deleted {
+        load_mention_ids_tx(conn, &row.id)?
+    } else {
+        Vec::new()
+    };
+
+    let snap = MessageSnapshot {
+        id: row.id.clone(),
+        channel: row.channel.clone(),
+        re: row.re.clone(),
+        text: effective_text.to_string(),
+        by_actor: row.by_actor.clone(),
+        by_principal: row.by_principal.clone(),
+        by_handle,
+        labels: msg_labels,
+        root_labels,
+        mention_ids,
+        from: row.from_source.clone(),
+        deleted,
+    };
+    Ok(filter.matches_snapshot(&snap, ctx))
+}
+
+fn query_filtered_message_rows_tx(
+    conn: &Connection,
+    board_id: &str,
+    filter: &QueryFilter,
+    after_seq: Option<i64>,
+    before_seq: Option<i64>,
+) -> BoardResult<Vec<StoredMessageRow>> {
+    let mut sql = String::from(
+        "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
+                by_profile, from_source, no_sync, revision, deleted_at, created_at
+         FROM messages
+         WHERE board_id = ?",
+    );
+    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(board_id.to_string())];
+
+    if let Some(re_id) = &filter.re {
+        sql.push_str(" AND (id = ? OR re = ?)");
+        bind.push(SqlValue::Text(re_id.clone()));
+        bind.push(SqlValue::Text(re_id.clone()));
+    } else {
+        match channel_sql_filter(filter.channel.as_deref()) {
+            ChannelSqlFilter::All => {}
+            ChannelSqlFilter::Exact(ch) => {
+                sql.push_str(" AND channel = ?");
+                bind.push(SqlValue::Text(ch.to_string()));
+            }
+            ChannelSqlFilter::Subtree { exact, low, high } => {
+                sql.push_str(" AND (channel = ? OR (channel >= ? AND channel < ?))");
+                bind.push(SqlValue::Text(exact.to_string()));
+                bind.push(SqlValue::Text(low));
+                bind.push(SqlValue::Text(high));
+            }
+        }
+    }
+
+    if let Some(a) = after_seq {
+        sql.push_str(" AND seq > ?");
+        bind.push(SqlValue::Integer(a));
+    }
+    if let Some(b) = before_seq {
+        sql.push_str(" AND seq < ?");
+        bind.push(SqlValue::Integer(b));
+    }
+    sql.push_str(" ORDER BY seq ASC");
+
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bind), map_stored_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn resolve_msg_seq_cursor_tx(conn: &Connection, board_id: &str, cursor: &str) -> BoardResult<i64> {
@@ -1396,7 +1777,20 @@ pub fn list_messages(
 
     db.with_conn(|conn| {
         let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let visible_actors = visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?;
+        if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
+            if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
+                let cursor = current_board_cursor_tx(conn, board_id)?;
+                return Ok(MessagesPage {
+                    messages: Vec::new(),
+                    cursor,
+                });
+            }
+        }
+        let visible_actors = if query.filter.mentions.is_some() {
+            visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?
+        } else {
+            Vec::new()
+        };
         let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
         let after_seq = match &query.after {
             Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
@@ -1407,49 +1801,216 @@ pub fn list_messages(
             None => None,
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
-                    by_profile, from_source, no_sync, revision, deleted_at, created_at
-             FROM messages
-             WHERE board_id = ?1
-             ORDER BY seq ASC",
+        let candidates = query_filtered_message_rows_tx(
+            conn,
+            board_id,
+            &query.filter,
+            after_seq,
+            before_seq,
         )?;
-        let rows = stmt.query_map(params![board_id], map_stored_row)?;
-        let mut matched: Vec<(i64, MessageView)> = Vec::new();
+        let mut perm_cache: HashMap<String, bool> = HashMap::new();
+        let mut handle_cache: HashMap<String, String> = HashMap::new();
+        let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+        let mut matched: Vec<StoredMessageRow> = Vec::new();
 
-        for row in rows {
-            let r = row?;
-            if let Some(a) = after_seq {
-                if r.seq <= a {
-                    continue;
-                }
-            }
-            if let Some(b) = before_seq {
-                if r.seq >= b {
-                    continue;
-                }
-            }
-            if !grants::caller_permissions_on_channel(&board_grants, caller, &r.channel).can_read()
-            {
+        for r in candidates {
+            if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
                 continue;
             }
-            let snap = build_message_snapshot_tx(conn, &r)?;
-            if !query.filter.matches_snapshot(&snap, &filter_ctx) {
+            if !row_matches_filter_tx(
+                conn,
+                &r,
+                &query.filter,
+                &filter_ctx,
+                &mut handle_cache,
+                &mut root_labels_cache,
+            )? {
                 continue;
             }
-            let view = hydrate_message_view_tx(conn, &r)?;
-            matched.push((r.seq, view));
+            matched.push(r);
+            if after_seq.is_some() && matched.len() >= limit {
+                break;
+            }
         }
 
-        let messages: Vec<MessageView> = if after_seq.is_some() {
-            matched.into_iter().take(limit).map(|(_, v)| v).collect()
+        let page_rows: Vec<StoredMessageRow> = if after_seq.is_some() {
+            matched.into_iter().take(limit).collect()
         } else {
             let skip = matched.len().saturating_sub(limit);
-            matched.into_iter().skip(skip).map(|(_, v)| v).collect()
+            matched.into_iter().skip(skip).collect()
         };
 
+        let messages = hydrate_message_views_batch_tx(conn, &page_rows)?;
         let cursor = current_board_cursor_tx(conn, board_id)?;
         Ok(MessagesPage { messages, cursor })
+    })
+}
+
+struct ThreadSummaryRow {
+    root_id: String,
+    channel: String,
+    last_id: String,
+    last_reply_id: Option<String>,
+    reply_count: usize,
+}
+
+struct ThreadPageBounds {
+    after_seq: Option<i64>,
+    before_seq: Option<i64>,
+    limit: usize,
+}
+
+fn list_threads_fast_tx(
+    conn: &Connection,
+    board_id: &str,
+    board_grants: &[grants::Grant],
+    caller: &CallerContext,
+    channel_filter: Option<&str>,
+    bounds: ThreadPageBounds,
+) -> BoardResult<ThreadsPage> {
+    let ThreadPageBounds {
+        after_seq,
+        before_seq,
+        limit,
+    } = bounds;
+    let ch_sql = channel_sql_filter(channel_filter);
+    let exact_verified = match ch_sql {
+        ChannelSqlFilter::Exact(ch) => {
+            if !grants::caller_permissions_on_channel(board_grants, caller, ch).can_read() {
+                let cursor = current_board_cursor_tx(conn, board_id)?;
+                return Ok(ThreadsPage {
+                    threads: Vec::new(),
+                    cursor,
+                    older: None,
+                });
+            }
+            true
+        }
+        ChannelSqlFilter::All | ChannelSqlFilter::Subtree { .. } => false,
+    };
+
+    let mut sql = String::from(
+        "SELECT root_id, channel, last_id, last_reply_id, reply_count
+         FROM threads
+         WHERE board_id = ?",
+    );
+    let mut bind: Vec<SqlValue> = vec![SqlValue::Text(board_id.to_string())];
+
+    match ch_sql {
+        ChannelSqlFilter::All => {}
+        ChannelSqlFilter::Exact(ch) => {
+            sql.push_str(" AND channel = ?");
+            bind.push(SqlValue::Text(ch.to_string()));
+        }
+        ChannelSqlFilter::Subtree { exact, low, high } => {
+            sql.push_str(" AND (channel = ? OR (channel >= ? AND channel < ?))");
+            bind.push(SqlValue::Text(exact.to_string()));
+            bind.push(SqlValue::Text(low));
+            bind.push(SqlValue::Text(high));
+        }
+    }
+
+    let want_count = if after_seq.is_some() { limit } else { limit + 1 };
+    if let Some(a) = after_seq {
+        sql.push_str(" AND last_seq > ? ORDER BY last_seq ASC");
+        bind.push(SqlValue::Integer(a));
+    } else {
+        if let Some(b) = before_seq {
+            sql.push_str(" AND last_seq < ?");
+            bind.push(SqlValue::Integer(b));
+        }
+        sql.push_str(" ORDER BY last_seq DESC");
+    }
+    if exact_verified {
+        sql.push_str(" LIMIT ?");
+        bind.push(SqlValue::Integer(want_count as i64));
+    }
+
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bind), |r| {
+        Ok(ThreadSummaryRow {
+            root_id: r.get(0)?,
+            channel: r.get(1)?,
+            last_id: r.get(2)?,
+            last_reply_id: r.get(3)?,
+            reply_count: r.get::<_, i64>(4)? as usize,
+        })
+    })?;
+
+    let mut perm_cache: HashMap<String, bool> = HashMap::new();
+    let mut selected: Vec<ThreadSummaryRow> = Vec::with_capacity(want_count);
+    for row in rows {
+        let t = row?;
+        if !exact_verified
+            && !cached_can_read_channel(&mut perm_cache, board_grants, caller, &t.channel)
+        {
+            continue;
+        }
+        selected.push(t);
+        if selected.len() >= want_count {
+            break;
+        }
+    }
+
+    let has_older = if after_seq.is_some() {
+        false
+    } else {
+        let more = selected.len() > limit;
+        if more {
+            selected.truncate(limit);
+        }
+        selected.reverse();
+        more
+    };
+
+    let mut needed_ids: Vec<&str> = Vec::with_capacity(selected.len() * 2);
+    for t in &selected {
+        needed_ids.push(t.root_id.as_str());
+        if let Some(ref rid) = t.last_reply_id {
+            needed_ids.push(rid.as_str());
+        }
+    }
+
+    let stored_map = load_stored_messages_batch_tx(conn, board_id, &needed_ids)?;
+    let mut ordered_rows: Vec<StoredMessageRow> = Vec::with_capacity(needed_ids.len());
+    for id in &needed_ids {
+        if let Some(r) = stored_map.get(*id) {
+            ordered_rows.push(r.clone());
+        }
+    }
+    let hydrated_list = hydrate_message_views_batch_tx(conn, &ordered_rows)?;
+    let mut views_map: HashMap<String, MessageView> = hydrated_list
+        .into_iter()
+        .map(|v| (v.id.clone(), v))
+        .collect();
+
+    let older = if has_older {
+        selected.first().map(|t| t.last_id.clone())
+    } else {
+        None
+    };
+
+    let mut threads = Vec::with_capacity(selected.len());
+    for t in selected {
+        let Some(root_view) = views_map.remove(&t.root_id) else {
+            continue;
+        };
+        let last_view = t
+            .last_reply_id
+            .as_ref()
+            .and_then(|rid| views_map.remove(rid));
+        threads.push(ThreadSummaryView {
+            message: root_view,
+            replies: t.reply_count,
+            last: last_view,
+        });
+    }
+
+    let cursor = current_board_cursor_tx(conn, board_id)?;
+    Ok(ThreadsPage {
+        threads,
+        cursor,
+        older,
     })
 }
 
@@ -1469,8 +2030,6 @@ pub fn list_threads(
 
     db.with_conn(|conn| {
         let board_grants = grants::load_grants_tx(conn, board_id)?;
-        let visible_actors = visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?;
-        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
         let after_seq = match &query.after {
             Some(c) => Some(resolve_msg_seq_cursor_tx(conn, board_id, c)?),
             None => None,
@@ -1480,29 +2039,58 @@ pub fn list_threads(
             None => None,
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, board_id, seq, channel, re, reply_to, text, by_actor, by_principal,
-                    by_profile, from_source, no_sync, revision, deleted_at, created_at
-             FROM messages
-             WHERE board_id = ?1
-             ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![board_id], map_stored_row)?;
+        // Fast indexed path when only channel/cursor/limit filters are active.
+        if !query.filter.has_message_specific_filters() {
+            return list_threads_fast_tx(
+                conn,
+                board_id,
+                &board_grants,
+                caller,
+                query.filter.channel.as_deref(),
+                ThreadPageBounds {
+                    after_seq,
+                    before_seq,
+                    limit,
+                },
+            );
+        }
+
+        if let ChannelSqlFilter::Exact(ch) = channel_sql_filter(query.filter.channel.as_deref()) {
+            if !grants::caller_permissions_on_channel(&board_grants, caller, ch).can_read() {
+                let cursor = current_board_cursor_tx(conn, board_id)?;
+                return Ok(ThreadsPage {
+                    threads: Vec::new(),
+                    cursor,
+                    older: None,
+                });
+            }
+        }
+
+        let visible_actors = if query.filter.mentions.is_some() {
+            visible_actors_for_caller_tx(conn, board_id, &board_grants, caller)?
+        } else {
+            Vec::new()
+        };
+        let filter_ctx = FilterContext::build(conn, caller, &visible_actors, &query.filter)?;
+        let candidates =
+            query_filtered_message_rows_tx(conn, board_id, &query.filter, None, None)?;
 
         struct ThreadAcc {
-            root: Option<MessageView>,
+            root: Option<StoredMessageRow>,
             replies: usize,
-            last: Option<MessageView>,
+            last: Option<StoredMessageRow>,
             last_seq: i64,
             last_id: String,
             matched: bool,
         }
 
+        let mut perm_cache: HashMap<String, bool> = HashMap::new();
+        let mut handle_cache: HashMap<String, String> = HashMap::new();
+        let mut root_labels_cache: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         let mut by_root: BTreeMap<String, ThreadAcc> = BTreeMap::new();
-        for row in rows {
-            let r = row?;
-            if !grants::caller_permissions_on_channel(&board_grants, caller, &r.channel).can_read()
-            {
+
+        for r in candidates {
+            if !cached_can_read_channel(&mut perm_cache, &board_grants, caller, &r.channel) {
                 continue;
             }
             if !query.filter.matches_channel(&r.channel) {
@@ -1515,9 +2103,19 @@ pub fn list_threads(
                 }
             }
 
-            let snap = build_message_snapshot_tx(conn, &r)?;
-            let is_match = query.filter.matches_snapshot(&snap, &filter_ctx);
-            let view = hydrate_message_view_tx(conn, &r)?;
+            let already_matched = by_root.get(&root_id).is_some_and(|a| a.matched);
+            let is_match = if already_matched {
+                true
+            } else {
+                row_matches_filter_tx(
+                    conn,
+                    &r,
+                    &query.filter,
+                    &filter_ctx,
+                    &mut handle_cache,
+                    &mut root_labels_cache,
+                )?
+            };
 
             let acc = by_root.entry(root_id).or_insert_with(|| ThreadAcc {
                 root: None,
@@ -1532,36 +2130,25 @@ pub fn list_threads(
                 acc.last_id = r.id.clone();
             }
             if r.re.is_none() {
-                acc.root = Some(view);
+                acc.root = Some(r);
             } else {
                 acc.replies += 1;
-                acc.last = Some(view);
+                acc.last = Some(r);
             }
             if is_match {
                 acc.matched = true;
             }
         }
 
-        let mut summaries: Vec<(i64, String, ThreadSummaryView)> = by_root
+        let mut summaries: Vec<ThreadAcc> = by_root
             .into_values()
             .filter(|a| a.matched && a.root.is_some())
             .filter(|a| after_seq.is_none_or(|s| a.last_seq > s))
             .filter(|a| before_seq.is_none_or(|s| a.last_seq < s))
-            .map(|a| {
-                (
-                    a.last_seq,
-                    a.last_id,
-                    ThreadSummaryView {
-                        message: a.root.unwrap(),
-                        replies: a.replies,
-                        last: a.last,
-                    },
-                )
-            })
             .collect();
 
         // Newest activity last
-        summaries.sort_by_key(|(seq, _, _)| *seq);
+        summaries.sort_by_key(|a| a.last_seq);
 
         let (page_items, has_older) = if after_seq.is_some() {
             let items: Vec<_> = summaries.into_iter().take(limit).collect();
@@ -1574,12 +2161,45 @@ pub fn list_threads(
         };
 
         let older = if has_older {
-            page_items.first().map(|(_, id, _)| id.clone())
+            page_items.first().map(|a| a.last_id.clone())
         } else {
             None
         };
 
-        let threads = page_items.into_iter().map(|(_, _, t)| t).collect();
+        let mut to_hydrate: Vec<StoredMessageRow> = Vec::with_capacity(page_items.len() * 2);
+        let mut page_meta: Vec<(String, Option<String>, usize)> =
+            Vec::with_capacity(page_items.len());
+        for a in page_items {
+            let root = a.root.unwrap();
+            let root_id = root.id.clone();
+            to_hydrate.push(root);
+            let last_id = a.last.map(|l| {
+                let lid = l.id.clone();
+                to_hydrate.push(l);
+                lid
+            });
+            page_meta.push((root_id, last_id, a.replies));
+        }
+
+        let hydrated = hydrate_message_views_batch_tx(conn, &to_hydrate)?;
+        let mut views_map: HashMap<String, MessageView> = hydrated
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+
+        let mut threads = Vec::with_capacity(page_meta.len());
+        for (root_id, last_id, replies) in page_meta {
+            let Some(root_view) = views_map.remove(&root_id) else {
+                continue;
+            };
+            let last_view = last_id.and_then(|lid| views_map.remove(&lid));
+            threads.push(ThreadSummaryView {
+                message: root_view,
+                replies,
+                last: last_view,
+            });
+        }
+
         let cursor = current_board_cursor_tx(conn, board_id)?;
         Ok(ThreadsPage {
             threads,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -467,14 +467,13 @@ pub fn bootstrap_owner(db: &Database, configured_token: Option<&str>) -> BoardRe
 pub fn authenticate_bearer_token(db: &Database, raw_token: &str) -> BoardResult<Principal> {
     let digest = hash_token(raw_token);
     db.with_conn(|conn| {
-        let row: Option<(String, String, Option<String>)> = conn
-            .query_row(
-                "SELECT principal_kind, principal_id, environment
-                 FROM tokens
-                 WHERE token_hash = ?1 AND revoked_at IS NULL",
-                params![digest],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        let mut stmt = conn.prepare_cached(
+            "SELECT principal_kind, principal_id, environment
+             FROM tokens
+             WHERE token_hash = ?1 AND revoked_at IS NULL",
+        )?;
+        let row: Option<(String, String, Option<String>)> = stmt
+            .query_row(params![digest], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
 
         let (kind, pid, env) = row.ok_or_else(|| {
@@ -622,12 +621,11 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
 
     let (base_kind, base_handle, base_name, base_avatar) =
         if let Some(uid) = principal_part.strip_prefix("user:") {
-            let row: Option<(String, String, Option<String>)> = conn
-                .query_row(
-                    "SELECT username, name, avatar FROM users WHERE id = ?1",
-                    params![uid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
+            let mut stmt = conn.prepare_cached(
+                "SELECT username, name, avatar FROM users WHERE id = ?1",
+            )?;
+            let row: Option<(String, String, Option<String>)> = stmt
+                .query_row(params![uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()?;
             let Some((username, name, avatar)) = row else {
                 return Ok(None);
@@ -637,13 +635,8 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
             let Some((pid, env)) = rest.split_once(':') else {
                 return Ok(None);
             };
-            let name: Option<String> = conn
-                .query_row(
-                    "SELECT name FROM projects WHERE id = ?1",
-                    params![pid],
-                    |r| r.get(0),
-                )
-                .optional()?;
+            let mut stmt = conn.prepare_cached("SELECT name FROM projects WHERE id = ?1")?;
+            let name: Option<String> = stmt.query_row(params![pid], |r| r.get(0)).optional()?;
             let Some(name) = name else {
                 return Ok(None);
             };
@@ -654,12 +647,9 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
             };
             ("project", name, display, None)
         } else if let Some(aid) = principal_part.strip_prefix("app:") {
-            let row: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT slug, name FROM apps WHERE id = ?1",
-                    params![aid],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+            let mut stmt = conn.prepare_cached("SELECT slug, name FROM apps WHERE id = ?1")?;
+            let row: Option<(String, String)> = stmt
+                .query_row(params![aid], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
             let Some((slug, name)) = row else {
                 return Ok(None);
@@ -670,12 +660,13 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
         };
 
     if let Some(prof_lower) = profile_part {
-        let prof_row: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT name, avatar FROM profiles WHERE principal_id = ?1 AND name_lower = ?2",
-                params![principal_part, prof_lower],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, avatar FROM profiles WHERE principal_id = ?1 AND name_lower = ?2",
+        )?;
+        let prof_row: Option<(String, Option<String>)> = stmt
+            .query_row(params![principal_part, prof_lower], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?;
         let (prof_name, prof_avatar) = prof_row.unwrap_or_else(|| (prof_lower.to_string(), None));
         if prof_lower.contains(":user:") {
@@ -720,6 +711,24 @@ pub fn resolve_actor_view(conn: &Connection, actor_id: &str) -> BoardResult<Opti
             avatar: base_avatar,
         }))
     }
+}
+
+/// Resolves display handles for a batch of actor IDs, looking up each unique actor only once.
+pub fn resolve_actor_handles_batch_tx<'a>(
+    conn: &Connection,
+    actor_ids: impl IntoIterator<Item = &'a str>,
+) -> BoardResult<HashMap<String, String>> {
+    let mut handles = HashMap::new();
+    for actor_id in actor_ids {
+        if handles.contains_key(actor_id) {
+            continue;
+        }
+        let handle = resolve_actor_view(conn, actor_id)?
+            .map(|a| a.handle)
+            .unwrap_or_else(|| actor_id.to_string());
+        handles.insert(actor_id.to_string(), handle);
+    }
+    Ok(handles)
 }
 
 /// Lists actors that have written on `board_id`, filtered by `can_read_channel`.
