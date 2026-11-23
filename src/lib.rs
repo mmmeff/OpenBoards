@@ -1,5 +1,6 @@
 pub mod actors;
 pub mod api;
+pub mod attachments;
 pub mod boards;
 pub mod channels;
 pub mod config;

@@ -232,6 +232,35 @@ const MIGRATIONS: &[Migration] = &[
                 ON message_blocks (board_id, message_id);
         "#,
     },
+    Migration {
+        version: 6,
+        name: "006_attachments",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS attachments (
+                id TEXT PRIMARY KEY,
+                board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                uploader_actor TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachments_board
+                ON attachments (board_id);
+
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                board_id TEXT NOT NULL,
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                attachment_id TEXT NOT NULL REFERENCES attachments(id),
+                idx INTEGER NOT NULL,
+                PRIMARY KEY (message_id, attachment_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_attachments_att
+                ON message_attachments (board_id, attachment_id);
+        "#,
+    },
 ];
 
 /// SQLite database wrapper in WAL mode with foreign keys enabled.

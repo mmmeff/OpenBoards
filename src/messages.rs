@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actors::{self, CallerContext};
+use crate::attachments;
 use crate::db::Database;
 use crate::error::{BoardError, BoardResult, ErrorCode};
 use crate::filter::{FilterContext, MessageSnapshot, QueryFilter};
@@ -305,12 +306,13 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
 
     let deleted = row.deleted_at.is_some();
 
-    let (labels, reactions, blocks) = if deleted {
-        (BTreeMap::new(), BTreeMap::new(), Vec::new())
+    let (labels, reactions, attachments, blocks) = if deleted {
+        (BTreeMap::new(), BTreeMap::new(), Vec::new(), Vec::new())
     } else {
         (
             labels::load_message_labels_tx(conn, &row.id)?,
             load_reactions_tx(conn, &row.id)?,
+            attachments::load_message_attachments_tx(conn, &row.id)?,
             schemas::load_message_blocks_tx(conn, &row.id)?,
         )
     };
@@ -333,7 +335,7 @@ pub fn hydrate_message_view_tx(conn: &Connection, row: &StoredMessageRow) -> Boa
         },
         labels,
         reactions,
-        attachments: Vec::new(),
+        attachments,
         blocks,
         from: row.from_source.clone(),
         no_sync: row.no_sync,
@@ -626,6 +628,16 @@ pub fn post_message(
         )?;
 
         store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+        if !input.attachments.is_empty() {
+            attachments::validate_and_link_attachments_tx(
+                tx,
+                board_id,
+                &board_grants,
+                caller,
+                &msg_id,
+                &input.attachments,
+            )?;
+        }
         if !input.labels.is_empty() {
             labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
         }
@@ -791,6 +803,16 @@ pub fn reply_message(
         )?;
 
         store_mentions_tx(tx, board_id, &msg_id, &resolved_mentions.actor_ids)?;
+        if !input.attachments.is_empty() {
+            attachments::validate_and_link_attachments_tx(
+                tx,
+                board_id,
+                &board_grants,
+                caller,
+                &msg_id,
+                &input.attachments,
+            )?;
+        }
         if !input.labels.is_empty() {
             labels::insert_labels_tx(tx, board_id, &msg_id, &input.labels)?;
         }

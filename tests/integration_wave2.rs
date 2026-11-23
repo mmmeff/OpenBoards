@@ -11,12 +11,14 @@ use openboards::db::Database;
 use openboards::{build_router, AppState};
 
 struct TestHarness {
+    _tmp: tempfile::TempDir,
     app: axum::Router,
     owner_token: String,
 }
 
 impl TestHarness {
     fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
         let owner_token = "owner-bootstrap-secret".to_string();
         let db = Database::open_in_memory().unwrap();
         actors::bootstrap_owner(&db, Some(&owner_token)).unwrap();
@@ -25,13 +27,40 @@ impl TestHarness {
             db,
             ServerConfig {
                 listen: "127.0.0.1:8080".parse().unwrap(),
-                data_dir: std::path::PathBuf::from("."),
+                data_dir: tmp.path().to_path_buf(),
                 team: "acme".to_string(),
                 admin_token: Some(owner_token.clone()),
             },
         );
         let app = build_router(state);
-        Self { app, owner_token }
+        Self {
+            _tmp: tmp,
+            app,
+            owner_token,
+        }
+    }
+
+    async fn req_raw(
+        &self,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            builder = builder.header("authorization", format!("Bearer {t}"));
+        }
+        for &(k, v) in headers {
+            builder = builder.header(k, v);
+        }
+        let req = builder.body(Body::from(body)).unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let resp_headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, resp_headers, bytes)
     }
 
     async fn req(
@@ -823,4 +852,239 @@ async fn labels_cas_filters_inheritance_and_structured_schemas() {
         .await;
     assert_eq!(st, StatusCode::OK);
     assert!(page["messages"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attachments_inline_streaming_limits_and_tombstone_visibility() {
+    let h = TestHarness::new();
+    let (_alice_id, alice_tok) = h.create_user_with_token("alice", "alice@acme.com", "member").await;
+    let (_bob_id, bob_tok) = h.create_user_with_token("bob", "bob@acme.com", "member").await;
+
+    // Restrict Bob so he can read ONLY `dev` (not `*`), so we can verify tombstone visibility!
+    // Create a private channel `vault` for Alice so Bob does not have `*`-read.
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/channels",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "path": "vault", "private": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // 1. Inline upload (<= 4 MB)
+    let payload = b"hello attachment bytes".to_vec();
+    let (st, _, raw) = h
+        .req_raw(
+            Method::POST,
+            "/v1/messageboard/boards/General/attachments?name=trace.txt",
+            Some(&alice_tok),
+            &[("content-type", "text/plain")],
+            payload.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let att1: Value = serde_json::from_slice(&raw).unwrap();
+    let att1_id = att1["id"].as_str().unwrap().to_string();
+    assert!(att1_id.starts_with("att_"));
+    assert_eq!(att1["name"], "trace.txt");
+    assert_eq!(att1["type"], "text/plain");
+    assert_eq!(att1["size"], payload.len());
+
+    // Inline upload > 4 MB rejected with 413
+    let too_big_inline = vec![0xABu8; 4 * 1024 * 1024 + 1];
+    let (st, _, _) = h
+        .req_raw(
+            Method::POST,
+            "/v1/messageboard/boards/General/attachments?name=huge.bin",
+            Some(&alice_tok),
+            &[("content-type", "application/octet-stream")],
+            too_big_inline,
+        )
+        .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 2. Streaming two-step upload (supports > 4 MB up to 100 MB)
+    let (st, init) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/attachments/uploads",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "name": "artifact.bin", "type": "application/octet-stream" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let att2_id = init["id"].as_str().unwrap().to_string();
+    let upload_url = init["upload_url"].as_str().unwrap().to_string();
+    let complete_url = init["complete_url"].as_str().unwrap().to_string();
+
+    let big_stream_payload = vec![0x42u8; 4 * 1024 * 1024 + 128];
+    let (st, _, raw) = h
+        .req_raw(
+            Method::PUT,
+            &upload_url,
+            Some(&alice_tok),
+            &[],
+            big_stream_payload.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let put_res: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(put_res["size"], big_stream_payload.len());
+
+    let (st, comp) = h
+        .req(Method::POST, &complete_url, Some(&alice_tok), &[], None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(comp["attachment"]["id"], att2_id);
+    assert_eq!(comp["attachment"]["size"], big_stream_payload.len());
+
+    // 3. Before attaching att1 to a readable message, Bob (who lacks `*`-read because of `vault`)
+    // cannot download OR attach Alice's unattached file!
+    let (st, _, _) = h
+        .req_raw(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/attachments/{att1_id}"),
+            Some(&bob_tok),
+            &[],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&bob_tok),
+            &[],
+            Some(json!({ "channel": "dev", "text": "steal", "attachments": [att1_id] })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // 4. Empty text is allowed when attachments are non-empty; >10 attachments rejected
+    let too_many: Vec<String> = (0..11).map(|i| format!("att_{i}")).collect();
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({ "channel": "dev", "text": "", "attachments": too_many })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, msg) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/messages",
+            Some(&alice_tok),
+            &[],
+            Some(json!({
+                "channel": "dev",
+                "text": "",
+                "attachments": [att1_id, att2_id]
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let msg_id = msg["id"].as_str().unwrap().to_string();
+    assert_eq!(msg["attachments"].as_array().unwrap().len(), 2);
+
+    // Now Bob CAN read `dev`, so Bob CAN download att1 and att2!
+    let (st, hdrs, bytes) = h
+        .req_raw(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/attachments/{att1_id}"),
+            Some(&bob_tok),
+            &[],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(hdrs.get("content-type").unwrap(), "text/plain");
+    assert_eq!(bytes, payload);
+
+    // 5. Delete (tombstone) the message -> attachments vanish from message view;
+    // Bob (non-uploader, non-`-read-all`) can NO LONGER download att1,
+    // while uploader Alice AND `*`-read user (after granting owner vault access) CAN still download!
+    let (st, _) = h
+        .req(
+            Method::DELETE,
+            &format!("/v1/messageboard/boards/General/messages/{msg_id}"),
+            Some(&alice_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, tomb) = h
+        .req(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/messages/{msg_id}"),
+            Some(&bob_tok),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(tomb["deleted"], true);
+    assert!(tomb["attachments"].as_array().unwrap().is_empty());
+
+    // Bob denied on tombstoned attachment
+    let (st, _, _) = h
+        .req_raw(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/attachments/{att1_id}"),
+            Some(&bob_tok),
+            &[],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Uploader Alice still allowed!
+    let (st, _, bytes) = h
+        .req_raw(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/attachments/{att1_id}"),
+            Some(&alice_tok),
+            &[],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bytes, payload);
+
+    // Owner granted read on `vault/` now has `*`-read across all channels -> can download tombstoned att1!
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/v1/messageboard/boards/General/grants",
+            Some(&h.owner_token),
+            &[],
+            Some(json!({
+                "principals": [{ "kind": "user", "username": "admin" }],
+                "can": { "vault/": ["read"] }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, _, bytes) = h
+        .req_raw(
+            Method::GET,
+            &format!("/v1/messageboard/boards/General/attachments/{att1_id}"),
+            Some(&h.owner_token),
+            &[],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bytes, payload);
 }

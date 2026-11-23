@@ -328,6 +328,29 @@ pub fn caller_permissions_at_pattern(
     resolve_for_pattern(grants, &caller.principal, caller.narrowing.as_ref(), pattern).can
 }
 
+/// Returns true if the caller has `read` permission on every channel of the board
+/// (i.e. `read` at `*` and no grant or narrowing rule denies `read` on any pattern).
+pub fn caller_can_read_all_channels(grants: &[Grant], caller: &CallerContext) -> bool {
+    if !caller_permissions_at_pattern(grants, caller, "*").can_read() {
+        return false;
+    }
+    for grant in grants {
+        for pattern in grant.can.keys() {
+            if !caller_permissions_at_pattern(grants, caller, pattern).can_read() {
+                return false;
+            }
+        }
+    }
+    if let Some(narrowing) = &caller.narrowing {
+        for pattern in narrowing.rules.keys() {
+            if !caller_permissions_at_pattern(grants, caller, pattern).can_read() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Returns true if the caller has any non-empty permission anywhere on the board.
 pub fn caller_has_any_board_access(grants: &[Grant], caller: &CallerContext) -> bool {
     if caller.is_unrestricted_owner() {

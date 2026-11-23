@@ -1,5 +1,6 @@
 pub mod actors;
 pub mod admin;
+pub mod attachments;
 pub mod boards;
 pub mod channels;
 pub mod grants;
@@ -32,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .merge(messages::routes())
         .merge(labels::routes())
         .merge(schemas::routes())
+        .merge(attachments::routes())
         .with_state(state)
 }
 

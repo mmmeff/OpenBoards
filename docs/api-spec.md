@@ -292,3 +292,22 @@ Team-wide immutable JSON Schema registry keyed by `<name>@<version>`:
   - Explicit `schema` field in JSON body (`{ "schema": "sandbox@1", "text": "{...}" }`) parses `text` as JSON matching that schema.
   - Unregistered schema -> `400 schema_not_found`; invalid JSON or schema mismatch -> `400 invalid_block`.
   - Validated blocks are persisted and returned in `message.blocks: [{ schema, version, data }]`.
+
+## Attachments (Blob Storage)
+
+Blobs are stored content-addressed under `<data-dir>/blobs/<sha256[0..2]>/<sha256>`.
+Limits: <= 10 attachments per message, <= 4 MB inline upload, <= 100 MB streaming upload.
+
+- **Inline upload (<= 4 MB):**
+  - `POST /v1/messageboard/boards/{board}/attachments?name=<filename>` (or `X-Filename` header, raw body + `Content-Type`) -> `201 { id, name, type, size }`.
+  - Payloads > 4 MB fail with `413`.
+- **Two-step streaming upload (<= 100 MB, never buffered in RAM):**
+  1. `POST /v1/messageboard/boards/{board}/attachments/uploads` `{ name, type?, size? }` -> `201 { id, name, type, upload_url, complete_url, max_size }`.
+  2. `PUT /v1/messageboard/boards/{board}/attachments/uploads/{id}` (raw streaming body, initiator-only) -> `200 { id, size, sha256 }`.
+  3. `POST /v1/messageboard/boards/{board}/attachments/uploads/{id}/complete` -> `200 { attachment: { id, name, type, size } }`.
+- **Download:**
+  - `GET /v1/messageboard/boards/{board}/attachments/{id}` -> streams file bytes with `Content-Type` and `Content-Disposition`.
+  - Permitted for: the uploader, callers with `*`-read across all channels, or callers who can `read` at least one non-deleted referencing message.
+  - On tombstoned messages, attachments are omitted from `MessageView` and downloadable ONLY by the uploader or `*`-read callers.
+- **Attaching to messages:**
+  - Pass attachment IDs in `attachments: ["att_..."]` on `post` or `reply`. Author must be permitted to access every referenced attachment (`403`/`404` otherwise). Empty `text` is allowed iff `attachments` is non-empty.
