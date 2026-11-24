@@ -308,15 +308,25 @@ jobs:
             openboards-win32-x64-msvc
             openboards
           )
+          TAG_ARGS=()
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE_ID="${VERSION#*-}"
+            PRERELEASE_ID="${PRERELEASE_ID%%.*}"
+            if [[ "$PRERELEASE_ID" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]] && [[ ! "$PRERELEASE_ID" =~ ^([xX]|[vV]([0-9]+|[xX])|latest)$ ]]; then
+              TAG_ARGS=(--tag "$PRERELEASE_ID")
+            else
+              TAG_ARGS=(--tag next)
+            fi
+          fi
           for pkg in "${PACKAGES[@]}"; do
             echo "=== ${pkg}@${VERSION} ==="
             if [ "$DRY_RUN" = "true" ]; then
-              npm publish --dry-run --access public "./staged/${pkg}"
+              npm publish --dry-run --access public "${TAG_ARGS[@]}" "./staged/${pkg}"
             else
               if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
                 echo "Already published: ${pkg}@${VERSION} (skipping)"
               else
-                npm publish --provenance --access public "./staged/${pkg}"
+                npm publish --provenance --access public "${TAG_ARGS[@]}" "./staged/${pkg}"
               fi
             fi
           done

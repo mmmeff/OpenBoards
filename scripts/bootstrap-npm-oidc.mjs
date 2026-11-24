@@ -14,6 +14,7 @@ import {
 } from "./stage-npm-packages.mjs";
 
 const BOOTSTRAP_VERSION = "0.0.0-bootstrap";
+const BOOTSTRAP_TAG = "bootstrap";
 const REPOSITORY = {
   type: "git",
   url: `git+https://github.com/${REPO_OWNER}/${REPO_NAME}.git`,
@@ -33,8 +34,8 @@ const ALL_PACKAGES = [
   },
 ];
 
-function runNpm(args, cwd) {
-  return spawnSync("npm", args, { cwd, encoding: "utf8" });
+function runNpm(args, cwd, { inherit = false } = {}) {
+  return spawnSync("npm", args, inherit ? { cwd, stdio: "inherit" } : { cwd, encoding: "utf8" });
 }
 
 function parseArgs(argv) {
@@ -90,9 +91,11 @@ function main() {
   const { publish } = parseArgs(process.argv.slice(2));
 
   if (!publish) {
-    console.log(`[dry-run] Would check and publish ${BOOTSTRAP_VERSION} placeholders for ${ALL_PACKAGES.length} packages:\n`);
+    console.log(
+      `[dry-run] Would check and publish ${BOOTSTRAP_VERSION} (--tag ${BOOTSTRAP_TAG}) placeholders for ${ALL_PACKAGES.length} packages:\n`
+    );
     for (const pkg of ALL_PACKAGES) {
-      console.log(`  - ${pkg.name}@${BOOTSTRAP_VERSION}`);
+      console.log(`  - ${pkg.name}@${BOOTSTRAP_VERSION} (tag: ${BOOTSTRAP_TAG})`);
     }
     console.log("\nRe-run with --publish (after `npm login`) to create any missing packages on npmjs.com.");
     printTrustedPublisherInstructions();
@@ -100,6 +103,9 @@ function main() {
   }
 
   const whoami = runNpm(["whoami"], process.cwd());
+  if (whoami.error) {
+    throw whoami.error;
+  }
   if (whoami.status !== 0) {
     console.error("Not logged in to npm. Run `npm login` first, then re-run with --publish.");
     process.exit(1);
@@ -109,9 +115,12 @@ function main() {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openboards-oidc-bootstrap-"));
   try {
     for (const pkg of ALL_PACKAGES) {
-      const existing = runNpm(["view", pkg.name, "version"], tmpRoot);
-      if (existing.status === 0 && existing.stdout.trim()) {
-        console.log(`Skipping ${pkg.name}: already exists on npm (latest: ${existing.stdout.trim()})`);
+      // Use dist-tag ls rather than `npm view <pkg> version` because packages
+      // published only with --tag bootstrap have no `latest` tag yet.
+      const existing = runNpm(["dist-tag", "ls", pkg.name], tmpRoot);
+      if (existing.status === 0) {
+        const tags = existing.stdout.trim().split("\n").filter(Boolean).join(", ");
+        console.log(`Skipping ${pkg.name}: already exists on npm (${tags || "published"})`);
         continue;
       }
 
@@ -132,14 +141,16 @@ function main() {
         `# ${pkg.name}\n\nPlaceholder release published to initialize npm Trusted Publishing (OIDC) for https://github.com/${REPO_OWNER}/${REPO_NAME}.\n`
       );
 
-      console.log(`Publishing ${pkg.name}@${BOOTSTRAP_VERSION}...`);
-      const res = runNpm(["publish", "--access", "public"], dir);
+      console.log(`Publishing ${pkg.name}@${BOOTSTRAP_VERSION} (--tag ${BOOTSTRAP_TAG})...`);
+      // Inherit stdio so npm can prompt for 2FA/OTP or browser WebAuthn when needed.
+      const res = runNpm(["publish", "--access", "public", "--tag", BOOTSTRAP_TAG], dir, { inherit: true });
+      if (res.error) {
+        throw res.error;
+      }
       if (res.status !== 0) {
-        console.error(res.stdout);
-        console.error(res.stderr);
         throw new Error(`Failed to publish ${pkg.name}@${BOOTSTRAP_VERSION}`);
       }
-      console.log(`Published ${pkg.name}@${BOOTSTRAP_VERSION}`);
+      console.log(`Published ${pkg.name}@${BOOTSTRAP_VERSION} (tag: ${BOOTSTRAP_TAG})`);
     }
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
